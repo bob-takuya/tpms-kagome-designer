@@ -98,15 +98,20 @@ export function buildConnectionLaplacian(
     const alphaJI = edgeAngles.get(he.twin) || (alphaIJ + Math.PI);
     const connectionAngle = alphaIJ - alphaJI + Math.PI;
 
-    // Rotation matrix element
-    const cosA = Math.cos(connectionAngle);
-    const sinA = Math.sin(connectionAngle);
+    // Off-diagonal: -w * e^(i * connectionAngle)
+    const offDiagIJ = {
+      real: -w * Math.cos(connectionAngle),
+      imag: -w * Math.sin(connectionAngle)
+    };
+    const offDiagJI = {
+      real: -w * Math.cos(-connectionAngle),
+      imag: -w * Math.sin(-connectionAngle)
+    };
 
-    // Off-diagonal entries (with rotation)
-    sparseAdd(L, vi, vj, { real: -w * cosA, imag: -w * sinA });
-    sparseAdd(L, vj, vi, { real: -w * cosA, imag: w * sinA });
+    sparseAdd(L, vi, vj, offDiagIJ);
+    sparseAdd(L, vj, vi, offDiagJI);
 
-    // Diagonal entries
+    // Diagonal: +w
     sparseAdd(L, vi, vi, { real: w, imag: 0 });
     sparseAdd(L, vj, vj, { real: w, imag: 0 });
   }
@@ -114,8 +119,8 @@ export function buildConnectionLaplacian(
   return { L, M };
 }
 
-function computeVertexAreas(mesh: HalfEdgeMesh): number[] {
-  const areas = new Array(mesh.vertices.length).fill(0);
+function computeVertexAreas(mesh: HalfEdgeMesh): Float64Array {
+  const areas = new Float64Array(mesh.vertices.length);
 
   for (let faceIdx = 0; faceIdx < mesh.faces.length; faceIdx++) {
     const face = mesh.faces[faceIdx];
@@ -123,127 +128,200 @@ function computeVertexAreas(mesh: HalfEdgeMesh): number[] {
     const v1 = mesh.vertices[face[1]];
     const v2 = mesh.vertices[face[2]];
 
-    const edge1 = new THREE.Vector3().subVectors(v1, v0);
-    const edge2 = new THREE.Vector3().subVectors(v2, v0);
-    const faceArea = new THREE.Vector3().crossVectors(edge1, edge2).length() / 2;
+    const e1 = new THREE.Vector3().subVectors(v1, v0);
+    const e2 = new THREE.Vector3().subVectors(v2, v0);
+    const area = e1.cross(e2).length() / 2;
+    const oneThird = area / 3;
 
-    // Distribute area to vertices (barycentric)
-    for (const vIdx of face) {
-      areas[vIdx] += faceArea / 3;
-    }
+    areas[face[0]] += oneThird;
+    areas[face[1]] += oneThird;
+    areas[face[2]] += oneThird;
   }
 
   return areas;
 }
 
-// Power iteration for smallest non-trivial eigenvector
+// ---------------------------------------------------------------------------
+// Complex Conjugate Gradient solver: solves (L + shift*M) * x = M * v
+// L is Hermitian positive semi-definite; shift regularises the zero eigenvalue
+// ---------------------------------------------------------------------------
+function complexCG(
+  L: SparseMatrix,
+  M: SparseMatrix,
+  bReal: Float64Array,
+  bImag: Float64Array,
+  shift: number,
+  maxIter: number,
+  tol: number
+): { real: Float64Array; imag: Float64Array } {
+  const n = L.rows;
+
+  // x_0 = 0
+  const xReal = new Float64Array(n);
+  const xImag = new Float64Array(n);
+
+  // r_0 = b  (since A*x_0 = 0)
+  const rReal = bReal.slice() as Float64Array;
+  const rImag = bImag.slice() as Float64Array;
+
+  const pReal = rReal.slice() as Float64Array;
+  const pImag = rImag.slice() as Float64Array;
+
+  // <r,r>_real  (for Hermitian A, CG residuals stay real-valued)
+  let rr = realInnerProduct(rReal, rImag, rReal, rImag);
+  if (rr < 1e-30) return { real: xReal, imag: xImag };
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    // Ap = (L + shift*M) * p
+    const ApR = new Float64Array(n);
+    const ApI = new Float64Array(n);
+
+    // L * p
+    L.data.forEach((val, key) => {
+      const [i, j] = key.split(',').map(Number);
+      ApR[i] += val.real * pReal[j] - val.imag * pImag[j];
+      ApI[i] += val.real * pImag[j] + val.imag * pReal[j];
+    });
+
+    // shift * M * p  (M is diagonal and real)
+    for (let i = 0; i < n; i++) {
+      const m = sparseGet(M, i, i).real;
+      ApR[i] += shift * m * pReal[i];
+      ApI[i] += shift * m * pImag[i];
+    }
+
+    // alpha = <r,r> / <p, Ap>  (denominator is real for Hermitian A)
+    const pAp = realInnerProduct(pReal, pImag, ApR, ApI);
+    if (Math.abs(pAp) < 1e-30) break;
+    const alpha = rr / pAp;
+
+    // x += alpha * p
+    for (let i = 0; i < n; i++) {
+      xReal[i] += alpha * pReal[i];
+      xImag[i] += alpha * pImag[i];
+    }
+
+    // r -= alpha * Ap
+    for (let i = 0; i < n; i++) {
+      rReal[i] -= alpha * ApR[i];
+      rImag[i] -= alpha * ApI[i];
+    }
+
+    const rrNew = realInnerProduct(rReal, rImag, rReal, rImag);
+    if (Math.sqrt(rrNew) < tol) break;
+
+    const beta = rrNew / rr;
+    for (let i = 0; i < n; i++) {
+      pReal[i] = rReal[i] + beta * pReal[i];
+      pImag[i] = rImag[i] + beta * pImag[i];
+    }
+    rr = rrNew;
+  }
+
+  return { real: xReal, imag: xImag };
+}
+
+/** Real part of the Hermitian inner product <u, v> = sum( conj(u_i) * v_i ) */
+function realInnerProduct(
+  uR: Float64Array, uI: Float64Array,
+  vR: Float64Array, vI: Float64Array
+): number {
+  let s = 0;
+  for (let i = 0; i < uR.length; i++) {
+    s += uR[i] * vR[i] + uI[i] * vI[i]; // Re( conj(u)*v )
+  }
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// Inverse power iteration to find the smallest eigenvector of L*x = λ M*x
+// Uses CG to solve (L + σM) x_new = M x_old at each step.
+// ---------------------------------------------------------------------------
 export function solveEigenvector(
   L: SparseMatrix,
   M: SparseMatrix,
-  maxIterations: number = 100,
-  tolerance: number = 1e-6
-): { real: Float64Array<ArrayBuffer>; imag: Float64Array<ArrayBuffer> } {
+  maxIterations: number = 60,
+  tolerance: number = 1e-5
+): { real: Float64Array; imag: Float64Array } {
   const n = L.rows;
 
-  // Initialize with random complex vector
-  let vReal: Float64Array<ArrayBuffer> = new Float64Array(n);
-  let vImag: Float64Array<ArrayBuffer> = new Float64Array(n);
+  // Regularisation shift (avoids singularity of L and skips the zero eigenvalue)
+  const shift = 1e-6;
 
+  // Initialise with random complex vector
+  let vReal = new Float64Array(n);
+  let vImag = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     vReal[i] = Math.random() - 0.5;
     vImag[i] = Math.random() - 0.5;
   }
+  mNormalize(vReal, vImag, M);
 
-  // Normalize
-  normalizeComplex(vReal, vImag, M);
-
-  // Inverse power iteration (for smallest eigenvalue)
-  // We'll use Lanczos-style iteration with shift
   for (let iter = 0; iter < maxIterations; iter++) {
-    // Apply M^-1 * L
-    const applied = applyMatrix(L, vReal, vImag);
-    const newReal = applied.real;
-    const newImag = applied.imag;
-
-    // Solve M * x = Lv (since M is diagonal, this is easy)
+    // rhs = M * v
+    const rhsR = new Float64Array(n);
+    const rhsI = new Float64Array(n);
     for (let i = 0; i < n; i++) {
-      const mVal = sparseGet(M, i, i).real;
-      if (mVal > 1e-10) {
-        newReal[i] /= mVal;
-        newImag[i] /= mVal;
-      }
+      const m = sparseGet(M, i, i).real;
+      rhsR[i] = m * vReal[i];
+      rhsI[i] = m * vImag[i];
     }
 
-    // Compute Rayleigh quotient for convergence check
-    const prevReal = vReal;
-    const prevImag = vImag;
+    // Solve (L + shift*M) * w = M * v
+    const { real: wReal, imag: wImag } = complexCG(
+      L, M, rhsR, rhsI, shift,
+      /*maxIter=*/ 200, /*tol=*/ 1e-8
+    );
 
-    vReal = newReal;
-    vImag = newImag;
+    // Check convergence (angle between v and w after normalisation)
+    const prevR = new Float64Array(vReal);
+    const prevI = new Float64Array(vImag);
 
-    // Remove constant mode (project out)
-    let sumReal = 0, sumImag = 0, sumWeight = 0;
+    vReal = wReal as Float64Array<ArrayBuffer>;
+    vImag = wImag as Float64Array<ArrayBuffer>;
+    mNormalize(vReal, vImag, M);
+
+    // Remove constant (zero-eigenvalue) component
+    let sumR = 0, sumI = 0, sumW = 0;
     for (let i = 0; i < n; i++) {
       const w = sparseGet(M, i, i).real;
-      sumReal += vReal[i] * w;
-      sumImag += vImag[i] * w;
-      sumWeight += w;
+      sumR += w * vReal[i];
+      sumI += w * vImag[i];
+      sumW += w;
     }
-    if (sumWeight > 1e-10) {
-      sumReal /= sumWeight;
-      sumImag /= sumWeight;
+    if (sumW > 1e-10) {
+      const cr = sumR / sumW;
+      const ci = sumI / sumW;
       for (let i = 0; i < n; i++) {
-        vReal[i] -= sumReal;
-        vImag[i] -= sumImag;
+        vReal[i] -= cr;
+        vImag[i] -= ci;
       }
     }
+    mNormalize(vReal, vImag, M);
 
-    // Normalize
-    normalizeComplex(vReal, vImag, M);
-
-    // Check convergence
-    let diff = 0;
+    // Convergence test: 1 - |<v_old, v_new>|
+    let dot = 0;
     for (let i = 0; i < n; i++) {
-      diff += (vReal[i] - prevReal[i]) ** 2 + (vImag[i] - prevImag[i]) ** 2;
+      dot += prevR[i] * vReal[i] + prevI[i] * vImag[i];
     }
-    if (Math.sqrt(diff) < tolerance) break;
+    if (1 - Math.abs(dot) < tolerance) break;
   }
 
   return { real: vReal, imag: vImag };
 }
 
-function applyMatrix(
-  mat: SparseMatrix,
-  vReal: Float64Array<ArrayBuffer>,
-  vImag: Float64Array<ArrayBuffer>
-): { real: Float64Array<ArrayBuffer>; imag: Float64Array<ArrayBuffer> } {
-  const n = mat.rows;
-  const resultReal: Float64Array<ArrayBuffer> = new Float64Array(n);
-  const resultImag: Float64Array<ArrayBuffer> = new Float64Array(n);
-
-  mat.data.forEach((val, key) => {
-    const [i, j] = key.split(',').map(Number);
-    // Complex multiplication: (a + bi)(c + di) = (ac - bd) + (ad + bc)i
-    resultReal[i] += val.real * vReal[j] - val.imag * vImag[j];
-    resultImag[i] += val.real * vImag[j] + val.imag * vReal[j];
-  });
-
-  return { real: resultReal, imag: resultImag };
-}
-
-function normalizeComplex(
-  vReal: Float64Array<ArrayBuffer>,
-  vImag: Float64Array<ArrayBuffer>,
+function mNormalize(
+  vReal: Float64Array,
+  vImag: Float64Array,
   M: SparseMatrix
 ): void {
   let norm = 0;
   for (let i = 0; i < vReal.length; i++) {
-    const mVal = sparseGet(M, i, i).real;
-    norm += mVal * (vReal[i] ** 2 + vImag[i] ** 2);
+    const m = sparseGet(M, i, i).real;
+    norm += m * (vReal[i] * vReal[i] + vImag[i] * vImag[i]);
   }
   norm = Math.sqrt(norm);
-
-  if (norm > 1e-10) {
+  if (norm > 1e-12) {
     for (let i = 0; i < vReal.length; i++) {
       vReal[i] /= norm;
       vImag[i] /= norm;
@@ -251,7 +329,9 @@ function normalizeComplex(
   }
 }
 
+// ---------------------------------------------------------------------------
 // Extract phase from complex eigenvector
+// ---------------------------------------------------------------------------
 export function extractPhase(real: Float64Array, imag: Float64Array): Float64Array {
   const phase = new Float64Array(real.length);
   for (let i = 0; i < real.length; i++) {
@@ -260,7 +340,9 @@ export function extractPhase(real: Float64Array, imag: Float64Array): Float64Arr
   return phase;
 }
 
+// ---------------------------------------------------------------------------
 // Trace isolines on the mesh
+// ---------------------------------------------------------------------------
 export interface Isoline {
   points: THREE.Vector3[];
   faceIndices: number[];
@@ -293,7 +375,6 @@ function traceSingleIsoline(
   const faceIndices: number[] = [];
   const visitedFaces = new Set<number>();
 
-  // Find starting face and edge
   for (let faceIdx = 0; faceIdx < mesh.faces.length; faceIdx++) {
     if (visitedFaces.has(faceIdx)) continue;
 
@@ -301,7 +382,6 @@ function traceSingleIsoline(
     const crossings = findPhaseCrossings(mesh, phase, face, targetPhase);
 
     if (crossings.length >= 2) {
-      // Start tracing from this face
       traceFromFace(
         mesh, phase, targetPhase, faceIdx,
         points, faceIndices, visitedFaces
@@ -332,7 +412,6 @@ function findPhaseCrossings(
     if (diff > Math.PI) p1 -= 2 * Math.PI;
     else if (diff < -Math.PI) p1 += 2 * Math.PI;
 
-    // Check if isoline crosses this edge
     if ((p0 <= targetPhase && targetPhase < p1) ||
         (p1 <= targetPhase && targetPhase < p0)) {
       const t = (targetPhase - p0) / (p1 - p0);
@@ -368,13 +447,11 @@ function traceFromFace(
 
     if (crossings.length < 2) break;
 
-    // Find exit crossing (not the entry edge)
     for (const crossing of crossings) {
       if (crossing.edgeIdx !== entryEdge) {
         points.push(crossing.point);
         faceIndices.push(currentFace);
 
-        // Find next face through this edge
         const heStart = mesh.faceToHalfEdge[currentFace];
         let heIdx = heStart;
         for (let i = 0; i < crossing.edgeIdx; i++) {
@@ -387,7 +464,6 @@ function traceFromFace(
         const nextFace = mesh.halfEdges[twinIdx].face;
         const nextFaceVerts = mesh.faces[nextFace];
 
-        // Find entry edge index in next face
         const exitV0 = face[crossing.edgeIdx];
         const exitV1 = face[(crossing.edgeIdx + 1) % 3];
 
