@@ -6,7 +6,7 @@ import { marchingCubes } from '../core/marchingCubes';
 import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
-import { buildConnectionLaplacian, solveEigenvector, extractPhase, traceIsolines } from '../core/connectionLaplacian';
+import { computeStripeField, traceIsolines } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
 import { extractKagomeStrips, assignLayers } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
@@ -172,34 +172,33 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
     }
   }
 
-  // Generate isolines for 3 families (0°, 60°, 120° rotation)
+  // Generate isolines for 3 families (0°, 60°, 120°)
+  // stripe density: controls how many stripes appear across the surface
+  const stripDensity = 4.0;
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
 
   for (let family = 0; family < 3; family++) {
-    const rotationAngle = (family * Math.PI) / 3;
+    // Each family uses a DIFFERENT angle → different Poisson RHS → different stripes
+    const phi = (family * Math.PI) / 3;
 
-    // Build connection Laplacian with rotation
-    const { L, M } = buildConnectionLaplacian(ctx.halfEdgeMesh, rotationAngle);
+    // Compute the scalar stripe field f for this family
+    const stripeField = computeStripeField(ctx.halfEdgeMesh, phi, stripDensity);
 
-    // Solve for eigenvector
-    const eigenvector = solveEigenvector(L, M, 50);
-
-    // Extract phase
-    const phase = extractPhase(eigenvector.real, eigenvector.imag);
-
-    // Trace isolines
-    const isolines = traceIsolines(ctx.halfEdgeMesh, phase, state.strip.numIsolines);
+    // Trace isolines (marching triangles)
+    const isolines = traceIsolines(ctx.halfEdgeMesh, stripeField, state.strip.numIsolines);
     isolinesByFamily[family] = isolines;
 
-    // Visualize isolines
+    // Render as LineSegments (pairs of points per face crossing)
     const color = new THREE.Color(state.kagome.layerColors[family]);
 
     for (const isoline of isolines) {
       if (isoline.points.length < 2) continue;
 
+      // points are stored as segment pairs: [A0,B0, A1,B1, …]
       const lineGeometry = new THREE.BufferGeometry().setFromPoints(isoline.points);
       const lineMaterial = new THREE.LineBasicMaterial({ color, linewidth: 2 });
-      const line = new THREE.Line(lineGeometry, lineMaterial);
+      // Use LineSegments so disconnected pairs are rendered correctly
+      const line = new THREE.LineSegments(lineGeometry, lineMaterial);
       ctx.stripMeshes.add(line);
     }
   }
