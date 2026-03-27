@@ -200,27 +200,36 @@ export function buildKagomePattern(
   }
   console.groupEnd();
 
-  // ── 2. Estimate world-space strip widths from adjacent centerline spacing ──
+  // ── 2. Estimate world-space strip widths from INTER-ISOLINE spacing only ──
+  // Strip IDs: single-chain = "A3"; multi-chain = "A3_1", "A3_2", ...
+  // Adjacent strips in families[] may be chains of the SAME isoline (distance≈0),
+  // so we group by base isoline ID and only measure BETWEEN different isolines.
+  const isoKey = (id: string) => id.replace(/_\d+$/, ''); // "A3_2" → "A3"
+
   for (let k = 0; k < 3; k++) {
     const fam = families[k];
-    // Collect all pairwise spacings then assign average so isolated strips still get a width
+
+    // One representative per isoline (the first chain of each)
+    const reps = new Map<string, Strip>();
+    for (const s of fam) {
+      const key = isoKey(s.id);
+      if (!reps.has(key)) reps.set(key, s);
+    }
+    const repList = [...reps.values()];
+
+    // Inter-isoline spacings only
     const spacings: number[] = [];
-    for (let i = 0; i < fam.length - 1; i++) {
-      const d = averageCenterlineDistance(fam[i].centerline, fam[i + 1].centerline);
+    for (let i = 0; i < repList.length - 1; i++) {
+      const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
       if (d > 1e-6) spacings.push(d);
     }
     const avgSpacing = spacings.length > 0
       ? spacings.reduce((a, b) => a + b, 0) / spacings.length
-      : 0.3; // fallback: 0.3 world units when only 1 strip or no valid spacing
+      : 0.3;
 
-    for (let i = 0; i < fam.length; i++) {
-      let d = avgSpacing;
-      if (i < fam.length - 1) {
-        const dd = averageCenterlineDistance(fam[i].centerline, fam[i + 1].centerline);
-        if (dd > 1e-6) d = dd;
-      }
-      fam[i].width = d * 0.75; // 75% of spacing → narrow gap between strips
-    }
+    // Assign uniform width to ALL strips in the family (same for all chains)
+    const familyWidth = avgSpacing * 0.75;
+    for (const s of fam) s.width = familyWidth;
   }
 
   // ── 3. faceMap was built inline in step 1 (each chain → per-segment entries)
