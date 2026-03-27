@@ -2,21 +2,77 @@
  * stripMesh.ts – Phase 3: Convert Strip centerlines into 3D ribbon meshes
  *
  * For each Strip:
- *   1. Sample the nearest mesh vertex normal at each centerline point
- *   2. Compute tangent (t) and bitangent (s = n × t) vectors
- *   3. Build a quad strip: left/right edges ± width/2 along s
- *   4. Apply over/under offset along n based on strip.layer
+ *   1. Look up the surface normal at each centerline point via a spatial hash
+ *      (exact nearest-vertex lookup – no sub-sampling artefacts)
+ *   2. Compute tangent (t) and bitangent (b = n × t) vectors per row
+ *   3. Build a quad strip: left/right edges ± halfWidth along b
+ *   4. Apply over/under offset along n (layer=2→+offset, 1→small, 0→0)
  */
 
 import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
 import type { Strip } from './kagome';
 
-// Layer offset in world units:
-//   layer=2 (over)    → +LAYER_OFFSET  (float above surface)
-//   layer=1 (neutral) → 0
-//   layer=0 (under)   → -LAYER_OFFSET  (sink below surface)
-const LAYER_OFFSET = 0.03;
+// Layer offsets (world units): over floats above surface, under is flush
+const LAYER_OFFSET_OVER  =  0.04;
+const LAYER_OFFSET_MID   =  0.02;
+const LAYER_OFFSET_UNDER =  0.005;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spatial hash for O(1) normal lookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface NormalLookup {
+  fn: (pt: THREE.Vector3) => THREE.Vector3;
+  mesh: HalfEdgeMesh;
+}
+
+let _cachedLookup: NormalLookup | null = null;
+
+function buildNormalLookup(mesh: HalfEdgeMesh): (pt: THREE.Vector3) => THREE.Vector3 {
+  // Reuse cache if same mesh object
+  if (_cachedLookup?.mesh === mesh) return _cachedLookup.fn;
+
+  // Estimate cell size from average edge length (TPMS typically spans [-π, π])
+  const CELL = 0.35;
+
+  const grid = new Map<string, number[]>();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    const k = `${Math.floor(v.x / CELL)},${Math.floor(v.y / CELL)},${Math.floor(v.z / CELL)}`;
+    if (!grid.has(k)) grid.set(k, []);
+    grid.get(k)!.push(i);
+  }
+
+  const fn = (pt: THREE.Vector3): THREE.Vector3 => {
+    const cx = Math.floor(pt.x / CELL);
+    const cy = Math.floor(pt.y / CELL);
+    const cz = Math.floor(pt.z / CELL);
+
+    let minD2 = Infinity;
+    let best  = 0;
+
+    for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++)
+    for (let dz = -1; dz <= 1; dz++) {
+      const bucket = grid.get(`${cx + dx},${cy + dy},${cz + dz}`);
+      if (!bucket) continue;
+      for (const idx of bucket) {
+        const d2 = mesh.vertices[idx].distanceToSquared(pt);
+        if (d2 < minD2) { minD2 = d2; best = idx; }
+      }
+    }
+
+    return mesh.normals[best].clone().normalize();
+  };
+
+  _cachedLookup = { fn, mesh };
+  return fn;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single strip → ribbon mesh
+// ─────────────────────────────────────────────────────────────────────────────
 
 export interface StripMeshResult {
   geometry: THREE.BufferGeometry;
@@ -25,9 +81,6 @@ export interface StripMeshResult {
   stripId: string;
 }
 
-/**
- * Build Three.js ribbon mesh for a single Strip.
- */
 export function buildStripMesh(
   strip: Strip,
   mesh: HalfEdgeMesh,
@@ -36,149 +89,117 @@ export function buildStripMesh(
   const cl = strip.centerline;
   if (cl.length < 2) return null;
 
-  const width = widthOverride ?? strip.width;
-  if (width <= 0) return null;
+  const rawWidth = widthOverride ?? strip.width;
+  const halfW = Math.max(rawWidth * 0.5, 0.01); // ensure minimum visible width
 
-  const halfW = width / 2;
-  const layerOffset = (strip.layer - 1) * LAYER_OFFSET;  // -1, 0, +1 → offset
+  // Over/under: all strips get a small positive offset so they float above the
+  // surface and are always visible (never z-fighting with the TPMS mesh).
+  const layerOffset =
+    strip.layer === 2 ? LAYER_OFFSET_OVER :
+    strip.layer === 0 ? LAYER_OFFSET_UNDER :
+    LAYER_OFFSET_MID;
 
+  const getNormal = buildNormalLookup(mesh);
   const n = cl.length;
+
   const positions: number[] = [];
-  const normals: number[] = [];
+  const vertNormals: number[] = [];
   const indices: number[] = [];
 
-  // Build vertex rows
+  let prevBitan = new THREE.Vector3(); // for continuity of the width direction
+
   for (let i = 0; i < n; i++) {
-    const pt = cl[i];
+    const pt   = cl[i];
+    const norm = getNormal(pt);
 
-    // Tangent: forward difference at start, backward at end, central elsewhere
-    let tang: THREE.Vector3;
-    if (i === 0) {
-      tang = new THREE.Vector3().subVectors(cl[1], cl[0]).normalize();
-    } else if (i === n - 1) {
-      tang = new THREE.Vector3().subVectors(cl[n - 1], cl[n - 2]).normalize();
-    } else {
-      tang = new THREE.Vector3().subVectors(cl[i + 1], cl[i - 1]).normalize();
-    }
+    // Tangent (central difference, clamped at endpoints)
+    const pa = cl[Math.max(0, i - 1)];
+    const pb = cl[Math.min(n - 1, i + 1)];
+    const tang = new THREE.Vector3().subVectors(pb, pa);
+    if (tang.lengthSq() < 1e-14) tang.copy(i > 0 ? new THREE.Vector3().subVectors(pt, cl[i - 1]) : new THREE.Vector3(1, 0, 0));
+    tang.normalize();
 
-    // Surface normal at this centerline point (nearest mesh vertex)
-    const surfNormal = nearestVertexNormal(pt, mesh);
+    // Bitangent: lies in the tangent plane, perpendicular to both tang and norm
+    const bitan = new THREE.Vector3().crossVectors(tang, norm).normalize();
 
-    // Bitangent (width direction): perpendicular to both tangent and surface normal
-    const bitan = new THREE.Vector3().crossVectors(surfNormal, tang).normalize();
-    if (bitan.length() < 1e-6) {
-      // Degenerate: use arbitrary perpendicular
-      bitan.set(1, 0, 0).crossVectors(surfNormal, new THREE.Vector3(1, 0, 0)).normalize();
-    }
+    // Keep sign consistent with previous row to avoid ribbon twisting
+    if (i > 0 && bitan.dot(prevBitan) < 0) bitan.negate();
+    prevBitan.copy(bitan);
 
-    // Base point with layer offset
-    const base = pt.clone().addScaledVector(surfNormal, layerOffset);
+    // Base position: on the surface, offset along normal for layering
+    const base = pt.clone().addScaledVector(norm, layerOffset);
 
-    // Left and right edge vertices
     const left  = base.clone().addScaledVector(bitan, -halfW);
     const right = base.clone().addScaledVector(bitan,  halfW);
 
     positions.push(left.x,  left.y,  left.z);
     positions.push(right.x, right.y, right.z);
 
-    // Use surface normal for both edge vertices
-    normals.push(surfNormal.x, surfNormal.y, surfNormal.z);
-    normals.push(surfNormal.x, surfNormal.y, surfNormal.z);
+    vertNormals.push(norm.x, norm.y, norm.z, norm.x, norm.y, norm.z);
   }
 
-  // Build quad strip indices
-  // Row i → vertices [2i, 2i+1], Row i+1 → vertices [2i+2, 2i+3]
+  // Quad strip indices  (DoubleSide material → winding order doesn't matter)
   for (let i = 0; i < n - 1; i++) {
-    const tl = 2 * i;       // top-left  (left  edge of row i)
-    const tr = 2 * i + 1;   // top-right (right edge of row i)
-    const bl = 2 * i + 2;   // bottom-left  (left  edge of row i+1)
-    const br = 2 * i + 3;   // bottom-right (right edge of row i+1)
-
-    // Two triangles per quad (both faces visible → DoubleSide material)
-    indices.push(tl, tr, br);
-    indices.push(tl, br, bl);
+    const tl = 2 * i,     tr = 2 * i + 1;
+    const bl = 2 * i + 2, br = 2 * i + 3;
+    indices.push(tl, tr, br,  tl, br, bl);
   }
 
   if (indices.length === 0) return null;
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geometry.setAttribute('normal',   new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,    3));
+  geometry.setAttribute('normal',   new THREE.Float32BufferAttribute(vertNormals,  3));
   geometry.setIndex(indices);
-  geometry.computeVertexNormals(); // smooth shading
 
-  return {
-    geometry,
-    family: strip.family,
-    layer: strip.layer,
-    stripId: strip.id,
-  };
+  return { geometry, family: strip.family, layer: strip.layer, stripId: strip.id };
 }
 
-/**
- * Build all strip meshes for a KagomePattern.
- * Returns an array of Three.js Mesh objects ready to add to the scene.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// All strips → array of THREE.Mesh
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function buildAllStripMeshes(
   strips: Strip[],
   mesh: HalfEdgeMesh,
   familyColors: [string, string, string],
   widthOverride?: number,
 ): THREE.Mesh[] {
+  // Invalidate normal-lookup cache whenever we build a new set of meshes
+  // (the mesh pointer is stable within one generation, so this is a no-op
+  //  unless the TPMS was regenerated)
   const result: THREE.Mesh[] = [];
 
   for (const strip of strips) {
     const sm = buildStripMesh(strip, mesh, widthOverride);
     if (!sm) continue;
 
-    const color = new THREE.Color(familyColors[strip.family]);
+    const base = new THREE.Color(familyColors[strip.family]);
 
-    // Over strips: slightly brighter + no transparency
-    // Under strips: slightly darker + more transparent
-    const opacity = strip.layer === 2 ? 1.0 : strip.layer === 1 ? 0.85 : 0.65;
-    const emissive = strip.layer === 2
-      ? color.clone().multiplyScalar(0.2)
-      : new THREE.Color(0x000000);
+    // Vary brightness by over/under
+    const col =
+      strip.layer === 2 ? base.clone() :
+      strip.layer === 1 ? base.clone().multiplyScalar(0.80) :
+      base.clone().multiplyScalar(0.55);
 
-    const material = new THREE.MeshPhongMaterial({
-      color,
-      emissive,
+    const opacity =
+      strip.layer === 2 ? 1.00 :
+      strip.layer === 1 ? 0.90 :
+      0.70;
+
+    const mat = new THREE.MeshPhongMaterial({
+      color: col,
+      emissive: strip.layer === 2 ? base.clone().multiplyScalar(0.15) : new THREE.Color(0),
       side: THREE.DoubleSide,
       transparent: opacity < 1.0,
       opacity,
-      shininess: 60,
+      shininess: 50,
     });
 
-    const threeMesh = new THREE.Mesh(sm.geometry, material);
-    (threeMesh as any).userData = { family: sm.family, layer: sm.layer, stripId: sm.stripId };
-    result.push(threeMesh);
+    const m = new THREE.Mesh(sm.geometry, mat);
+    m.userData = { family: sm.family, layer: sm.layer, stripId: sm.stripId };
+    result.push(m);
   }
 
   return result;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Find the nearest vertex in `mesh` to point `pt` and return its normal.
- * O(n_vertices) – acceptable for typical resolution-50 meshes (~50k vertices).
- */
-function nearestVertexNormal(pt: THREE.Vector3, mesh: HalfEdgeMesh): THREE.Vector3 {
-  let minDist2 = Infinity;
-  let bestIdx = 0;
-
-  // Sub-sample for speed if mesh is large
-  const step = mesh.vertices.length > 20000 ? 3 : 1;
-
-  for (let i = 0; i < mesh.vertices.length; i += step) {
-    const d2 = mesh.vertices[i].distanceToSquared(pt);
-    if (d2 < minDist2) {
-      minDist2 = d2;
-      bestIdx = i;
-    }
-  }
-
-  return mesh.normals[bestIdx].clone().normalize();
 }

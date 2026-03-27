@@ -88,8 +88,9 @@ export function buildKagomePattern(
 
       // Stitch marching-triangle segment pairs into connected polyline chains
       const chains = stitchSegments(iso.points);
-      // Pick the longest chain as the representative centerline
-      const centerline = chains.sort((a, b) => b.length - a.length)[0] ?? [];
+      // Pick the longest chain as the representative centerline, then smooth
+      const raw = chains.sort((a, b) => b.length - a.length)[0] ?? [];
+      const centerline = smoothPolyline(raw, 10);
       if (centerline.length < 2) continue;
 
       const strip: Strip = {
@@ -111,12 +112,23 @@ export function buildKagomePattern(
   // ── 2. Estimate world-space strip widths from adjacent centerline spacing ──
   for (let k = 0; k < 3; k++) {
     const fam = families[k];
+    // Collect all pairwise spacings then assign average so isolated strips still get a width
+    const spacings: number[] = [];
+    for (let i = 0; i < fam.length - 1; i++) {
+      const d = averageCenterlineDistance(fam[i].centerline, fam[i + 1].centerline);
+      if (d > 1e-6) spacings.push(d);
+    }
+    const avgSpacing = spacings.length > 0
+      ? spacings.reduce((a, b) => a + b, 0) / spacings.length
+      : 0.3; // fallback: 0.3 world units when only 1 strip or no valid spacing
+
     for (let i = 0; i < fam.length; i++) {
-      const prev = fam[(i - 1 + fam.length) % fam.length];
-      const next = fam[(i + 1) % fam.length];
-      const d1 = averageCenterlineDistance(fam[i].centerline, prev.centerline);
-      const d2 = averageCenterlineDistance(fam[i].centerline, next.centerline);
-      fam[i].width = Math.min(d1, d2) * 0.8;   // 80% of spacing
+      let d = avgSpacing;
+      if (i < fam.length - 1) {
+        const dd = averageCenterlineDistance(fam[i].centerline, fam[i + 1].centerline);
+        if (dd > 1e-6) d = dd;
+      }
+      fam[i].width = d * 0.75; // 75% of spacing → narrow gap between strips
     }
   }
 
@@ -264,6 +276,28 @@ export function extractKagomeStrips(
 export function assignLayers(_pattern: KagomePattern): void { /* no-op */ }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Laplacian smoothing – keeps endpoints fixed, prevents drift
+// ─────────────────────────────────────────────────────────────────────────────
+
+function smoothPolyline(pts: THREE.Vector3[], iterations = 10): THREE.Vector3[] {
+  if (pts.length < 3) return pts.map(p => p.clone());
+  let cur = pts.map(p => p.clone());
+  for (let iter = 0; iter < iterations; iter++) {
+    const next = cur.map(p => p.clone());
+    for (let i = 1; i < cur.length - 1; i++) {
+      // λ = 0.5 Laplacian step (fixed endpoints)
+      next[i].set(
+        0.25 * cur[i - 1].x + 0.5 * cur[i].x + 0.25 * cur[i + 1].x,
+        0.25 * cur[i - 1].y + 0.5 * cur[i].y + 0.25 * cur[i + 1].y,
+        0.25 * cur[i - 1].z + 0.5 * cur[i].z + 0.25 * cur[i + 1].z,
+      );
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Stitch marching-triangle segment pairs into connected polyline chains
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -289,23 +323,49 @@ function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
   const used = new Uint8Array(n);
   const chains: THREE.Vector3[][] = [];
 
+  // At a T-junction (3+ segments sharing one endpoint), we pick the segment
+  // that makes the smoothest angle (closest to 180°) with the current direction.
+  function pickNext(
+    curPt: THREE.Vector3,
+    inDir: THREE.Vector3 | null,
+  ): { segIdx: number; end: 0 | 1 } | null {
+    const h = hash(curPt);
+    const candidates = (endpointMap.get(h) ?? []).filter(c => !used[c.segIdx]);
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1 || inDir === null) return candidates[0];
+
+    // Pick the segment whose direction is most aligned with inDir
+    // (i.e. the one that continues the polyline most smoothly)
+    let best = candidates[0];
+    let bestDot = -Infinity;
+    for (const c of candidates) {
+      const otherEnd = points[2 * c.segIdx + (1 - c.end)];
+      const segDir = new THREE.Vector3().subVectors(otherEnd, curPt).normalize();
+      const d = inDir.dot(segDir);
+      if (d > bestDot) { bestDot = d; best = c; }
+    }
+    return best;
+  }
+
   for (let start = 0; start < n; start++) {
     if (used[start]) continue;
 
     const chain: THREE.Vector3[] = [points[2 * start].clone(), points[2 * start + 1].clone()];
     used[start] = 1;
 
-    // Extend forward
+    // Extend forward (with direction continuity)
     let extending = true;
     while (extending) {
       extending = false;
-      const h = hash(chain[chain.length - 1]);
-      for (const { segIdx, end } of endpointMap.get(h) ?? []) {
-        if (used[segIdx]) continue;
-        chain.push(points[2 * segIdx + (1 - end)].clone());
-        used[segIdx] = 1;
+      const tail = chain[chain.length - 1];
+      const inDir = chain.length >= 2
+        ? new THREE.Vector3().subVectors(tail, chain[chain.length - 2]).normalize()
+        : null;
+      const c = pickNext(tail, inDir);
+      if (c) {
+        chain.push(points[2 * c.segIdx + (1 - c.end)].clone());
+        used[c.segIdx] = 1;
         extending = true;
-        break;
       }
     }
 
@@ -313,17 +373,19 @@ function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
     extending = true;
     while (extending) {
       extending = false;
-      const h = hash(chain[0]);
-      for (const { segIdx, end } of endpointMap.get(h) ?? []) {
-        if (used[segIdx]) continue;
-        chain.unshift(points[2 * segIdx + (1 - end)].clone());
-        used[segIdx] = 1;
+      const head = chain[0];
+      const inDir = chain.length >= 2
+        ? new THREE.Vector3().subVectors(head, chain[1]).normalize()
+        : null;
+      const c = pickNext(head, inDir);
+      if (c) {
+        chain.unshift(points[2 * c.segIdx + (1 - c.end)].clone());
+        used[c.segIdx] = 1;
         extending = true;
-        break;
       }
     }
 
-    if (chain.length >= 2) chains.push(chain);
+    if (chain.length >= 3) chains.push(chain); // require at least 3 points
   }
 
   return chains;
