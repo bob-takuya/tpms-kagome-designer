@@ -1,27 +1,22 @@
 /**
- * unfold.ts – Phase 4: Darboux-frame geodesic unfolding with normal curvature
+ * unfold.ts – Phase 4: Developable strip approximation via arc-length geodesic unrolling
  *
- * For each strip on the TPMS surface we compute the Darboux frame at every
- * centerline point:
+ * For strips on TPMS surfaces (which have K < 0 everywhere), we approximate
+ * each strip as a developable ruled surface using the following approach:
  *
- *   t   – tangent (along the strip)
- *   n_s – in-surface normal (perp to t inside the tangent plane)
- *   n   – surface normal
+ * 1. Compute arc-length along the 3D centerline
+ * 2. Compute geodesic curvature κ_g at each point (turning rate in the tangent plane)
+ * 3. Unroll to 2D by integrating the turning angle: θ(s) = ∫ κ_g ds
+ * 4. Place 2D centerline points: x(s) = ∫ cos(θ) ds,  y(s) = ∫ sin(θ) ds
+ * 5. Add left/right boundaries at ±width/2 perpendicular to the 2D tangent
  *
- * Differential-geometry quantities:
- *   κ_g = geodesic curvature  = (dt/ds) · n_s
- *   τ_g = geodesic torsion    = -(dn_s/ds) · n
+ * This produces a developable strip that:
+ * - Preserves arc length along the centerline exactly
+ * - Preserves geodesic curvature (the "bending" in the surface plane)
+ * - Has constant width along its length (uses strip.width or per-point strip.widths)
+ * - Can be physically bent to conform to the TPMS surface
  *
- * LEFT / RIGHT edge arc length per centerline arc-length ds:
- *   dL/ds = √( (1 − halfW·κ_g)² + (halfW·τ_g)² )
- *   dR/ds = √( (1 + halfW·κ_g)² + (halfW·τ_g)² )
- *
- * The cross-section width (arc length in the n_s direction) = 2·halfW (constant).
- *
- * 2-D placement uses sequential triangle unfolding (law of cosines), which is
- * exact for developable surfaces and minimal-distortion for non-developable ones.
- *
- * All output coordinates are in mm (scale = mm per TPMS world unit).
+ * Output coordinates are in mm (scale = mm per TPMS world unit).
  */
 
 import * as THREE from 'three';
@@ -64,6 +59,7 @@ let _normCache: { mesh: HalfEdgeMesh; fn: (p: THREE.Vector3) => THREE.Vector3 } 
 
 function buildNormalLookup(mesh: HalfEdgeMesh): (p: THREE.Vector3) => THREE.Vector3 {
   if (_normCache?.mesh === mesh) return _normCache.fn;
+
   const CELL = 0.35;
   const grid = new Map<string, number[]>();
   for (let i = 0; i < mesh.vertices.length; i++) {
@@ -72,158 +68,160 @@ function buildNormalLookup(mesh: HalfEdgeMesh): (p: THREE.Vector3) => THREE.Vect
     if (!grid.has(k)) grid.set(k, []);
     grid.get(k)!.push(i);
   }
+
   const fn = (p: THREE.Vector3): THREE.Vector3 => {
-    const cx = Math.floor(p.x / CELL), cy = Math.floor(p.y / CELL), cz = Math.floor(p.z / CELL);
+    const cx = Math.floor(p.x / CELL);
+    const cy = Math.floor(p.y / CELL);
+    const cz = Math.floor(p.z / CELL);
     let minD2 = Infinity, best = 0;
     for (let dx = -1; dx <= 1; dx++)
     for (let dy = -1; dy <= 1; dy++)
     for (let dz = -1; dz <= 1; dz++) {
-      for (const idx of grid.get(`${cx+dx},${cy+dy},${cz+dz}`) ?? []) {
+      for (const idx of grid.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
         const d2 = mesh.vertices[idx].distanceToSquared(p);
         if (d2 < minD2) { minD2 = d2; best = idx; }
       }
     }
     return mesh.normals[best].clone().normalize();
   };
+
   _normCache = { mesh, fn };
   return fn;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Darboux frame at each centerline point
+// Compute geodesic curvature along the centerline
+//
+// κ_g = (dt/ds) · n_s,  where:
+//   t   = tangent vector (along the curve)
+//   n_s = in-surface perpendicular = normalize(surfNormal × t)
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface DarbouxData {
-  tangents: THREE.Vector3[];
-  nPerps:   THREE.Vector3[];  // in-surface perpendicular = n_s
-  nSurfs:   THREE.Vector3[];  // surface normal = n
-  kappasG:  number[];         // geodesic curvature κ_g
-  tausG:    number[];         // geodesic torsion τ_g
+interface GeodesicData {
+  arcLengths:  number[];   // cumulative arc length at each point
+  kappaG:      number[];   // geodesic curvature at each point
+  tangents2D:  THREE.Vector2[];  // 2D tangent directions after unrolling
 }
 
-function computeDarbouxFrame(
+function computeGeodesicData(
   cl3:  THREE.Vector3[],
   mesh: HalfEdgeMesh,
-): DarbouxData {
+): GeodesicData {
   const n = cl3.length;
   const getNorm = buildNormalLookup(mesh);
 
-  // ── Tangents (central difference) ─────────────────────────────────────────
-  const tangents: THREE.Vector3[] = cl3.map((_, i) => {
-    const a = cl3[Math.max(0, i - 1)];
-    const b = cl3[Math.min(n - 1, i + 1)];
-    return new THREE.Vector3().subVectors(b, a).normalize();
-  });
+  // ── Tangents (forward difference for stability) ────────────────────────────
+  const tangents3D: THREE.Vector3[] = [];
+  for (let i = 0; i < n; i++) {
+    const pa = cl3[Math.max(0, i - 1)];
+    const pb = cl3[Math.min(n - 1, i + 1)];
+    const t = new THREE.Vector3().subVectors(pb, pa);
+    if (t.lengthSq() < 1e-14) t.set(1, 0, 0);
+    tangents3D.push(t.normalize());
+  }
 
   // ── Surface normals ────────────────────────────────────────────────────────
-  const nSurfs: THREE.Vector3[] = cl3.map(p => getNorm(p));
+  const surfNormals: THREE.Vector3[] = cl3.map(p => getNorm(p));
 
-  // ── In-surface perpendicular: n_s = normalize(n × t) ─────────────────────
-  const nPerps: THREE.Vector3[] = tangents.map((t, i) => {
-    let ns = new THREE.Vector3().crossVectors(nSurfs[i], t);
-    if (ns.lengthSq() < 1e-10) ns.crossVectors(new THREE.Vector3(0, 0, 1), t);
+  // ── In-surface perpendicular: n_s = normalize(surfNormal × t) ──────────────
+  const nPerps: THREE.Vector3[] = tangents3D.map((t, i) => {
+    let ns = new THREE.Vector3().crossVectors(surfNormals[i], t);
+    if (ns.lengthSq() < 1e-10) ns.set(0, 0, 1).cross(t);
     return ns.normalize();
   });
 
-  // ── Geodesic curvature: κ_g = (dt/ds) · n_s  (central difference) ────────
-  const kappasG: number[] = new Array(n).fill(0);
+  // ── Arc lengths (cumulative) ───────────────────────────────────────────────
+  const arcLengths: number[] = [0];
+  for (let i = 1; i < n; i++) {
+    arcLengths.push(arcLengths[i - 1] + cl3[i - 1].distanceTo(cl3[i]));
+  }
+
+  // ── Geodesic curvature: κ_g = (dt/ds) · n_s  (central difference) ──────────
+  const kappaG: number[] = new Array(n).fill(0);
   for (let i = 1; i < n - 1; i++) {
     const ds = cl3[i - 1].distanceTo(cl3[i + 1]);
     if (ds < 1e-12) continue;
-    const dt = new THREE.Vector3().subVectors(tangents[i + 1], tangents[i - 1]);
-    kappasG[i] = dt.dot(nPerps[i]) / ds;
+    const dt = new THREE.Vector3().subVectors(tangents3D[i + 1], tangents3D[i - 1]);
+    kappaG[i] = dt.dot(nPerps[i]) / ds;
   }
-  if (n >= 2) { kappasG[0] = kappasG[1]; kappasG[n - 1] = kappasG[n - 2]; }
-
-  // ── Geodesic torsion: τ_g = −(dn_s/ds) · n  (central difference) ─────────
-  const tausG: number[] = new Array(n).fill(0);
-  for (let i = 1; i < n - 1; i++) {
-    const ds = cl3[i - 1].distanceTo(cl3[i + 1]);
-    if (ds < 1e-12) continue;
-    const dns = new THREE.Vector3().subVectors(nPerps[i + 1], nPerps[i - 1]);
-    tausG[i] = -dns.dot(nSurfs[i]) / ds;
+  // Extrapolate endpoints
+  if (n >= 2) {
+    kappaG[0] = kappaG[1];
+    kappaG[n - 1] = kappaG[n - 2];
   }
-  if (n >= 2) { tausG[0] = tausG[1]; tausG[n - 1] = tausG[n - 2]; }
 
-  return { tangents, nPerps, nSurfs, kappasG, tausG };
+  // ── Clamp extreme curvatures to avoid self-intersecting strips ─────────────
+  const maxKappa = 2.0;  // reasonable limit for strips
+  for (let i = 0; i < n; i++) {
+    kappaG[i] = Math.max(-maxKappa, Math.min(maxKappa, kappaG[i]));
+  }
+
+  // ── Compute 2D tangents by integrating geodesic curvature ──────────────────
+  // θ(s) = ∫ κ_g ds  →  tangent2D = (cos θ, sin θ)
+  const tangents2D: THREE.Vector2[] = [];
+  let theta = 0;  // initial angle (strip starts pointing in +x direction)
+  tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
+
+  for (let i = 1; i < n; i++) {
+    const ds = arcLengths[i] - arcLengths[i - 1];
+    const kAvg = (kappaG[i - 1] + kappaG[i]) / 2;
+    theta += kAvg * ds;
+    tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
+  }
+
+  return { arcLengths, kappaG, tangents2D };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Triangle unfolding: place a 2-D point from two known base points + two distances
-// "onLeft" = place on the left side (CCW) of the directed base edge a → b
+// Arc-length geodesic unrolling to 2D
+//
+// Place centerline points by integrating 2D tangent directions:
+//   x(s) = ∫ cos(θ(s)) ds
+//   y(s) = ∫ sin(θ(s)) ds
+// Then add left/right boundaries at ±halfWidth perpendicular to tangent
 // ─────────────────────────────────────────────────────────────────────────────
 
-function triPoint(
-  a: THREE.Vector2, b: THREE.Vector2,
-  da: number, db: number,
-  onLeft: boolean,
-): THREE.Vector2 {
-  const ab  = new THREE.Vector2().subVectors(b, a);
-  const d   = ab.length();
-  if (d < 1e-12) return a.clone();
-  const t   = (da * da - db * db + d * d) / (2 * d);
-  const s2  = Math.max(0, da * da - t * t);
-  const s   = Math.sqrt(s2) * (onLeft ? 1 : -1);
-  const dir = ab.clone().divideScalar(d);
-  const perp = new THREE.Vector2(-dir.y, dir.x);
-  return a.clone().addScaledVector(dir, t).addScaledVector(perp, s);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main unfold: Darboux edge lengths + triangle unfolding
-// ─────────────────────────────────────────────────────────────────────────────
-
-function unfoldWithDarboux(
-  cl3:    THREE.Vector3[],
-  darboux: DarbouxData,
-  halfW:  number,   // world units
-  scale:  number,   // mm per world unit
-): { L2: THREE.Vector2[]; R2: THREE.Vector2[] } {
+function unrollGeodesic(
+  cl3:       THREE.Vector3[],
+  geodesic:  GeodesicData,
+  widths:    number[],      // per-point width in world units
+  scale:     number,        // mm per world unit
+): { L2: THREE.Vector2[]; R2: THREE.Vector2[]; cl2: THREE.Vector2[] } {
   const n = cl3.length;
-  if (n === 0) return { L2: [], R2: [] };
+  if (n === 0) return { L2: [], R2: [], cl2: [] };
 
-  // 3D edge positions (for diagonal computation)
-  const L3 = cl3.map((p, i) => p.clone().addScaledVector(darboux.nPerps[i],  halfW));
-  const R3 = cl3.map((p, i) => p.clone().addScaledVector(darboux.nPerps[i], -halfW));
+  const cl2: THREE.Vector2[] = [];
+  const L2:  THREE.Vector2[] = [];
+  const R2:  THREE.Vector2[] = [];
 
-  const w0mm = halfW * 2 * scale;
-  const L2: THREE.Vector2[] = [new THREE.Vector2(0,  w0mm / 2)];
-  const R2: THREE.Vector2[] = [new THREE.Vector2(0, -w0mm / 2)];
+  // Start at origin
+  let x = 0, y = 0;
+  cl2.push(new THREE.Vector2(x * scale, y * scale));
 
-  for (let i = 0; i < n - 1; i++) {
-    // Centerline arc-length for this link
-    const ds = cl3[i].distanceTo(cl3[i + 1]);
+  // Integrate along the curve
+  for (let i = 1; i < n; i++) {
+    const ds = geodesic.arcLengths[i] - geodesic.arcLengths[i - 1];
+    // Use average tangent for better accuracy
+    const tAvg = geodesic.tangents2D[i - 1].clone().add(geodesic.tangents2D[i]).multiplyScalar(0.5);
+    tAvg.normalize();
 
-    // Average Darboux scalars over the link
-    const kg = (darboux.kappasG[i] + darboux.kappasG[i + 1]) / 2;
-    const tg = (darboux.tausG[i]   + darboux.tausG[i + 1])   / 2;
-
-    // Clamp curvature to avoid degenerate strips
-    // (halfW · |κ_g| < 1 is required for the strip to be non-self-intersecting)
-    const kg_clamped = Math.max(-0.9 / Math.max(halfW, 1e-9),
-                               Math.min( 0.9 / Math.max(halfW, 1e-9), kg));
-
-    // Analytical edge arc lengths (Darboux formula)
-    const dL_mm = ds * Math.sqrt((1 - halfW * kg_clamped) ** 2 + (halfW * tg) ** 2) * scale;
-    const dR_mm = ds * Math.sqrt((1 + halfW * kg_clamped) ** 2 + (halfW * tg) ** 2) * scale;
-
-    // Diagonal from R3[i] to L3[i+1] in 3D (preserves the quad's diagonal in 2D)
-    const dDiag_mm = R3[i].distanceTo(L3[i + 1]) * scale;
-
-    // Cross-section at i+1 = 2*halfW (constant in Darboux approximation)
-    const dCross_mm = 2 * halfW * scale;
-
-    // Tri-1: (L_i, R_i, L_{i+1}) → place L_{i+1} to the LEFT of L_i→R_i (= forward)
-    const L_next = triPoint(L2[i], R2[i], dL_mm, dDiag_mm, true);
-
-    // Tri-2: (R_i, L_{i+1}, R_{i+1}) → place R_{i+1} to the RIGHT of R_i→L_{i+1}
-    const R_next = triPoint(R2[i], L_next, dR_mm, dCross_mm, false);
-
-    L2.push(L_next);
-    R2.push(R_next);
+    x += tAvg.x * ds;
+    y += tAvg.y * ds;
+    cl2.push(new THREE.Vector2(x * scale, y * scale));
   }
 
-  return { L2, R2 };
+  // Add left/right boundaries using per-point widths
+  for (let i = 0; i < n; i++) {
+    const t2 = geodesic.tangents2D[i];
+    // Perpendicular direction (90° CCW rotation)
+    const perp = new THREE.Vector2(-t2.y, t2.x);
+
+    const halfW = (widths[i] / 2) * scale;
+    L2.push(cl2[i].clone().addScaledVector(perp,  halfW));
+    R2.push(cl2[i].clone().addScaledVector(perp, -halfW));
+  }
+
+  return { L2, R2, cl2 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,34 +229,47 @@ function unfoldWithDarboux(
 // ─────────────────────────────────────────────────────────────────────────────
 
 function mapJunctions(
-  strip: Strip,
-  cl3:   THREE.Vector3[],
-  cl2:   THREE.Vector2[],
-  scale: number,
+  strip:       Strip,
+  cl3:         THREE.Vector3[],
+  cl2:         THREE.Vector2[],
+  _arcLengths: number[],  // kept for potential future use (arc-length interpolation)
+  scale:       number,
 ): UnfoldedHole[] {
   const holes: UnfoldedHole[] = [];
 
   for (const junc of strip.junctions) {
+    // Find closest centerline point in 3D
     let minD2 = Infinity, idx = 0;
     for (let i = 0; i < cl3.length; i++) {
       const d2 = cl3[i].distanceToSquared(junc.position);
       if (d2 < minD2) { minD2 = d2; idx = i; }
     }
-    // Sub-segment interpolation
+
+    // Interpolate along arc length for better accuracy
     let pt2 = cl2[idx].clone();
     if (idx < cl3.length - 1 && idx < cl2.length - 1) {
-      const dA = cl3[idx    ].distanceTo(junc.position);
-      const dB = cl3[idx + 1].distanceTo(junc.position);
-      pt2 = cl2[idx].clone().lerp(cl2[idx + 1], dA / Math.max(dA + dB, 1e-12));
+      const d3to = cl3[idx].distanceTo(junc.position);
+      const segLen = cl3[idx].distanceTo(cl3[idx + 1]);
+      if (segLen > 1e-9) {
+        const t = Math.min(d3to / segLen, 1);
+        pt2 = cl2[idx].clone().lerp(cl2[idx + 1], t);
+      }
     }
-    holes.push({ junctionId: junc.id, center: pt2, radius: junc.holeRadius * scale });
+
+    holes.push({
+      junctionId: junc.id,
+      center:     pt2,
+      radius:     junc.holeRadius * scale,
+    });
   }
 
-  // Deduplicate
+  // Deduplicate near-coincident holes
   const seen = new Set<string>();
   return holes.filter(h => {
     const k = `${Math.round(h.center.x)},${Math.round(h.center.y)}`;
-    return seen.has(k) ? false : (seen.add(k), true);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
   });
 }
 
@@ -269,8 +280,10 @@ function mapJunctions(
 function computeBBox(left: THREE.Vector2[], right: THREE.Vector2[]) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const p of [...left, ...right]) {
-    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
   }
   return { minX, maxX, minY, maxY };
 }
@@ -283,19 +296,33 @@ export function unfoldStrip(
   strip:      Strip,
   mesh:       HalfEdgeMesh,
   _junctions: Junction[],
-  scale:      number,
+  scale:      number,           // mm per world unit
 ): UnfoldedStrip {
-  const cl3   = strip.centerline;
-  const halfW = Math.max(strip.width / 2, 1e-6);
+  const cl3 = strip.centerline;
+  if (cl3.length < 2) {
+    return {
+      stripId:     strip.id,
+      family:      strip.family,
+      layer:       strip.layer,
+      segments:    [],
+      boundingBox: { minX: 0, maxX: 0, minY: 0, maxY: 0 },
+    };
+  }
 
-  // Darboux frame
-  const darboux = computeDarbouxFrame(cl3, mesh);
+  // Use per-point widths if available, otherwise fall back to uniform width
+  const widths: number[] = strip.widths && strip.widths.length === cl3.length
+    ? strip.widths
+    : new Array(cl3.length).fill(Math.max(strip.width, 1e-6));
 
-  // Triangle unfold (Darboux edge lengths)
-  const { L2, R2 } = unfoldWithDarboux(cl3, darboux, halfW, scale);
-  const cl2 = L2.map((l, i) => l.clone().add(R2[i]).multiplyScalar(0.5));
+  // Compute geodesic data (arc lengths, curvatures, 2D tangents)
+  const geodesic = computeGeodesicData(cl3, mesh);
 
-  const holes   = mapJunctions(strip, cl3, cl2, scale);
+  // Unroll to 2D using arc-length parameterization
+  const { L2, R2, cl2 } = unrollGeodesic(cl3, geodesic, widths, scale);
+
+  // Map junction positions to 2D
+  const holes = mapJunctions(strip, cl3, cl2, geodesic.arcLengths, scale);
+
   const segment: UnfoldedSegment = {
     startJunctionId: null,
     endJunctionId:   null,
@@ -303,20 +330,20 @@ export function unfoldStrip(
     rightBoundary:   R2,
     centerline:      cl2,
     holes,
-    width: strip.width * scale,
+    width:           strip.width * scale,
   };
 
   return {
-    stripId:  strip.id,
-    family:   strip.family,
-    layer:    strip.layer,
-    segments: [segment],
+    stripId:     strip.id,
+    family:      strip.family,
+    layer:       strip.layer,
+    segments:    [segment],
     boundingBox: computeBBox(L2, R2),
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout
+// Layout: row-based packing with auto maxRowWidth
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface StripLayout {
@@ -337,14 +364,33 @@ export function layoutStrips(
   for (const strip of strips) {
     const w = strip.boundingBox.maxX - strip.boundingBox.minX;
     const h = strip.boundingBox.maxY - strip.boundingBox.minY;
-    if (rowX + w > maxRowWidth && rowX > margin) { rowY += rowH + margin; rowX = margin; rowH = 0; }
-    positions.push(new THREE.Vector2(rowX - strip.boundingBox.minX, rowY - strip.boundingBox.minY));
+
+    if (rowX + w > maxRowWidth && rowX > margin) {
+      rowY += rowH + margin;
+      rowX  = margin;
+      rowH  = 0;
+    }
+
+    positions.push(new THREE.Vector2(
+      rowX - strip.boundingBox.minX,
+      rowY - strip.boundingBox.minY,
+    ));
+
     rowX += w + margin;
-    rowH = Math.max(rowH, h);
+    rowH  = Math.max(rowH, h);
   }
 
-  return { strips, totalWidth: maxRowWidth + margin, totalHeight: rowY + rowH + margin, positions };
+  return {
+    strips,
+    totalWidth:  maxRowWidth + margin,
+    totalHeight: rowY + rowH + margin,
+    positions,
+  };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Apply layout offsets
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function applyLayout(layout: StripLayout): UnfoldedStrip[] {
   return layout.strips.map((strip, idx) => {
@@ -356,11 +402,16 @@ export function applyLayout(layout: StripLayout): UnfoldedStrip[] {
         leftBoundary:  seg.leftBoundary.map(p  => p.clone().add(off)),
         rightBoundary: seg.rightBoundary.map(p  => p.clone().add(off)),
         centerline:    seg.centerline.map(p    => p.clone().add(off)),
-        holes:         seg.holes.map(h => ({ ...h, center: h.center.clone().add(off) })),
+        holes:         seg.holes.map(h => ({
+          ...h,
+          center: h.center.clone().add(off),
+        })),
       })),
       boundingBox: {
-        minX: strip.boundingBox.minX + off.x, maxX: strip.boundingBox.maxX + off.x,
-        minY: strip.boundingBox.minY + off.y, maxY: strip.boundingBox.maxY + off.y,
+        minX: strip.boundingBox.minX + off.x,
+        maxX: strip.boundingBox.maxX + off.x,
+        minY: strip.boundingBox.minY + off.y,
+        maxY: strip.boundingBox.maxY + off.y,
       },
     };
   });
