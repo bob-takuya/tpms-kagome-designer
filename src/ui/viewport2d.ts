@@ -43,12 +43,25 @@ export function createViewport2D(container: HTMLElement): Viewport2DContext {
   };
 
   const resize = () => {
-    canvas.width  = container.clientWidth;
-    canvas.height = container.clientHeight;
-    render2D(vp);
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+      canvas.width  = w;
+      canvas.height = h;
+      render2D(vp);
+    }
   };
-  resize();
+
+  // ResizeObserver fires whenever the container gets a real size
+  // (including when the 2D tab is first activated from a hidden state).
+  const ro = new ResizeObserver(resize);
+  ro.observe(container);
+
+  // Also handle window resize (belt + suspenders)
   window.addEventListener('resize', resize);
+
+  // Attempt immediate sizing (works if container is already visible)
+  resize();
 
   // Zoom
   canvas.addEventListener('wheel', (e) => {
@@ -171,6 +184,10 @@ export function regenerateUnfold(
 
 export function render2D(vp: Viewport2DContext): void {
   const { canvas, ctx, unfoldedStrips, scale, offset } = vp;
+
+  // Canvas not yet sized (hidden tab)
+  if (canvas.width === 0 || canvas.height === 0) return;
+
   const state = store.getState();
 
   ctx.fillStyle = '#1a1a1a';

@@ -51,7 +51,16 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     store.getState().setViewMode(view as '3d' | '2d');
 
     if (view === '2d') {
-      regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
+      // Force canvas resize AFTER the DOM has painted the now-visible container
+      requestAnimationFrame(() => {
+        const c = ctx2D.canvas;
+        const container = c.parentElement!;
+        if (container.clientWidth > 0 && (c.width !== container.clientWidth || c.height !== container.clientHeight)) {
+          c.width  = container.clientWidth;
+          c.height = container.clientHeight;
+        }
+        regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
+      });
     }
   });
 });
