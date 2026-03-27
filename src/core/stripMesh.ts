@@ -13,10 +13,13 @@ import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
 import type { Strip } from './kagome';
 
-// Layer offsets (world units): over floats above surface, under is flush
-const LAYER_OFFSET_OVER  =  0.04;
-const LAYER_OFFSET_MID   =  0.02;
-const LAYER_OFFSET_UNDER =  0.005;
+// Layer offsets: keep ribbons ON the surface (offset = 0).
+// Physical over/under separation for fabrication is handled in the 2D unfold step.
+// Here we rely entirely on polygonOffset in the material to render the ribbon
+// in front of the TPMS mesh regardless of which side of the surface we're on.
+const LAYER_OFFSET_OVER  = 0;
+const LAYER_OFFSET_MID   = 0;
+const LAYER_OFFSET_UNDER = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Spatial hash for O(1) normal lookup

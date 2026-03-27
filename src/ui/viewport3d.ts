@@ -138,7 +138,8 @@ export function regenerateMesh(ctx: Viewport3DContext): void {
     color: 0x3a6faa,
     side: THREE.DoubleSide,
     transparent: true,
-    opacity: 0.25,   // semi-transparent so strips are clearly visible
+    opacity: 0.15,        // low opacity → strips always dominate visually
+    depthWrite: false,    // transparent surface never wins depth test vs ribbons
     shininess: 40,
   });
 
