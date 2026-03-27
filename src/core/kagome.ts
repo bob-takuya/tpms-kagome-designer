@@ -80,21 +80,42 @@ export function buildKagomePattern(
   const families: [Strip[], Strip[], Strip[]] = [[], [], []];
   const allStrips: Strip[] = [];
 
+  // Diagnostic counters
+  const diagRows: {
+    id: string; segments: number; chains: number;
+    longestChain: number; accepted: boolean; reason: string;
+  }[] = [];
+
   for (let k = 0; k < 3; k++) {
     const isos = isolinesByFamily[k];
     for (let li = 0; li < isos.length; li++) {
       const iso = isos[li];
-      if (iso.points.length < 2) continue;
+      const id = `${String.fromCharCode(65 + k)}${li + 1}`;
+      const rawSegs = iso.points.length / 2;
+
+      if (iso.points.length < 2) {
+        diagRows.push({ id, segments: rawSegs, chains: 0, longestChain: 0, accepted: false, reason: 'no segments' });
+        continue;
+      }
 
       // Stitch marching-triangle segment pairs into connected polyline chains
       const chains = stitchSegments(iso.points);
+      const longestChain = chains.length > 0
+        ? chains.reduce((m, c) => Math.max(m, c.length), 0) : 0;
+
       // Pick the longest chain as the representative centerline, then smooth
       const raw = chains.sort((a, b) => b.length - a.length)[0] ?? [];
       const centerline = smoothPolyline(raw, 10);
-      if (centerline.length < 2) continue;
+
+      if (centerline.length < 2) {
+        diagRows.push({ id, segments: rawSegs, chains: chains.length, longestChain, accepted: false, reason: 'centerline < 2 pts after smooth' });
+        continue;
+      }
+
+      diagRows.push({ id, segments: rawSegs, chains: chains.length, longestChain, accepted: true, reason: `cl=${centerline.length}pts` });
 
       const strip: Strip = {
-        id: `${String.fromCharCode(65 + k)}${li + 1}`,
+        id,
         family: k,
         layer: 1,
         isolines: [iso, iso],    // placeholder; boundaries added later
@@ -108,6 +129,46 @@ export function buildKagomePattern(
       allStrips.push(strip);
     }
   }
+
+  // ── Diagnostic summary ────────────────────────────────────────────────────
+  const accepted = diagRows.filter(r => r.accepted);
+  const rejected = diagRows.filter(r => !r.accepted);
+  console.group(`[Kagome] Strip extraction — ${accepted.length}/${diagRows.length} accepted`);
+  console.log(`Accepted ${accepted.length}, Rejected ${rejected.length}`);
+
+  // Tabular view: one row per strip
+  if (typeof console.table === 'function') {
+    console.table(
+      diagRows.map(r => ({
+        id: r.id,
+        segs: r.segments,
+        chains: r.chains,
+        longestChain: r.longestChain,
+        accepted: r.accepted ? '✓' : '✗',
+        reason: r.reason,
+      })),
+    );
+  }
+
+  // Group rejected by reason
+  if (rejected.length > 0) {
+    const byReason: Record<string, string[]> = {};
+    for (const r of rejected) {
+      byReason[r.reason] = [...(byReason[r.reason] ?? []), r.id];
+    }
+    console.warn('[Kagome] Rejected strips by reason:');
+    for (const [reason, ids] of Object.entries(byReason)) {
+      console.warn(`  ${reason}: ${ids.join(', ')}`);
+    }
+
+    // Extra: for each rejected strip, log segment/chain distribution
+    for (const r of rejected) {
+      if (r.chains > 1) {
+        console.warn(`  ${r.id}: ${r.chains} chains (segs=${r.segments}, longestChain=${r.longestChain}) — chain fragmentation?`);
+      }
+    }
+  }
+  console.groupEnd();
 
   // ── 2. Estimate world-space strip widths from adjacent centerline spacing ──
   for (let k = 0; k < 3; k++) {

@@ -87,9 +87,15 @@ export function buildStripMesh(
   widthOverride?: number,
 ): StripMeshResult | null {
   const cl = strip.centerline;
-  if (cl.length < 2) return null;
+  if (cl.length < 2) {
+    console.warn(`[StripMesh] ${strip.id}: centerline too short (${cl.length} pts) — skipped`);
+    return null;
+  }
 
   const rawWidth = widthOverride ?? strip.width;
+  if (rawWidth <= 0) {
+    console.warn(`[StripMesh] ${strip.id}: width=0 (strip.width=${strip.width}, override=${widthOverride}) — using min`);
+  }
   const halfW = Math.max(rawWidth * 0.5, 0.01); // ensure minimum visible width
 
   // Over/under: all strips get a small positive offset so they float above the
@@ -165,14 +171,12 @@ export function buildAllStripMeshes(
   familyColors: [string, string, string],
   widthOverride?: number,
 ): THREE.Mesh[] {
-  // Invalidate normal-lookup cache whenever we build a new set of meshes
-  // (the mesh pointer is stable within one generation, so this is a no-op
-  //  unless the TPMS was regenerated)
   const result: THREE.Mesh[] = [];
+  let nullCount = 0;
 
   for (const strip of strips) {
     const sm = buildStripMesh(strip, mesh, widthOverride);
-    if (!sm) continue;
+    if (!sm) { nullCount++; continue; }
 
     const base = new THREE.Color(familyColors[strip.family]);
 
@@ -199,6 +203,14 @@ export function buildAllStripMeshes(
     const m = new THREE.Mesh(sm.geometry, mat);
     m.userData = { family: sm.family, layer: sm.layer, stripId: sm.stripId };
     result.push(m);
+  }
+
+  console.log(`[StripMesh] buildAllStripMeshes: ${result.length} meshes built, ${nullCount} skipped`);
+  if (nullCount > 0) {
+    const skipped = strips
+      .filter(s => !result.find(m => m.userData.stripId === s.id))
+      .map(s => `${s.id}(cl=${s.centerline.length},w=${s.width.toFixed(3)})`);
+    console.warn(`[StripMesh] Skipped: ${skipped.join(', ')}`);
   }
 
   return result;
