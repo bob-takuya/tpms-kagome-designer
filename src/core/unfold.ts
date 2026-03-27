@@ -1,6 +1,25 @@
+/**
+ * unfold.ts – Phase 4: Geodesic unfolding of Kagome strips to 2D
+ *
+ * Algorithm (per strip):
+ *   1. Walk the 3D centerline [p0, p1, ..., pN]
+ *   2. At each interior point p_i, compute the signed geodesic turning angle:
+ *        θ_i = atan2( (t_in × t_out) · n_i,  t_in · t_out )
+ *      where t_in = normalize(p_i − p_{i−1}),
+ *            t_out= normalize(p_{i+1} − p_i),
+ *            n_i  = surface normal at p_i (nearest vertex)
+ *   3. Accumulate arc lengths → 2D centerline
+ *   4. Build left/right edges at ±halfWidth perpendicular to the 2D tangent
+ *   5. Map junction positions to 2D via closest-centerline-point lookup
+ */
+
 import * as THREE from 'three';
-import type { Strip, StripSegment, Junction } from './kagome';
+import type { Strip, Junction } from './kagome';
 import type { HalfEdgeMesh } from './halfEdge';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public interfaces (backward-compatible with dxf.ts / viewport2d.ts)
+// ─────────────────────────────────────────────────────────────────────────────
 
 export interface UnfoldedStrip {
   stripId: string;
@@ -12,252 +31,295 @@ export interface UnfoldedStrip {
 
 export interface UnfoldedSegment {
   startJunctionId: number | null;
-  endJunctionId: number | null;
-  leftBoundary: THREE.Vector2[];
-  rightBoundary: THREE.Vector2[];
-  centerline: THREE.Vector2[];
-  holes: UnfoldedHole[];
-  width: number;
+  endJunctionId:   number | null;
+  leftBoundary:    THREE.Vector2[];
+  rightBoundary:   THREE.Vector2[];
+  centerline:      THREE.Vector2[];
+  holes:           UnfoldedHole[];
+  width:           number;
 }
 
 export interface UnfoldedHole {
   junctionId: number;
-  center: THREE.Vector2;
-  radius: number;
+  center:     THREE.Vector2;
+  radius:     number;
 }
 
-// Sequential triangle unfolding to preserve edge lengths
-export function unfoldStrip(
-  strip: Strip,
-  mesh: HalfEdgeMesh,
-  junctions: Junction[],
-  scale: number
-): UnfoldedStrip {
-  const unfoldedSegments: UnfoldedSegment[] = [];
+// ─────────────────────────────────────────────────────────────────────────────
+// Spatial hash for nearest-vertex normal lookup (same approach as stripMesh.ts)
+// ─────────────────────────────────────────────────────────────────────────────
 
-  for (const segment of strip.segments) {
-    const unfolded = unfoldSegment(segment, strip, mesh, junctions, scale);
-    unfoldedSegments.push(unfolded);
+interface NormalLookup { fn: (p: THREE.Vector3) => THREE.Vector3; mesh: HalfEdgeMesh }
+let _nlCache: NormalLookup | null = null;
+
+function getNormalLookup(mesh: HalfEdgeMesh): (p: THREE.Vector3) => THREE.Vector3 {
+  if (_nlCache?.mesh === mesh) return _nlCache.fn;
+
+  const CELL = 0.35;
+  const grid = new Map<string, number[]>();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    const k = `${Math.floor(v.x/CELL)},${Math.floor(v.y/CELL)},${Math.floor(v.z/CELL)}`;
+    if (!grid.has(k)) grid.set(k, []);
+    grid.get(k)!.push(i);
   }
 
-  // Calculate bounding box
-  let minX = Infinity, maxX = -Infinity;
-  let minY = Infinity, maxY = -Infinity;
-
-  for (const seg of unfoldedSegments) {
-    for (const pt of [...seg.leftBoundary, ...seg.rightBoundary, ...seg.centerline]) {
-      minX = Math.min(minX, pt.x);
-      maxX = Math.max(maxX, pt.x);
-      minY = Math.min(minY, pt.y);
-      maxY = Math.max(maxY, pt.y);
+  const fn = (p: THREE.Vector3): THREE.Vector3 => {
+    const cx = Math.floor(p.x/CELL), cy = Math.floor(p.y/CELL), cz = Math.floor(p.z/CELL);
+    let minD2 = Infinity, best = 0;
+    for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++)
+    for (let dz = -1; dz <= 1; dz++) {
+      for (const idx of grid.get(`${cx+dx},${cy+dy},${cz+dz}`) ?? []) {
+        const d2 = mesh.vertices[idx].distanceToSquared(p);
+        if (d2 < minD2) { minD2 = d2; best = idx; }
+      }
     }
+    return mesh.normals[best].clone().normalize();
+  };
+
+  _nlCache = { fn, mesh };
+  return fn;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core: unfold a 3D centerline to 2D via signed geodesic turning angles
+// ─────────────────────────────────────────────────────────────────────────────
+
+function unfoldCenterline(
+  cl:    THREE.Vector3[],
+  mesh:  HalfEdgeMesh,
+  scale: number,
+): THREE.Vector2[] {
+  const n = cl.length;
+  if (n === 0) return [];
+  if (n === 1) return [new THREE.Vector2(0, 0)];
+
+  const getNorm = getNormalLookup(mesh);
+  const pts2: THREE.Vector2[] = [new THREE.Vector2(0, 0)];
+
+  let dir = 0; // current 2D direction (radians, 0 = +x)
+
+  for (let i = 1; i < n; i++) {
+    const segLen = cl[i - 1].distanceTo(cl[i]) * scale;
+
+    // Place next point along current direction
+    const prev = pts2[pts2.length - 1];
+    pts2.push(new THREE.Vector2(
+      prev.x + Math.cos(dir) * segLen,
+      prev.y + Math.sin(dir) * segLen,
+    ));
+
+    // Update direction at point i (for the NEXT segment)
+    if (i < n - 1) {
+      const surfN = getNorm(cl[i]);
+      const tIn   = new THREE.Vector3().subVectors(cl[i],   cl[i - 1]).normalize();
+      const tOut  = new THREE.Vector3().subVectors(cl[i + 1], cl[i]).normalize();
+
+      // Signed angle in the surface tangent plane:
+      //   sinθ = (tIn × tOut) · surfN
+      //   cosθ = tIn · tOut
+      const cross = new THREE.Vector3().crossVectors(tIn, tOut);
+      const sinθ  = cross.dot(surfN);
+      const cosθ  = tIn.dot(tOut);
+      const θ     = Math.atan2(sinθ, cosθ);
+
+      dir += θ; // accumulate geodesic curvature
+    }
+  }
+
+  return pts2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build left/right boundary from unfolded centerline + halfWidth
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildBoundaries(
+  cl2: THREE.Vector2[],
+  halfW: number,
+): { left: THREE.Vector2[]; right: THREE.Vector2[] } {
+  const n = cl2.length;
+  const left:  THREE.Vector2[] = [];
+  const right: THREE.Vector2[] = [];
+
+  for (let i = 0; i < n; i++) {
+    // Tangent in 2D (central difference, clamped at ends)
+    const a = cl2[Math.max(0, i - 1)];
+    const b = cl2[Math.min(n - 1, i + 1)];
+    const tx = b.x - a.x, ty = b.y - a.y;
+    const len = Math.sqrt(tx * tx + ty * ty);
+    const nx  = len > 1e-12 ? -ty / len : 0;   // normal (rotated 90° CCW)
+    const ny  = len > 1e-12 ?  tx / len : 1;
+
+    const p = cl2[i];
+    left.push(new THREE.Vector2(p.x + nx * halfW,  p.y + ny * halfW));
+    right.push(new THREE.Vector2(p.x - nx * halfW, p.y - ny * halfW));
+  }
+
+  return { left, right };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Map each junction to the closest 2D centerline position
+// ─────────────────────────────────────────────────────────────────────────────
+
+function mapJunctions(
+  strip:  Strip,
+  cl3:    THREE.Vector3[],
+  cl2:    THREE.Vector2[],
+  _junctionsParam: Junction[],
+  scale:  number,
+): UnfoldedHole[] {
+  const holes: UnfoldedHole[] = [];
+
+  for (const junc of strip.junctions) {
+    let minD2 = Infinity, idx = 0;
+    for (let i = 0; i < cl3.length; i++) {
+      const d2 = cl3[i].distanceToSquared(junc.position);
+      if (d2 < minD2) { minD2 = d2; idx = i; }
+    }
+
+    if (idx < cl2.length) {
+      holes.push({
+        junctionId: junc.id,
+        center:     cl2[idx].clone(),
+        radius:     junc.holeRadius * scale,
+      });
+    }
+  }
+
+  // De-duplicate: if two junctions map to the same 2D point, keep only one
+  const seen = new Set<string>();
+  return holes.filter(h => {
+    const k = `${Math.round(h.center.x * 100)},${Math.round(h.center.y * 100)}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function unfoldStrip(
+  strip:      Strip,
+  mesh:       HalfEdgeMesh,
+  _junctions: Junction[],
+  scale:      number,
+): UnfoldedStrip {
+  const cl3 = strip.centerline;
+
+  // Geodesic unfolding
+  const cl2  = unfoldCenterline(cl3, mesh, scale);
+  const halfW = Math.max(strip.width * scale * 0.5, 0.5); // min 0.5 units visible
+  const { left, right } = buildBoundaries(cl2, halfW);
+
+  // Junction holes (use strip.junctions, not the passed-in array)
+  const holes = mapJunctions(strip, cl3, cl2, strip.junctions, scale);
+
+  // One UnfoldedSegment covers the whole strip
+  const segment: UnfoldedSegment = {
+    startJunctionId: null,
+    endJunctionId:   null,
+    leftBoundary:    left,
+    rightBoundary:   right,
+    centerline:      cl2,
+    holes,
+    width: strip.width * scale,
+  };
+
+  // Bounding box
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of [...left, ...right]) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
   }
 
   return {
     stripId: strip.id,
-    family: strip.family,
-    layer: strip.layer,
-    segments: unfoldedSegments,
-    boundingBox: { minX, maxX, minY, maxY }
+    family:  strip.family,
+    layer:   strip.layer,
+    segments: [segment],
+    boundingBox: { minX, maxX, minY, maxY },
   };
 }
 
-function unfoldSegment(
-  segment: StripSegment,
-  _strip: Strip,
-  _mesh: HalfEdgeMesh,
-  junctions: Junction[],
-  scale: number
-): UnfoldedSegment {
-  const centerline2D: THREE.Vector2[] = [];
-  const leftBoundary2D: THREE.Vector2[] = [];
-  const rightBoundary2D: THREE.Vector2[] = [];
-  const holes: UnfoldedHole[] = [];
+// ─────────────────────────────────────────────────────────────────────────────
+// Layout: row-based packing with max row width
+// ─────────────────────────────────────────────────────────────────────────────
 
-  if (segment.points.length < 2) {
-    return {
-      startJunctionId: segment.startJunctionId,
-      endJunctionId: segment.endJunctionId,
-      leftBoundary: [],
-      rightBoundary: [],
-      centerline: [],
-      holes: [],
-      width: segment.width * scale
-    };
-  }
-
-  // Initialize with first point at origin
-  let currentPos = new THREE.Vector2(0, 0);
-  let currentAngle = 0;
-  let accumulatedLength = 0;
-
-  centerline2D.push(currentPos.clone());
-
-  // Compute perpendicular offset for boundaries
-  const halfWidth = (segment.width * scale) / 2;
-
-  // Add first boundary points
-  const firstDir2D = new THREE.Vector2(Math.cos(currentAngle), Math.sin(currentAngle));
-  const firstPerp = new THREE.Vector2(-firstDir2D.y, firstDir2D.x);
-  leftBoundary2D.push(currentPos.clone().add(firstPerp.clone().multiplyScalar(halfWidth)));
-  rightBoundary2D.push(currentPos.clone().sub(firstPerp.clone().multiplyScalar(halfWidth)));
-
-  // Unfold each segment preserving edge lengths
-  for (let i = 1; i < segment.points.length; i++) {
-    const p0 = segment.points[i - 1];
-    const p1 = segment.points[i];
-
-    // 3D edge length
-    const edgeLength3D = p0.distanceTo(p1) * scale;
-
-    // Place next point along current direction
-    currentPos = currentPos.clone().add(
-      new THREE.Vector2(
-        Math.cos(currentAngle) * edgeLength3D,
-        Math.sin(currentAngle) * edgeLength3D
-      )
-    );
-
-    centerline2D.push(currentPos.clone());
-    accumulatedLength += edgeLength3D;
-
-    // Compute tangent direction for boundaries
-    if (i < segment.points.length - 1) {
-      const p2 = segment.points[i + 1];
-      const dir1 = new THREE.Vector3().subVectors(p1, p0).normalize();
-      const dir2 = new THREE.Vector3().subVectors(p2, p1).normalize();
-
-      // Angle change between segments
-      const angleChange = Math.atan2(
-        dir1.clone().cross(dir2).length(),
-        dir1.dot(dir2)
-      );
-
-      // Update direction (turning gradually)
-      currentAngle += angleChange * 0.5;
-    }
-
-    const dir2D = new THREE.Vector2(Math.cos(currentAngle), Math.sin(currentAngle));
-    const perp = new THREE.Vector2(-dir2D.y, dir2D.x);
-    leftBoundary2D.push(currentPos.clone().add(perp.clone().multiplyScalar(halfWidth)));
-    rightBoundary2D.push(currentPos.clone().sub(perp.clone().multiplyScalar(halfWidth)));
-  }
-
-  // Map junction holes to 2D
-  for (const junction of junctions) {
-    const isStartJunction = segment.startJunctionId === junction.id;
-    const isEndJunction = segment.endJunctionId === junction.id;
-
-    if (isStartJunction) {
-      holes.push({
-        junctionId: junction.id,
-        center: centerline2D[0].clone(),
-        radius: junction.holeRadius * scale
-      });
-    } else if (isEndJunction) {
-      holes.push({
-        junctionId: junction.id,
-        center: centerline2D[centerline2D.length - 1].clone(),
-        radius: junction.holeRadius * scale
-      });
-    } else {
-      // Check if junction is along this segment
-      const junctionPos3D = junction.position;
-      let minDist = Infinity;
-      let closestIdx = -1;
-
-      for (let i = 0; i < segment.points.length; i++) {
-        const dist = segment.points[i].distanceTo(junctionPos3D);
-        if (dist < minDist) {
-          minDist = dist;
-          closestIdx = i;
-        }
-      }
-
-      // If junction is close to segment
-      const threshold = segment.width * 2;
-      if (minDist < threshold && closestIdx >= 0 && closestIdx < centerline2D.length) {
-        holes.push({
-          junctionId: junction.id,
-          center: centerline2D[closestIdx].clone(),
-          radius: junction.holeRadius * scale
-        });
-      }
-    }
-  }
-
-  return {
-    startJunctionId: segment.startJunctionId,
-    endJunctionId: segment.endJunctionId,
-    leftBoundary: leftBoundary2D,
-    rightBoundary: rightBoundary2D,
-    centerline: centerline2D,
-    holes,
-    width: segment.width * scale
-  };
-}
-
-// Layout multiple unfolded strips on a 2D canvas
 export interface StripLayout {
-  strips: UnfoldedStrip[];
-  totalWidth: number;
+  strips:      UnfoldedStrip[];
+  totalWidth:  number;
   totalHeight: number;
-  positions: THREE.Vector2[];
+  positions:   THREE.Vector2[];
 }
 
 export function layoutStrips(
-  strips: UnfoldedStrip[],
-  margin: number
+  strips:    UnfoldedStrip[],
+  margin:    number,
+  maxRowWidth = 400,   // world units per row before wrapping
 ): StripLayout {
   const positions: THREE.Vector2[] = [];
-  let currentX = margin;
-  let maxHeight = 0;
+
+  let rowX     = margin;
+  let rowY     = margin;
+  let rowH     = 0;
 
   for (const strip of strips) {
-    const width = strip.boundingBox.maxX - strip.boundingBox.minX;
-    const height = strip.boundingBox.maxY - strip.boundingBox.minY;
+    const w = strip.boundingBox.maxX - strip.boundingBox.minX;
+    const h = strip.boundingBox.maxY - strip.boundingBox.minY;
 
-    // Offset to move strip's min corner to currentX, margin
+    // Wrap to next row when this strip doesn't fit
+    if (rowX + w > maxRowWidth && rowX > margin) {
+      rowY += rowH + margin;
+      rowX  = margin;
+      rowH  = 0;
+    }
+
     positions.push(new THREE.Vector2(
-      currentX - strip.boundingBox.minX,
-      margin - strip.boundingBox.minY
+      rowX - strip.boundingBox.minX,
+      rowY - strip.boundingBox.minY,
     ));
 
-    currentX += width + margin;
-    maxHeight = Math.max(maxHeight, height);
+    rowX += w + margin;
+    rowH  = Math.max(rowH, h);
   }
 
-  return {
-    strips,
-    totalWidth: currentX,
-    totalHeight: maxHeight + 2 * margin,
-    positions
-  };
+  const totalWidth  = maxRowWidth + margin;
+  const totalHeight = rowY + rowH + margin;
+
+  return { strips, totalWidth, totalHeight, positions };
 }
 
-// Apply layout offset to unfolded strips
+// ─────────────────────────────────────────────────────────────────────────────
+// Apply layout offsets to all segments/holes/boundaries
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function applyLayout(layout: StripLayout): UnfoldedStrip[] {
   return layout.strips.map((strip, idx) => {
-    const offset = layout.positions[idx];
+    const off = layout.positions[idx];
 
     return {
       ...strip,
       segments: strip.segments.map(seg => ({
         ...seg,
-        leftBoundary: seg.leftBoundary.map(p => p.clone().add(offset)),
-        rightBoundary: seg.rightBoundary.map(p => p.clone().add(offset)),
-        centerline: seg.centerline.map(p => p.clone().add(offset)),
-        holes: seg.holes.map(h => ({
+        leftBoundary:  seg.leftBoundary.map(p  => p.clone().add(off)),
+        rightBoundary: seg.rightBoundary.map(p  => p.clone().add(off)),
+        centerline:    seg.centerline.map(p    => p.clone().add(off)),
+        holes:         seg.holes.map(h => ({
           ...h,
-          center: h.center.clone().add(offset)
-        }))
+          center: h.center.clone().add(off),
+        })),
       })),
       boundingBox: {
-        minX: strip.boundingBox.minX + offset.x,
-        maxX: strip.boundingBox.maxX + offset.x,
-        minY: strip.boundingBox.minY + offset.y,
-        maxY: strip.boundingBox.maxY + offset.y
-      }
+        minX: strip.boundingBox.minX + off.x,
+        maxX: strip.boundingBox.maxX + off.x,
+        minY: strip.boundingBox.minY + off.y,
+        maxY: strip.boundingBox.maxY + off.y,
+      },
     };
   });
 }
