@@ -101,47 +101,50 @@ export function buildKagomePattern(
         continue;
       }
 
-      // Stitch marching-triangle segment pairs into connected polyline chains
+      // Stitch marching-triangle segment pairs into connected polyline chains.
+      // Build ONE STRIP PER CHAIN so every isoline segment gets a ribbon.
+      // (Previously only the longest chain was used; ~50-70% of segments had
+      //  no ribbon despite showing up as thin isoline underlay lines.)
       const chains = stitchSegments(iso.points);
-      const longestChain = chains.length > 0
-        ? chains.reduce((m, c) => Math.max(m, c.length), 0) : 0;
+      chains.sort((a, b) => b.length - a.length); // longest first
 
-      // Pick the longest chain, smooth, then re-project onto the surface
-      const raw      = chains.sort((a, b) => b.length - a.length)[0] ?? [];
-      const smoothed = smoothPolyline(raw, 4);
+      const longestChain = chains.length > 0 ? chains[0].length : 0;
+      let acceptedChains = 0;
 
-      // Measure max drift before projection (diagnostic)
-      let maxDrift = 0;
-      const centerline = smoothed.map(p => {
-        const projected = projectToSurface(p);
-        maxDrift = Math.max(maxDrift, p.distanceTo(projected));
-        return projected;
-      });
+      for (let ci = 0; ci < chains.length; ci++) {
+        const raw = chains[ci];
+        if (raw.length < 2) continue;
 
-      if (centerline.length < 2) {
-        diagRows.push({ id, segments: rawSegs, chains: chains.length, longestChain, accepted: false, reason: 'centerline < 2 pts after smooth' });
-        continue;
+        const smoothed = smoothPolyline(raw, 4);
+        const centerline = smoothed.map(p => projectToSurface(p));
+        if (centerline.length < 2) continue;
+
+        // Give each chain a unique ID: "A1" for single chain, "A1_2" for extra chains
+        const chainSuffix = chains.length > 1 ? `_${ci + 1}` : '';
+        const stripId = `${id}${chainSuffix}`;
+
+        const strip: Strip = {
+          id: stripId,
+          family: k,
+          layer: 1,
+          isolines: [iso, iso],
+          centerline,
+          width: 0,
+          junctions: [],
+          segments: [],
+        };
+        families[k].push(strip);
+        allStrips.push(strip);
+        acceptedChains++;
       }
 
       diagRows.push({
         id, segments: rawSegs, chains: chains.length, longestChain,
-        accepted: true,
-        reason: `cl=${centerline.length}pts drift=${maxDrift.toFixed(4)}`,
+        accepted: acceptedChains > 0,
+        reason: acceptedChains > 0
+          ? `${acceptedChains} chain(s) → ${acceptedChains} strips`
+          : 'no valid chains',
       });
-
-      const strip: Strip = {
-        id,
-        family: k,
-        layer: 1,
-        isolines: [iso, iso],    // placeholder; boundaries added later
-        centerline,
-        width: 0,                // computed below
-        junctions: [],
-        segments: [],
-      };
-
-      families[k].push(strip);
-      allStrips.push(strip);
     }
   }
 
