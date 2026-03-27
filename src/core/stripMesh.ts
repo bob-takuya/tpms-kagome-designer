@@ -156,10 +156,39 @@ export function buildStripMesh(
 
   if (indices.length === 0) return null;
 
+  // ── Diagnostics ────────────────────────────────────────────────────────────
+  let nanCount     = 0;
+  let zeroRowCount = 0;
+  for (let i = 0; i < n; i++) {
+    const base = i * 6;
+    const lx = positions[base],   ly = positions[base+1], lz = positions[base+2];
+    const rx = positions[base+3], ry = positions[base+4], rz = positions[base+5];
+    if (!isFinite(lx)||!isFinite(ly)||!isFinite(lz)||
+        !isFinite(rx)||!isFinite(ry)||!isFinite(rz)) nanCount++;
+    const rowWidth = Math.hypot(rx - lx, ry - ly, rz - lz);
+    if (rowWidth < 1e-5) zeroRowCount++;
+  }
+
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,    3));
   geometry.setAttribute('normal',   new THREE.Float32BufferAttribute(vertNormals,  3));
   geometry.setIndex(indices);
+  geometry.computeBoundingSphere();
+
+  const bs = geometry.boundingSphere;
+  const bsR = bs?.radius  ?? -1;
+  const bsC = bs?.center;
+
+  const ok = nanCount === 0 && zeroRowCount < n * 0.5 && bsR > 1e-6;
+  const tag = ok ? '[strip ✓]' : '[strip ✗]';
+  console[ok ? 'log' : 'warn'](
+    `${tag} ${strip.id.padEnd(3)} ` +
+    `clPts=${String(n).padStart(3)} halfW=${halfW.toFixed(3)} ` +
+    `nan=${nanCount} zeroRow=${zeroRowCount}/${n} ` +
+    `bs.r=${bsR.toFixed(3)} ` +
+    `bs.c=(${bsC?.x.toFixed(2)},${bsC?.y.toFixed(2)},${bsC?.z.toFixed(2)})`,
+  );
+  // ── End diagnostics ────────────────────────────────────────────────────────
 
   return { geometry, family: strip.family, layer: strip.layer, stripId: strip.id };
 }
