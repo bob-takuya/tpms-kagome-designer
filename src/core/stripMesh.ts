@@ -180,24 +180,27 @@ export function buildAllStripMeshes(
 
     const base = new THREE.Color(familyColors[strip.family]);
 
-    // Vary brightness by over/under
+    // Vary brightness by over/under (pure colour, no transparency)
+    // Transparency in the ribbon material pushes objects into Three.js's
+    // "transparent pass" which renders back-to-front; when a ribbon sits
+    // inside the (also-transparent) TPMS surface the surface wins and the
+    // ribbon disappears.  Keep ribbons fully opaque to stay in the opaque pass.
     const col =
       strip.layer === 2 ? base.clone() :
-      strip.layer === 1 ? base.clone().multiplyScalar(0.80) :
-      base.clone().multiplyScalar(0.55);
+      strip.layer === 1 ? base.clone().multiplyScalar(0.85) :
+      base.clone().multiplyScalar(0.60);
 
-    const opacity =
-      strip.layer === 2 ? 1.00 :
-      strip.layer === 1 ? 0.90 :
-      0.70;
-
-    const mat = new THREE.MeshPhongMaterial({
+    // MeshBasicMaterial: no lighting dependency → always visible regardless
+    // of normal orientation or light position.
+    // polygonOffset: push the ribbon slightly in front of the TPMS surface so
+    // no z-fighting even when the ribbon lies exactly on the surface.
+    const mat = new THREE.MeshBasicMaterial({
       color: col,
-      emissive: strip.layer === 2 ? base.clone().multiplyScalar(0.15) : new THREE.Color(0),
       side: THREE.DoubleSide,
-      transparent: opacity < 1.0,
-      opacity,
-      shininess: 50,
+      transparent: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -2,
+      polygonOffsetUnits: -2,
     });
 
     const m = new THREE.Mesh(sm.geometry, mat);
