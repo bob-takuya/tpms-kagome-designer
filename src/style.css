@@ -233,6 +233,38 @@ body {
   cursor: pointer;
 }
 
+/* Calculate button */
+.calculate-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.calculate-btn {
+  flex: 1;
+  padding: 9px 14px;
+  background: #2a7d4f;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+  transition: background 0.15s;
+}
+.calculate-btn:hover { background: #35a366; }
+.calculate-btn:disabled { background: #444; cursor: not-allowed; }
+
+.calc-status {
+  font-size: 13px;
+  color: #35a366;
+  min-width: 16px;
+}
+
 /* Buttons */
 .button-group {
   display: flex;

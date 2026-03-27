@@ -21,6 +21,15 @@ export function createSidebar(container: HTMLElement): void {
     </div>
   `;
 
+  // Inject Calculate button before sidebar content
+  const calcSection = document.createElement('div');
+  calcSection.className = 'calculate-section';
+  calcSection.innerHTML = `
+    <button id="calculate-btn" class="calculate-btn">▶ Calculate</button>
+    <span id="calc-status" class="calc-status"></span>
+  `;
+  sidebar.insertBefore(calcSection, sidebar.querySelector('.sidebar-content')!);
+
   container.appendChild(sidebar);
 
   setupEventListeners();
@@ -196,13 +205,33 @@ function createExportControls(): string {
 }
 
 function setupEventListeners(): void {
-  // Accordion toggle
+  // ── Calculate button ────────────────────────────────────────────────────────
+  // Heavy computation (Phase 1+2+3) is only triggered here, not on slider drag.
+  document.getElementById('calculate-btn')?.addEventListener('click', () => {
+    const btn    = document.getElementById('calculate-btn') as HTMLButtonElement;
+    const status = document.getElementById('calc-status')!;
+    btn.disabled = true;
+    btn.textContent = '⏳ Calculating…';
+    status.textContent = '';
+
+    // Yield to the browser so the button UI updates before blocking work starts
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.dispatchEvent(new CustomEvent('regenerate-mesh'));
+        btn.disabled = false;
+        btn.textContent = '▶ Calculate';
+        status.textContent = '✓';
+        setTimeout(() => { status.textContent = ''; }, 1500);
+      });
+    });
+  });
+
+  // ── Accordion toggle ────────────────────────────────────────────────────────
   document.querySelectorAll('.accordion-header').forEach(header => {
     header.addEventListener('click', () => {
       const section = header.getAttribute('data-section');
       const content = document.getElementById(`section-${section}`);
       const icon = header.querySelector('.accordion-icon');
-
       if (content && icon) {
         content.classList.toggle('collapsed');
         icon.textContent = content.classList.contains('collapsed') ? '▶' : '▼';
@@ -216,85 +245,59 @@ function setupEventListeners(): void {
     document.querySelector('.sidebar')?.classList.toggle('collapsed');
   });
 
-  // TPMS controls
+  // ── TPMS controls – update store only (Calculate triggers recompute) ────────
   setupSlider('surface-type', 'select', (value) => {
     store.getState().setTPMS({ surfaceType: value as SurfaceType });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   setupSlider('period', 'range', (value) => {
     store.getState().setTPMS({ period: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   setupSlider('base-t', 'range', (value) => {
     store.getState().setTPMS({ baseT: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   setupSlider('bbox-min', 'range', (value) => {
-    const state = store.getState();
-    store.getState().setTPMS({ boundingBox: { ...state.tpms.boundingBox, min: parseFloat(value) } });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
+    const s = store.getState();
+    s.setTPMS({ boundingBox: { ...s.tpms.boundingBox, min: parseFloat(value) } });
   });
-
   setupSlider('bbox-max', 'range', (value) => {
-    const state = store.getState();
-    store.getState().setTPMS({ boundingBox: { ...state.tpms.boundingBox, max: parseFloat(value) } });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
+    const s = store.getState();
+    s.setTPMS({ boundingBox: { ...s.tpms.boundingBox, max: parseFloat(value) } });
   });
-
   setupSlider('resolution', 'range', (value) => {
     store.getState().setTPMS({ gridResolution: parseInt(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
 
-  // Noise controls
+  // ── Noise controls (store-only) ─────────────────────────────────────────────
   document.getElementById('noise-enabled')?.addEventListener('change', (e) => {
     store.getState().setNoise({ enabled: (e.target as HTMLInputElement).checked });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   setupSlider('noise-amplitude', 'range', (value) => {
     store.getState().setNoise({ amplitude: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   setupSlider('noise-frequency', 'range', (value) => {
     store.getState().setNoise({ frequency: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
-
   document.getElementById('noise-seed')?.addEventListener('change', (e) => {
     store.getState().setNoise({ seed: parseInt((e.target as HTMLInputElement).value) });
-    window.dispatchEvent(new CustomEvent('regenerate-mesh'));
   });
 
-  // Strip controls
+  // ── Strip controls (store-only) ─────────────────────────────────────────────
   setupSlider('num-isolines', 'range', (value) => {
     store.getState().setStrip({ numIsolines: parseInt(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-pattern'));
   });
-
   setupSlider('strip-method', 'select', (value) => {
     store.getState().setStrip({ method: value as 'A' | 'B' });
-    window.dispatchEvent(new CustomEvent('regenerate-pattern'));
   });
-
   setupSlider('strip-width', 'range', (value) => {
     store.getState().setStrip({ stripWidth: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-pattern'));
   });
-
   setupSlider('width-ratio', 'range', (value) => {
     store.getState().setStrip({ widthRatio: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-pattern'));
   });
 
-  // Kagome controls
+  // ── Kagome controls (store-only) ────────────────────────────────────────────
   setupSlider('hole-radius', 'range', (value) => {
     store.getState().setKagome({ holeRadius: parseFloat(value) });
-    window.dispatchEvent(new CustomEvent('regenerate-pattern'));
   });
 
   for (let i = 0; i < 3; i++) {
