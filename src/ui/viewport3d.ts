@@ -179,12 +179,20 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   ctx.isolinesByFamily = isolinesByFamily;
 
   // ── Stage 3 – Kagome strip extraction ─────────────────────────────────────
+  // Convert mm values to world units using the physical scale
+  const scale = state.develop.scale;   // mm per world unit
+  const holeRadiusWorld  = state.kagome.holeRadiusMm  / scale;
+  const stripWidthWorld  = state.strip.stripWidthMm   / scale;
+
   ctx.kagomePattern = buildKagomePattern(
     mesh,
     stripeFields,
     isolinesByFamily,
     state.strip.numIsolines,
-    state.kagome.holeRadius,
+    holeRadiusWorld,
+    state.strip.method,
+    state.strip.widthRatio,
+    stripWidthWorld,
   );
 
   const { strips, junctions } = ctx.kagomePattern;
@@ -197,8 +205,7 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // ── Stage 3 visualization ──────────────────────────────────────────────────
 
   // 3a. Ribbon meshes for each strip (with over/under layer offsets)
-  //     Width fallback: use store's stripWidth if per-strip width is zero
-  const widthFallback = state.strip.stripWidth;
+  const widthFallback = stripWidthWorld;
   const stripThreeMeshes = buildAllStripMeshes(
     strips,
     mesh,

@@ -118,25 +118,25 @@ function createStripControls(): string {
   const state = store.getState();
   return `
     <div class="control-group">
-      <label for="num-isolines">Number of Isolines N</label>
+      <label for="num-isolines">アイソライン本数 N</label>
       <input type="range" id="num-isolines" min="2" max="20" step="1" value="${state.strip.numIsolines}">
       <span class="value-display" id="num-isolines-value">${state.strip.numIsolines}</span>
     </div>
     <div class="control-group">
-      <label for="strip-method">Method</label>
+      <label for="strip-method">幅の決め方</label>
       <select id="strip-method">
-        <option value="A" ${state.strip.method === 'A' ? 'selected' : ''}>A - Isoline Pair</option>
-        <option value="B" ${state.strip.method === 'B' ? 'selected' : ''}>B - Width Ratio</option>
+        <option value="A" ${state.strip.method === 'A' ? 'selected' : ''}>A - アイソライン間隔比（非均一）</option>
+        <option value="B" ${state.strip.method === 'B' ? 'selected' : ''}>B - mm 直接指定（均一）</option>
       </select>
     </div>
-    <div class="control-group">
-      <label for="strip-width">Strip Width</label>
-      <input type="range" id="strip-width" min="0.01" max="0.5" step="0.01" value="${state.strip.stripWidth}">
-      <span class="value-display" id="strip-width-value">${state.strip.stripWidth.toFixed(2)}</span>
+    <div class="control-group" id="strip-width-mm-group">
+      <label for="strip-width-mm">ストリップ幅 (mm) <small>[B案]</small></label>
+      <input type="range" id="strip-width-mm" min="1" max="50" step="0.5" value="${state.strip.stripWidthMm}">
+      <span class="value-display" id="strip-width-mm-value">${state.strip.stripWidthMm} mm</span>
     </div>
-    <div class="control-group">
-      <label for="width-ratio">Width Ratio ρ</label>
-      <input type="range" id="width-ratio" min="0.1" max="0.9" step="0.05" value="${state.strip.widthRatio}">
+    <div class="control-group" id="width-ratio-group">
+      <label for="width-ratio">幅比率 ρ <small>[A案]</small></label>
+      <input type="range" id="width-ratio" min="0.1" max="0.95" step="0.05" value="${state.strip.widthRatio}">
       <span class="value-display" id="width-ratio-value">${state.strip.widthRatio.toFixed(2)}</span>
     </div>
   `;
@@ -146,9 +146,9 @@ function createKagomeControls(): string {
   const state = store.getState();
   return `
     <div class="control-group">
-      <label for="hole-radius">Hole Radius</label>
-      <input type="range" id="hole-radius" min="0.005" max="0.1" step="0.005" value="${state.kagome.holeRadius}">
-      <span class="value-display" id="hole-radius-value">${state.kagome.holeRadius.toFixed(3)}</span>
+      <label for="hole-radius">ジャンクション穴径 (mm)</label>
+      <input type="range" id="hole-radius" min="0.5" max="10" step="0.5" value="${state.kagome.holeRadiusMm}">
+      <span class="value-display" id="hole-radius-value">${state.kagome.holeRadiusMm} mm</span>
     </div>
     <div class="control-group">
       <label>Layer Colors</label>
@@ -288,16 +288,25 @@ function setupEventListeners(): void {
   setupSlider('strip-method', 'select', (value) => {
     store.getState().setStrip({ method: value as 'A' | 'B' });
   });
-  setupSlider('strip-width', 'range', (value) => {
-    store.getState().setStrip({ stripWidth: parseFloat(value) });
+  setupSlider('strip-width-mm', 'range', (value) => {
+    const v = parseFloat(value);
+    store.getState().setStrip({ stripWidthMm: v });
+    const el = document.getElementById('strip-width-mm-value');
+    if (el) el.textContent = `${v} mm`;
   });
   setupSlider('width-ratio', 'range', (value) => {
-    store.getState().setStrip({ widthRatio: parseFloat(value) });
+    const v = parseFloat(value);
+    store.getState().setStrip({ widthRatio: v });
+    const el = document.getElementById('width-ratio-value');
+    if (el) el.textContent = v.toFixed(2);
   });
 
   // ── Kagome controls (store-only) ────────────────────────────────────────────
   setupSlider('hole-radius', 'range', (value) => {
-    store.getState().setKagome({ holeRadius: parseFloat(value) });
+    const v = parseFloat(value);
+    store.getState().setKagome({ holeRadiusMm: v });
+    const el = document.getElementById('hole-radius-value');
+    if (el) el.textContent = `${v} mm`;
   });
 
   for (let i = 0; i < 3; i++) {

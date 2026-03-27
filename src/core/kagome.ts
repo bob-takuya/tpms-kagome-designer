@@ -24,7 +24,8 @@ export interface Strip {
   layer: number;             // 0=under, 1=neutral, 2=over  (per-junction)
   isolines: [Isoline, Isoline];  // [left-boundary isoline, right-boundary isoline] (kept for compat)
   centerline: THREE.Vector3[];   // stitched polyline
-  width: number;             // world-space half-width × 2
+  width: number;             // average world-space half-width × 2 (backward compat)
+  widths: number[];          // per-point width (same length as centerline) for developable unfolding
   junctions: Junction[];
   segments: StripSegment[];
 }
@@ -70,10 +71,13 @@ export interface KagomePattern {
  */
 export function buildKagomePattern(
   mesh: HalfEdgeMesh,
-  _stripeFields: [Float64Array, Float64Array, Float64Array],
+  _stripeFields:    [Float64Array, Float64Array, Float64Array],
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]],
-  _numStripes: number,
-  holeRadius: number,
+  _numStripes:      number,
+  holeRadius:       number,
+  widthMethod:      'A' | 'B' = 'A',
+  widthRatio:       number    = 0.75,
+  stripWidthWorld:  number    = 0,    // world units; used when widthMethod='B'
 ): KagomePattern {
 
   // Build surface projector once (shared across all strips)
@@ -129,6 +133,7 @@ export function buildKagomePattern(
           isolines: [iso, iso],
           centerline,
           width: 0,
+          widths: new Array(centerline.length).fill(0),  // filled in step 2
           junctions: [],
           segments: [],
         };
@@ -220,36 +225,49 @@ export function buildKagomePattern(
     }
     const repList = [...repMap.values()];
 
-    // Global average inter-isoline spacing (fallback)
-    const allSpacings: number[] = [];
-    for (let i = 0; i < repList.length - 1; i++) {
-      const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
-      if (d > 1e-6) allSpacings.push(d);
-    }
-    const avgSpacing = allSpacings.length > 0
-      ? allSpacings.reduce((a, b) => a + b, 0) / allSpacings.length
-      : 0.3;
-
-    // Assign LOCAL width to each isoline (avg of spacings to prev + next representative)
-    for (let i = 0; i < repList.length; i++) {
-      const localS: number[] = [];
-      if (i > 0) {
-        const d = averageCenterlineDistance(repList[i - 1].centerline, repList[i].centerline);
-        if (d > 1e-6) localS.push(d);
-      }
-      if (i < repList.length - 1) {
-        const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
-        if (d > 1e-6) localS.push(d);
-      }
-      const localSpacing = localS.length > 0
-        ? localS.reduce((a, b) => a + b, 0) / localS.length
-        : avgSpacing;
-      const width = localSpacing * 0.75;
-
-      // All chains of this isoline get the same width
-      const key = isoKey(repList[i].id);
+    if (widthMethod === 'B') {
+      // ── Method B: uniform mm-specified width ──────────────────────────────
       for (const s of fam) {
-        if (isoKey(s.id) === key) s.width = width;
+        s.width = stripWidthWorld;
+        s.widths = new Array(s.centerline.length).fill(stripWidthWorld);
+      }
+    } else {
+      // ── Method A: per-isoline local spacing × widthRatio (non-uniform) ───
+
+      // Global average inter-isoline spacing (fallback)
+      const allSpacings: number[] = [];
+      for (let i = 0; i < repList.length - 1; i++) {
+        const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
+        if (d > 1e-6) allSpacings.push(d);
+      }
+      const avgSpacing = allSpacings.length > 0
+        ? allSpacings.reduce((a, b) => a + b, 0) / allSpacings.length
+        : 0.3;
+
+      // Assign LOCAL width to each isoline (avg of spacings to prev + next)
+      for (let i = 0; i < repList.length; i++) {
+        const localS: number[] = [];
+        if (i > 0) {
+          const d = averageCenterlineDistance(repList[i - 1].centerline, repList[i].centerline);
+          if (d > 1e-6) localS.push(d);
+        }
+        if (i < repList.length - 1) {
+          const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
+          if (d > 1e-6) localS.push(d);
+        }
+        const localSpacing = localS.length > 0
+          ? localS.reduce((a, b) => a + b, 0) / localS.length
+          : avgSpacing;
+        const width = localSpacing * widthRatio;
+
+        // All chains of this isoline get the same width
+        const key = isoKey(repList[i].id);
+        for (const s of fam) {
+          if (isoKey(s.id) === key) {
+            s.width = width;
+            s.widths = new Array(s.centerline.length).fill(width);
+          }
+        }
       }
     }
   }
