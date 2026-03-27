@@ -124,7 +124,9 @@ function unfoldCenterline(
       const cosθ  = tIn.dot(tOut);
       const θ     = Math.atan2(sinθ, cosθ);
 
-      dir += θ; // accumulate geodesic curvature
+      // Clamp per-step angle (30°) – prevents spiraling on high-curvature isolines
+      const MAX_STEP = Math.PI / 6;
+      dir += Math.max(-MAX_STEP, Math.min(MAX_STEP, θ));
     }
   }
 

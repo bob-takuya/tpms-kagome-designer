@@ -95,8 +95,8 @@ const defaultState: AppState = {
     layerColors: ['#ff4444', '#ffff44', '#44ff44'],
   },
   develop: {
-    scale: 100,
-    margin: 10,
+    scale: 50,   // mm per TPMS world unit (1 unit ≈ 50 mm → period ≈ 314 mm)
+    margin: 5,
   },
   export: {
     includeHoleIds: true,

@@ -165,9 +165,9 @@ function createDevelopControls(): string {
   const state = store.getState();
   return `
     <div class="control-group">
-      <label for="develop-scale">Scale (mm/unit)</label>
-      <input type="range" id="develop-scale" min="10" max="500" step="10" value="${state.develop.scale}">
-      <span class="value-display" id="develop-scale-value">${state.develop.scale}</span>
+      <label for="develop-scale">スケール (mm/unit)</label>
+      <input type="range" id="develop-scale" min="5" max="200" step="5" value="${state.develop.scale}">
+      <span class="value-display" id="develop-scale-value">${state.develop.scale} mm</span>
     </div>
     <div class="control-group">
       <label for="develop-margin">Margin (mm)</label>
@@ -312,7 +312,10 @@ function setupEventListeners(): void {
 
   // Develop controls
   setupSlider('develop-scale', 'range', (value) => {
-    store.getState().setDevelop({ scale: parseFloat(value) });
+    const v = parseFloat(value);
+    store.getState().setDevelop({ scale: v });
+    const el = document.getElementById('develop-scale-value');
+    if (el) el.textContent = `${v} mm`;
     window.dispatchEvent(new CustomEvent('regenerate-unfold'));
   });
 

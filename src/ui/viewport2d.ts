@@ -144,24 +144,22 @@ export function regenerateUnfold(
     unfoldStrip(strip, mesh, pattern.junctions, scale),
   );
 
-  // Compute a sane maxRowWidth so the final layout is roughly 2:1 (landscape).
-  // All coordinates are in "scaled" space (strip coords × develop.scale).
-  // We target aspect ratio ≈ 2.0 (width ≈ 2 × height).
+  // Compute maxRowWidth from strip sizes only (independent of canvas zoom).
+  // Target: roughly 2:1 aspect ratio (landscape sheet).
+  // All strip coordinates are already in mm (scale = mm/world-unit).
   let totalArea = 0;
   for (const s of raw) {
     const w = (s.boundingBox.maxX - s.boundingBox.minX) + margin;
     const h = (s.boundingBox.maxY - s.boundingBox.minY) + margin;
-    totalArea += w * h;
+    totalArea += Math.max(w * h, 1);
   }
-  const targetAspect = 2.0;
-  const maxRowWidth  = Math.max(Math.sqrt(totalArea * targetAspect), 10);
+  const maxRowWidth = Math.max(Math.sqrt(totalArea * 2.0), scale * 2);
 
   const layout = layoutStrips(raw, margin, maxRowWidth);
   vp.unfoldedStrips = applyLayout(layout);
 
   console.log(
-    `[Unfold] built ${vp.unfoldedStrips.length} unfolded strips; ` +
-    `layout ${layout.totalWidth.toFixed(1)} × ${layout.totalHeight.toFixed(1)} world units`,
+    `[Unfold] ${vp.unfoldedStrips.length} strips in ${layout.totalWidth.toFixed(0)}×${layout.totalHeight.toFixed(0)} mm`,
   );
 
   fitView(vp);
