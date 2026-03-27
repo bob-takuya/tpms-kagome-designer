@@ -1,15 +1,21 @@
 /**
- * unfold.ts – Phase 4: 2D flat-pattern unfolding of Kagome strips
+ * unfold.ts – Phase 4: Developable-strip approximation + isometric triangle unfolding
  *
- * Geodesic unfolding via parallel transport:
- *   At each interior point p_i, the "in-surface normal" vector n_s is
- *   parallel-transported along the curve (no mesh-normal lookups needed).
- *   The signed geodesic turning angle uses this self-consistent n_s:
- *     θ_i = atan2( (t_in × t_out) · n_s,  t_in · t_out )
- *   Clamped to ±MAX_STEP per link, and total accumulated turn ≤ 270°.
- *   Strips that accumulate > 270° are re-rendered as straight lines (fallback).
+ * TPMS surfaces have negative Gaussian curvature everywhere → strips are NOT
+ * developable. We approximate each strip as a RULED surface using surface normals:
  *
- * Outputs coordinates in mm (scale = mm per TPMS world unit).
+ *   L3[i] = cl3[i] + halfW · perp_i
+ *   R3[i] = cl3[i] − halfW · perp_i
+ *   perp_i = normalize( tangent_i × surfNormal_i )  ← in-surface perpendicular
+ *
+ * Then unfold the ruled strip to 2D using sequential TRIANGLE UNFOLDING:
+ *
+ *   Each quad [L_i, R_i, L_{i+1}, R_{i+1}] is split into two triangles.
+ *   Edge lengths are preserved exactly → isometric for developable surfaces,
+ *   minimal-distortion for non-developable ones.
+ *
+ * Coordinates are output in mm (scale = mm per TPMS world unit).
+ * Strip width per isoline is non-uniform (reflects local isoline density).
  */
 
 import * as THREE from 'three';
@@ -45,127 +51,158 @@ export interface UnfoldedHole {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Straight arc-length unrolling (used as fallback when curvature blows up)
+// Spatial hash for surface normal lookup
 // ─────────────────────────────────────────────────────────────────────────────
 
-function unfoldStraight(cl: THREE.Vector3[], scale: number): THREE.Vector2[] {
-  const pts: THREE.Vector2[] = [];
-  let x = 0;
-  for (let i = 0; i < cl.length; i++) {
-    pts.push(new THREE.Vector2(x, 0));
-    if (i < cl.length - 1) x += cl[i].distanceTo(cl[i + 1]) * scale;
+let _normCache: { mesh: HalfEdgeMesh; fn: (p: THREE.Vector3) => THREE.Vector3 } | null = null;
+
+function buildNormalLookup(mesh: HalfEdgeMesh): (p: THREE.Vector3) => THREE.Vector3 {
+  if (_normCache?.mesh === mesh) return _normCache.fn;
+
+  const CELL = 0.35;
+  const grid = new Map<string, number[]>();
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    const k = `${Math.floor(v.x / CELL)},${Math.floor(v.y / CELL)},${Math.floor(v.z / CELL)}`;
+    if (!grid.has(k)) grid.set(k, []);
+    grid.get(k)!.push(i);
   }
-  return pts;
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Parallel-transport geodesic unfolding
-// ─────────────────────────────────────────────────────────────────────────────
-
-const MAX_STEP  = Math.PI / 8;   // 22.5° per link max
-const MAX_TOTAL = Math.PI * 1.5; // 270° total – beyond this assume spiral → fallback
-
-function unfoldGeodesic(cl: THREE.Vector3[], scale: number): THREE.Vector2[] {
-  const n = cl.length;
-  if (n === 0) return [];
-
-  const pts: THREE.Vector2[] = [new THREE.Vector2(0, 0)];
-  if (n === 1) return pts;
-
-  // ── Initial tangent ───────────────────────────────────────────────────────
-  let t = new THREE.Vector3().subVectors(cl[1], cl[0]).normalize();
-
-  // ── Initial in-surface perpendicular (n_s) ────────────────────────────────
-  // Choose a world axis that's not collinear with t, then orthogonalise.
-  const up = Math.abs(t.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
-  let n_s = new THREE.Vector3().crossVectors(t, up).normalize();
-
-  let dir       = 0;  // accumulated 2D direction (radians)
-  let totalTurn = 0;
-
-  for (let i = 1; i < n; i++) {
-    const len  = cl[i - 1].distanceTo(cl[i]) * scale;
-    const prev = pts[pts.length - 1];
-    pts.push(new THREE.Vector2(
-      prev.x + Math.cos(dir) * len,
-      prev.y + Math.sin(dir) * len,
-    ));
-
-    if (i < n - 1) {
-      const t_next = new THREE.Vector3().subVectors(cl[i + 1], cl[i]).normalize();
-
-      // Signed geodesic turning angle using parallel-transported n_s
-      const cross = new THREE.Vector3().crossVectors(t, t_next);
-      const sinθ  = cross.dot(n_s);
-      const cosθ  = Math.max(-1, Math.min(1, t.dot(t_next)));
-      const θ     = Math.atan2(sinθ, cosθ);
-      const step  = Math.max(-MAX_STEP, Math.min(MAX_STEP, θ));
-
-      totalTurn += Math.abs(step);
-      if (totalTurn > MAX_TOTAL) return null!; // signal fallback
-
-      dir += step;
-
-      // Parallel-transport n_s: remove component along t_next
-      n_s.addScaledVector(t_next, -n_s.dot(t_next));
-      if (n_s.lengthSq() < 1e-14) {
-        // Degenerate: reinitialise perpendicular to t_next
-        const alt = Math.abs(t_next.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
-        n_s.crossVectors(t_next, alt);
+  const fn = (p: THREE.Vector3): THREE.Vector3 => {
+    const cx = Math.floor(p.x / CELL);
+    const cy = Math.floor(p.y / CELL);
+    const cz = Math.floor(p.z / CELL);
+    let minD2 = Infinity, best = 0;
+    for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++)
+    for (let dz = -1; dz <= 1; dz++) {
+      for (const idx of grid.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
+        const d2 = mesh.vertices[idx].distanceToSquared(p);
+        if (d2 < minD2) { minD2 = d2; best = idx; }
       }
-      n_s.normalize();
-      t = t_next;
     }
-  }
+    return mesh.normals[best].clone().normalize();
+  };
 
-  return pts;
+  _normCache = { mesh, fn };
+  return fn;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Choose geodesic or straight unrolling per strip
+// Step 1: Compute 3D left/right edges using surface normals
+//
+//   perp_i = normalize( tangent_i × surfNormal_i )
+//   L3[i]  = cl3[i] + halfW_world · perp_i
+//   R3[i]  = cl3[i] − halfW_world · perp_i
 // ─────────────────────────────────────────────────────────────────────────────
 
-function unfoldCenterline(cl: THREE.Vector3[], scale: number): THREE.Vector2[] {
-  if (cl.length < 2) return unfoldStraight(cl, scale);
-  const geo = unfoldGeodesic(cl, scale);
-  if (geo) return geo;
-  // Fallback: straight unrolling
-  console.debug('[Unfold] geodesic overflowed → straight fallback');
-  return unfoldStraight(cl, scale);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Boundaries: ±halfW perpendicular to the local 2D tangent at each point
-// ─────────────────────────────────────────────────────────────────────────────
-
-function buildBoundaries(
-  cl2:   THREE.Vector2[],
-  halfW: number,
-): { left: THREE.Vector2[]; right: THREE.Vector2[] } {
-  const n    = cl2.length;
-  const left:  THREE.Vector2[] = [];
-  const right: THREE.Vector2[] = [];
+function computeEdges3D(
+  cl3:       THREE.Vector3[],
+  halfW:     number,           // half-width in world units
+  mesh:      HalfEdgeMesh,
+): { L3: THREE.Vector3[]; R3: THREE.Vector3[] } {
+  const getNorm = buildNormalLookup(mesh);
+  const n = cl3.length;
+  const L3: THREE.Vector3[] = [];
+  const R3: THREE.Vector3[] = [];
 
   for (let i = 0; i < n; i++) {
-    // Central-difference tangent (clamped at ends)
-    const a = cl2[Math.max(0, i - 1)];
-    const b = cl2[Math.min(n - 1, i + 1)];
-    const dx = b.x - a.x, dy = b.y - a.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    // Perpendicular (rotated 90° CCW)
-    const nx = len > 1e-12 ? -dy / len : 0;
-    const ny = len > 1e-12 ?  dx / len : 1;
+    // Central-difference tangent
+    const pa = cl3[Math.max(0, i - 1)];
+    const pb = cl3[Math.min(n - 1, i + 1)];
+    const t  = new THREE.Vector3().subVectors(pb, pa).normalize();
 
-    const p = cl2[i];
-    left.push(new THREE.Vector2(p.x + nx * halfW, p.y + ny * halfW));
-    right.push(new THREE.Vector2(p.x - nx * halfW, p.y - ny * halfW));
+    // Surface normal at this point
+    const nSurf = getNorm(cl3[i]);
+
+    // In-surface perpendicular: tangent × surface_normal
+    let perp = new THREE.Vector3().crossVectors(t, nSurf);
+    if (perp.lengthSq() < 1e-10) {
+      // Degenerate: t ≈ nSurf → use world-up fallback
+      perp.crossVectors(t, new THREE.Vector3(0, 1, 0));
+    }
+    perp.normalize();
+
+    L3.push(cl3[i].clone().addScaledVector(perp,  halfW));
+    R3.push(cl3[i].clone().addScaledVector(perp, -halfW));
   }
 
-  return { left, right };
+  return { L3, R3 };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Map junction positions to 2D via arc-length interpolation
+// Step 2: Triangle unfolding
+//
+// Each quad [L_i, R_i, L_{i+1}, R_{i+1}] is split by diagonal [R_i, L_{i+1}]:
+//   Tri-1: (L_i, R_i, L_{i+1})  → place L_{i+1}_2d
+//   Tri-2: (R_i, L_{i+1}, R_{i+1}) → place R_{i+1}_2d
+//
+// triPoint: given two known 2D points a, b and distances da, db to unknown p,
+//   returns p on the LEFT (onLeft=true) or RIGHT (onLeft=false) of directed a→b.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function triPoint(
+  a: THREE.Vector2, b: THREE.Vector2,
+  da: number, db: number,
+  onLeft: boolean,
+): THREE.Vector2 {
+  const ab  = new THREE.Vector2().subVectors(b, a);
+  const d   = ab.length();
+
+  if (d < 1e-12) {
+    // Degenerate edge: just extend in the last direction
+    return a.clone().addScaledVector(ab.set(1, 0), da);
+  }
+
+  // Law of cosines: t = projection along a→b, s = perpendicular distance
+  const t   = (da * da - db * db + d * d) / (2 * d);
+  const s2  = Math.max(0, da * da - t * t);  // clamp for floating-point safety
+  const s   = Math.sqrt(s2) * (onLeft ? 1 : -1);
+
+  const dir  = ab.clone().divideScalar(d);
+  const perp = new THREE.Vector2(-dir.y, dir.x);  // CCW perpendicular
+
+  return a.clone()
+    .addScaledVector(dir,  t)
+    .addScaledVector(perp, s);
+}
+
+function unfoldTriangles(
+  L3: THREE.Vector3[],
+  R3: THREE.Vector3[],
+): { L2: THREE.Vector2[]; R2: THREE.Vector2[] } {
+  const n = L3.length;
+  if (n === 0) return { L2: [], R2: [] };
+
+  // Initial edge centred on origin
+  const w0 = Math.max(L3[0].distanceTo(R3[0]), 1e-6);
+  const L2: THREE.Vector2[] = [new THREE.Vector2(0,  w0 / 2)];
+  const R2: THREE.Vector2[] = [new THREE.Vector2(0, -w0 / 2)];
+
+  for (let i = 0; i < n - 1; i++) {
+    const dLL = L3[i].distanceTo(L3[i + 1]);       // left  top edge
+    const dRL = R3[i].distanceTo(L3[i + 1]);       // diagonal R_i → L_{i+1}
+    const dRR = R3[i].distanceTo(R3[i + 1]);       // right top edge
+    const dLR = L3[i + 1].distanceTo(R3[i + 1]);  // new cross edge
+
+    // Tri-1: (L_i, R_i, L_{i+1})
+    //   L_i → R_i points "downward"; LEFT = forward (+x side) → onLeft = true
+    const L_next = triPoint(L2[i], R2[i], dLL, dRL, true);
+
+    // Tri-2: (R_i, L_{i+1}, R_{i+1})
+    //   R_{i+1} should be on the RIGHT side (the "under" side of the strip)
+    //   R_i → L_{i+1} has mixed direction; RIGHT = toward previous right edge → onLeft = false
+    const R_next = triPoint(R2[i], L_next, dRR, dLR, false);
+
+    L2.push(L_next);
+    R2.push(R_next);
+  }
+
+  return { L2, R2 };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 3: Map junction 3D positions to 2D via centerline lookup
 // ─────────────────────────────────────────────────────────────────────────────
 
 function mapJunctions(
@@ -177,19 +214,20 @@ function mapJunctions(
   const holes: UnfoldedHole[] = [];
 
   for (const junc of strip.junctions) {
+    // Closest centerline point in 3D
     let minD2 = Infinity, idx = 0;
     for (let i = 0; i < cl3.length; i++) {
       const d2 = cl3[i].distanceToSquared(junc.position);
       if (d2 < minD2) { minD2 = d2; idx = i; }
     }
 
-    // Sub-segment interpolation
+    // Sub-segment interpolation for accuracy
     let pt2 = cl2[idx].clone();
-    if (idx < cl3.length - 1) {
-      const dA  = cl3[idx    ].distanceTo(junc.position);
-      const dB  = cl3[idx + 1].distanceTo(junc.position);
-      const t   = dA + dB > 1e-9 ? dA / (dA + dB) : 0;
-      pt2 = cl2[idx].clone().lerp(cl2[Math.min(idx + 1, cl2.length - 1)], t);
+    if (idx < cl3.length - 1 && idx < cl2.length - 1) {
+      const dA = cl3[idx    ].distanceTo(junc.position);
+      const dB = cl3[idx + 1].distanceTo(junc.position);
+      const t  = dA + dB > 1e-9 ? dA / (dA + dB) : 0;
+      pt2 = cl2[idx].clone().lerp(cl2[idx + 1], t);
     }
 
     holes.push({
@@ -199,7 +237,7 @@ function mapJunctions(
     });
   }
 
-  // De-duplicate by arc-length position
+  // De-duplicate near-coincident holes
   const seen = new Set<string>();
   return holes.filter(h => {
     const k = `${Math.round(h.center.x)},${Math.round(h.center.y)}`;
@@ -210,10 +248,10 @@ function mapJunctions(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bounding box from boundary points
+// Bounding box
 // ─────────────────────────────────────────────────────────────────────────────
 
-function bbox(left: THREE.Vector2[], right: THREE.Vector2[]) {
+function computeBBox(left: THREE.Vector2[], right: THREE.Vector2[]) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const p of [...left, ...right]) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
@@ -228,22 +266,30 @@ function bbox(left: THREE.Vector2[], right: THREE.Vector2[]) {
 
 export function unfoldStrip(
   strip:      Strip,
-  _mesh:      HalfEdgeMesh,   // API compatibility
+  mesh:       HalfEdgeMesh,
   _junctions: Junction[],
-  scale:      number,          // mm per world unit
+  scale:      number,           // mm per world unit
 ): UnfoldedStrip {
-  const cl3  = strip.centerline;
-  const cl2  = unfoldCenterline(cl3, scale);
-  const halfW = Math.max(strip.width * scale * 0.5, 0.5);
+  const cl3   = strip.centerline;
+  const halfW = Math.max(strip.width / 2, 1e-6);  // world units
 
-  const { left, right } = buildBoundaries(cl2, halfW);
+  // 1. Compute 3D ruled-surface edges
+  const { L3, R3 } = computeEdges3D(cl3, halfW, mesh);
+
+  // 2. Triangle unfolding → world-unit 2D coordinates → convert to mm
+  const { L2: L2w, R2: R2w } = unfoldTriangles(L3, R3);
+  const L2  = L2w.map(p => p.clone().multiplyScalar(scale));
+  const R2  = R2w.map(p => p.clone().multiplyScalar(scale));
+  const cl2 = L2.map((l, i) => l.clone().add(R2[i]).multiplyScalar(0.5));
+
+  // 3. Junction holes (in mm)
   const holes = mapJunctions(strip, cl3, cl2, scale);
 
   const segment: UnfoldedSegment = {
     startJunctionId: null,
     endJunctionId:   null,
-    leftBoundary:    left,
-    rightBoundary:   right,
+    leftBoundary:    L2,
+    rightBoundary:   R2,
     centerline:      cl2,
     holes,
     width: strip.width * scale,
@@ -254,12 +300,12 @@ export function unfoldStrip(
     family:   strip.family,
     layer:    strip.layer,
     segments: [segment],
-    boundingBox: bbox(left, right),
+    boundingBox: computeBBox(L2, R2),
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout: row-based packing
+// Layout: row-based packing with auto maxRowWidth
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface StripLayout {

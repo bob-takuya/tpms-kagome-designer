@@ -200,36 +200,58 @@ export function buildKagomePattern(
   }
   console.groupEnd();
 
-  // ── 2. Estimate world-space strip widths from INTER-ISOLINE spacing only ──
+  // ── 2. Estimate world-space strip widths: per-isoline, inter-isoline spacing only ──
+  //
   // Strip IDs: single-chain = "A3"; multi-chain = "A3_1", "A3_2", ...
-  // Adjacent strips in families[] may be chains of the SAME isoline (distance≈0),
-  // so we group by base isoline ID and only measure BETWEEN different isolines.
+  // Adjacent strips in families[] may be chains of the SAME isoline (distance ≈ 0),
+  // so we group by base isoline ID and measure ONLY between different isolines.
+  // Each isoline gets its OWN local width (= avg of spacings to neighbors).
+  // → Non-uniform widths across isolines are preserved (Plan A behaviour).
   const isoKey = (id: string) => id.replace(/_\d+$/, ''); // "A3_2" → "A3"
 
   for (let k = 0; k < 3; k++) {
     const fam = families[k];
 
-    // One representative per isoline (the first chain of each)
-    const reps = new Map<string, Strip>();
+    // One representative per isoline (first chain inserted)
+    const repMap = new Map<string, Strip>();
     for (const s of fam) {
       const key = isoKey(s.id);
-      if (!reps.has(key)) reps.set(key, s);
+      if (!repMap.has(key)) repMap.set(key, s);
     }
-    const repList = [...reps.values()];
+    const repList = [...repMap.values()];
 
-    // Inter-isoline spacings only
-    const spacings: number[] = [];
+    // Global average inter-isoline spacing (fallback)
+    const allSpacings: number[] = [];
     for (let i = 0; i < repList.length - 1; i++) {
       const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
-      if (d > 1e-6) spacings.push(d);
+      if (d > 1e-6) allSpacings.push(d);
     }
-    const avgSpacing = spacings.length > 0
-      ? spacings.reduce((a, b) => a + b, 0) / spacings.length
+    const avgSpacing = allSpacings.length > 0
+      ? allSpacings.reduce((a, b) => a + b, 0) / allSpacings.length
       : 0.3;
 
-    // Assign uniform width to ALL strips in the family (same for all chains)
-    const familyWidth = avgSpacing * 0.75;
-    for (const s of fam) s.width = familyWidth;
+    // Assign LOCAL width to each isoline (avg of spacings to prev + next representative)
+    for (let i = 0; i < repList.length; i++) {
+      const localS: number[] = [];
+      if (i > 0) {
+        const d = averageCenterlineDistance(repList[i - 1].centerline, repList[i].centerline);
+        if (d > 1e-6) localS.push(d);
+      }
+      if (i < repList.length - 1) {
+        const d = averageCenterlineDistance(repList[i].centerline, repList[i + 1].centerline);
+        if (d > 1e-6) localS.push(d);
+      }
+      const localSpacing = localS.length > 0
+        ? localS.reduce((a, b) => a + b, 0) / localS.length
+        : avgSpacing;
+      const width = localSpacing * 0.75;
+
+      // All chains of this isoline get the same width
+      const key = isoKey(repList[i].id);
+      for (const s of fam) {
+        if (isoKey(s.id) === key) s.width = width;
+      }
+    }
   }
 
   // ── 3. faceMap was built inline in step 1 (each chain → per-segment entries)
