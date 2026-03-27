@@ -205,7 +205,25 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
     state.kagome.layerColors,
     widthFallback,
   );
-  for (const m of stripThreeMeshes) ctx.stripMeshes.add(m);
+
+  console.group(`[Viewport] adding ${stripThreeMeshes.length} strip meshes to scene`);
+  for (const m of stripThreeMeshes) {
+    const ud  = m.userData as { stripId: string; family: number; layer: number };
+    const geo = m.geometry as THREE.BufferGeometry;
+    geo.computeBoundingSphere();
+    const bs  = geo.boundingSphere;
+    const mat = m.material as THREE.MeshBasicMaterial;
+    console.log(
+      `  ${ud.stripId.padEnd(3)} visible=${m.visible} ` +
+      `frustumCulled=${m.frustumCulled} ` +
+      `color=#${mat.color.getHexString()} ` +
+      `opacity=${mat.opacity} transparent=${mat.transparent} ` +
+      `bs.r=${bs?.radius?.toFixed(3) ?? 'null'}`,
+    );
+    ctx.stripMeshes.add(m);
+  }
+  console.log(`  → stripMeshes group total children: ${ctx.stripMeshes.children.length}`);
+  console.groupEnd();
 
   // 3b. Junction visualisation: coloured rings + ID labels
   for (const junc of junctions) {
