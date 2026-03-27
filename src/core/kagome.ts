@@ -306,7 +306,9 @@ function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
   if (n === 0) return [];
 
   // Hash endpoint coordinates (rounded to 4 decimal places for stability)
-  const PREC = 1e4;
+  // 0.002 unit grid – tolerates floating-point jitter on shared mesh edges
+  // while keeping distinct endpoints separate
+  const PREC = 500;
   const hash = (p: THREE.Vector3) =>
     `${Math.round(p.x * PREC)},${Math.round(p.y * PREC)},${Math.round(p.z * PREC)}`;
 
@@ -385,7 +387,7 @@ function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
       }
     }
 
-    if (chain.length >= 3) chains.push(chain); // require at least 3 points
+    if (chain.length >= 2) chains.push(chain);
   }
 
   return chains;
