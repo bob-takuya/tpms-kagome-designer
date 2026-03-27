@@ -18,15 +18,15 @@ export interface NoiseParams {
 }
 
 export interface StripParams {
-  numIsolines: number;
-  stripWidth: number;
-  widthRatio: number;
-  method: 'A' | 'B';
+  numIsolines:   number;
+  stripWidthMm:  number;  // physical strip width in mm (used by method B)
+  widthRatio:    number;  // fraction of isoline spacing (used by method A)
+  method:        'A' | 'B';
 }
 
 export interface KagomeParams {
-  holeRadius: number;
-  layerColors: [string, string, string];
+  holeRadiusMm:  number;  // junction hole radius in mm
+  layerColors:   [string, string, string];
 }
 
 export interface DevelopParams {
@@ -85,14 +85,14 @@ const defaultState: AppState = {
     seed: 42,
   },
   strip: {
-    numIsolines: 8,
-    stripWidth: 0.1,
-    widthRatio: 0.3,
-    method: 'B',
+    numIsolines:  8,
+    stripWidthMm: 10,   // 10 mm default
+    widthRatio:   0.75, // method A: 75% of inter-isoline spacing
+    method:       'A' as 'A' | 'B',
   },
   kagome: {
-    holeRadius: 0.02,
-    layerColors: ['#ff4444', '#ffff44', '#44ff44'],
+    holeRadiusMm: 2,    // 2 mm default
+    layerColors:  ['#ff4444', '#ffff44', '#44ff44'] as [string, string, string],
   },
   develop: {
     scale: 50,   // mm per TPMS world unit (1 unit ≈ 50 mm → period ≈ 314 mm)
