@@ -144,9 +144,19 @@ export function regenerateUnfold(
     unfoldStrip(strip, mesh, pattern.junctions, scale),
   );
 
-  // Estimate max row width from canvas (in world units), with fallback
-  const worldW = vp.canvas.width > 0 ? vp.canvas.width / Math.max(vp.scale, 0.1) : 600;
-  const layout = layoutStrips(raw, margin, worldW * 0.9);
+  // Compute a sane maxRowWidth so the final layout is roughly 2:1 (landscape).
+  // All coordinates are in "scaled" space (strip coords × develop.scale).
+  // We target aspect ratio ≈ 2.0 (width ≈ 2 × height).
+  let totalArea = 0;
+  for (const s of raw) {
+    const w = (s.boundingBox.maxX - s.boundingBox.minX) + margin;
+    const h = (s.boundingBox.maxY - s.boundingBox.minY) + margin;
+    totalArea += w * h;
+  }
+  const targetAspect = 2.0;
+  const maxRowWidth  = Math.max(Math.sqrt(totalArea * targetAspect), 10);
+
+  const layout = layoutStrips(raw, margin, maxRowWidth);
   vp.unfoldedStrips = applyLayout(layout);
 
   console.log(
@@ -185,6 +195,10 @@ export function render2D(vp: Viewport2DContext): void {
   ctx.scale(scale, scale);
 
   const lw = 1 / scale;
+
+  // ── Background grid (10-unit spacing in scaled coords) ───────────────────
+  drawGrid(ctx, canvas, offset, scale);
+
   const familyColors = state.kagome.layerColors;
 
   for (const strip of unfoldedStrips) {
@@ -282,6 +296,49 @@ export function render2D(vp: Viewport2DContext): void {
 
   // Fixed-size ruler in bottom-left
   drawRuler(ctx, vp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Background grid (drawn in world/scaled space, already inside ctx.save+translate+scale)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function drawGrid(
+  ctx:    CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  offset: THREE.Vector2,
+  scale:  number,
+): void {
+  const GRID = 10;           // grid spacing in scaled units
+  const lw   = 0.5 / scale;
+
+  // Visible world-space bounds
+  const x0 = -offset.x / scale;
+  const y0 = -offset.y / scale;
+  const x1 = x0 + canvas.width  / scale;
+  const y1 = y0 + canvas.height / scale;
+
+  const startX = Math.floor(x0 / GRID) * GRID;
+  const startY = Math.floor(y0 / GRID) * GRID;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth   = lw;
+  ctx.beginPath();
+
+  for (let x = startX; x <= x1; x += GRID) {
+    ctx.moveTo(x, y0); ctx.lineTo(x, y1);
+  }
+  for (let y = startY; y <= y1; y += GRID) {
+    ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+  }
+  ctx.stroke();
+
+  // Origin crosshair
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth   = lw * 2;
+  ctx.beginPath();
+  ctx.moveTo(0, y0); ctx.lineTo(0, y1);
+  ctx.moveTo(x0, 0); ctx.lineTo(x1, 0);
+  ctx.stroke();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
