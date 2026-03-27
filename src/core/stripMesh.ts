@@ -222,20 +222,21 @@ export function buildAllStripMeshes(
       strip.layer === 1 ? base.clone().multiplyScalar(0.85) :
       base.clone().multiplyScalar(0.60);
 
-    // MeshBasicMaterial: no lighting dependency → always visible regardless
-    // of normal orientation or light position.
-    // polygonOffset: push the ribbon slightly in front of the TPMS surface so
-    // no z-fighting even when the ribbon lies exactly on the surface.
+    // depthTest:false — ribbons on the "back" side of the TPMS were being
+    // occluded by ribbons on the "front" side (depth buffer conflict).
+    // With depthTest off, all ribbons always render.
+    // renderOrder:1 — ensures ribbons draw AFTER the transparent TPMS surface.
     const mat = new THREE.MeshBasicMaterial({
       color: col,
       side: THREE.DoubleSide,
-      transparent: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -2,
+      transparent: true,   // must be true when depthTest:false for correct Three.js pass
+      opacity: 1.0,
+      depthTest: false,
+      depthWrite: false,
     });
 
     const m = new THREE.Mesh(sm.geometry, mat);
+    m.renderOrder = 1;
     m.userData = { family: sm.family, layer: sm.layer, stripId: sm.stripId };
     result.push(m);
   }
