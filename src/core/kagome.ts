@@ -316,22 +316,14 @@ export function buildKagomePattern(
     strip.segments = segmentAtJunctions(strip);
   }
 
-  // ── 8. Remove strips with no junctions (isolated, don't participate in Kagome)
-  const activeStrips = allStrips.filter(s => s.junctions.length > 0);
-  const activeSet    = new Set(activeStrips.map(s => s.id));
-  const activeFamilies: [Strip[], Strip[], Strip[]] = [
-    families[0].filter(s => activeSet.has(s.id)),
-    families[1].filter(s => activeSet.has(s.id)),
-    families[2].filter(s => activeSet.has(s.id)),
-  ];
-
+  // ── 8. Log junction coverage (do not prune – isolated strips still useful for 2D unfold)
+  const withJunc = allStrips.filter(s => s.junctions.length > 0).length;
   console.log(
     `[Kagome] junctions=${junctions.length}  ` +
-    `strips: total=${allStrips.length} active=${activeStrips.length} ` +
-    `removed=${allStrips.length - activeStrips.length}`,
+    `strips: total=${allStrips.length}  with-junctions=${withJunc}  isolated=${allStrips.length - withJunc}`,
   );
 
-  return { strips: activeStrips, junctions, families: activeFamilies };
+  return { strips: allStrips, junctions, families };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

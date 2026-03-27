@@ -112,27 +112,47 @@ function fitView(vp: Viewport2DContext): void {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function regenerateUnfold(
-  vp:        Viewport2DContext,
-  pattern:   KagomePattern | null,
-  mesh:      HalfEdgeMesh | null,
+  vp:         Viewport2DContext,
+  pattern:    KagomePattern | null,
+  mesh:       HalfEdgeMesh | null,
   _junctions: Junction[],
 ): void {
-  if (!pattern || !mesh || pattern.strips.length === 0) {
+  if (!pattern || !mesh) {
     vp.unfoldedStrips = [];
     render2D(vp);
     return;
   }
 
-  const state = store.getState();
-  const scale = state.develop?.scale ?? 50;  // default 50 pixels per world unit
+  // Filter strips that have a non-empty centerline
+  const validStrips = pattern.strips.filter(s => s.centerline.length >= 2);
+  console.log(
+    `[Unfold] pattern.strips=${pattern.strips.length}  valid(cl≥2)=${validStrips.length}  ` +
+    `junctions=${pattern.junctions.length}`,
+  );
+
+  if (validStrips.length === 0) {
+    vp.unfoldedStrips = [];
+    render2D(vp);
+    return;
+  }
+
+  const state  = store.getState();
+  const scale  = state.develop?.scale  ?? 100;
   const margin = state.develop?.margin ?? 10;
 
-  const raw: UnfoldedStrip[] = pattern.strips.map(strip =>
+  const raw: UnfoldedStrip[] = validStrips.map(strip =>
     unfoldStrip(strip, mesh, pattern.junctions, scale),
   );
 
-  const layout  = layoutStrips(raw, margin, vp.canvas.width / vp.scale * 0.9 || 600);
+  // Estimate max row width from canvas (in world units), with fallback
+  const worldW = vp.canvas.width > 0 ? vp.canvas.width / Math.max(vp.scale, 0.1) : 600;
+  const layout = layoutStrips(raw, margin, worldW * 0.9);
   vp.unfoldedStrips = applyLayout(layout);
+
+  console.log(
+    `[Unfold] built ${vp.unfoldedStrips.length} unfolded strips; ` +
+    `layout ${layout.totalWidth.toFixed(1)} × ${layout.totalHeight.toFixed(1)} world units`,
+  );
 
   fitView(vp);
 }
@@ -153,10 +173,10 @@ export function render2D(vp: Viewport2DContext): void {
     ctx.font = '15px "Segoe UI", system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(
-      'Switch to 3D view, click ▶ Calculate, then come back here',
-      canvas.width / 2, canvas.height / 2,
-    );
+    ctx.fillText('3D view で ▶ Calculate を押してください', canvas.width / 2, canvas.height / 2 - 12);
+    ctx.font = '12px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = '#444';
+    ctx.fillText('(その後このタブを再クリックすると展開図が表示されます)', canvas.width / 2, canvas.height / 2 + 14);
     return;
   }
 
