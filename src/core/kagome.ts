@@ -76,6 +76,9 @@ export function buildKagomePattern(
   holeRadius: number,
 ): KagomePattern {
 
+  // Build surface projector once (shared across all strips)
+  const projectToSurface = buildSurfaceProjector(mesh);
+
   // ── 1. Stitch segment pairs → ordered polylines per strip ─────────────────
   const families: [Strip[], Strip[], Strip[]] = [[], [], []];
   const allStrips: Strip[] = [];
@@ -103,16 +106,28 @@ export function buildKagomePattern(
       const longestChain = chains.length > 0
         ? chains.reduce((m, c) => Math.max(m, c.length), 0) : 0;
 
-      // Pick the longest chain as the representative centerline, then smooth
-      const raw = chains.sort((a, b) => b.length - a.length)[0] ?? [];
-      const centerline = smoothPolyline(raw, 10);
+      // Pick the longest chain, smooth, then re-project onto the surface
+      const raw      = chains.sort((a, b) => b.length - a.length)[0] ?? [];
+      const smoothed = smoothPolyline(raw, 4);
+
+      // Measure max drift before projection (diagnostic)
+      let maxDrift = 0;
+      const centerline = smoothed.map(p => {
+        const projected = projectToSurface(p);
+        maxDrift = Math.max(maxDrift, p.distanceTo(projected));
+        return projected;
+      });
 
       if (centerline.length < 2) {
         diagRows.push({ id, segments: rawSegs, chains: chains.length, longestChain, accepted: false, reason: 'centerline < 2 pts after smooth' });
         continue;
       }
 
-      diagRows.push({ id, segments: rawSegs, chains: chains.length, longestChain, accepted: true, reason: `cl=${centerline.length}pts` });
+      diagRows.push({
+        id, segments: rawSegs, chains: chains.length, longestChain,
+        accepted: true,
+        reason: `cl=${centerline.length}pts drift=${maxDrift.toFixed(4)}`,
+      });
 
       const strip: Strip = {
         id,
@@ -337,16 +352,15 @@ export function extractKagomeStrips(
 export function assignLayers(_pattern: KagomePattern): void { /* no-op */ }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Laplacian smoothing – keeps endpoints fixed, prevents drift
+// Laplacian smoothing – keeps endpoints fixed
 // ─────────────────────────────────────────────────────────────────────────────
 
-function smoothPolyline(pts: THREE.Vector3[], iterations = 10): THREE.Vector3[] {
+function smoothPolyline(pts: THREE.Vector3[], iterations = 4): THREE.Vector3[] {
   if (pts.length < 3) return pts.map(p => p.clone());
   let cur = pts.map(p => p.clone());
   for (let iter = 0; iter < iterations; iter++) {
     const next = cur.map(p => p.clone());
     for (let i = 1; i < cur.length - 1; i++) {
-      // λ = 0.5 Laplacian step (fixed endpoints)
       next[i].set(
         0.25 * cur[i - 1].x + 0.5 * cur[i].x + 0.25 * cur[i + 1].x,
         0.25 * cur[i - 1].y + 0.5 * cur[i].y + 0.25 * cur[i + 1].y,
@@ -356,6 +370,53 @@ function smoothPolyline(pts: THREE.Vector3[], iterations = 10): THREE.Vector3[] 
     cur = next;
   }
   return cur;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Surface projection – re-project smoothed points back onto the mesh surface.
+//
+// Laplacian smoothing pulls points toward the chord of the curve.  On a
+// saddle-shaped TPMS (negative Gaussian curvature), this causes some strips
+// to drift BELOW the surface and become hidden by the mesh.  Projecting each
+// point onto the tangent plane at the nearest mesh vertex corrects this.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildSurfaceProjector(
+  mesh: HalfEdgeMesh,
+): (pt: THREE.Vector3) => THREE.Vector3 {
+  const CELL = 0.35;
+  const grid = new Map<string, number[]>();
+
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    const v = mesh.vertices[i];
+    const k = `${Math.floor(v.x / CELL)},${Math.floor(v.y / CELL)},${Math.floor(v.z / CELL)}`;
+    if (!grid.has(k)) grid.set(k, []);
+    grid.get(k)!.push(i);
+  }
+
+  return (pt: THREE.Vector3): THREE.Vector3 => {
+    const cx = Math.floor(pt.x / CELL);
+    const cy = Math.floor(pt.y / CELL);
+    const cz = Math.floor(pt.z / CELL);
+
+    let minD2 = Infinity;
+    let best  = 0;
+    for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++)
+    for (let dz = -1; dz <= 1; dz++) {
+      for (const idx of grid.get(`${cx + dx},${cy + dy},${cz + dz}`) ?? []) {
+        const d2 = mesh.vertices[idx].distanceToSquared(pt);
+        if (d2 < minD2) { minD2 = d2; best = idx; }
+      }
+    }
+
+    // Signed distance from pt to the tangent plane at the nearest vertex.
+    // Subtracting it projects pt back onto (an approximation of) the surface.
+    const vPos = mesh.vertices[best];
+    const vNrm = mesh.normals[best];
+    const d    = vNrm.dot(new THREE.Vector3().subVectors(pt, vPos));
+    return pt.clone().sub(new THREE.Vector3().copy(vNrm).multiplyScalar(d));
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
