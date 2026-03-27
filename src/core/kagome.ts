@@ -83,6 +83,9 @@ export function buildKagomePattern(
   const families: [Strip[], Strip[], Strip[]] = [[], [], []];
   const allStrips: Strip[] = [];
 
+  // faceMap built inline while processing each chain (step 1)
+  const faceMap = new Map<number, { stripId: string; family: number; segA: THREE.Vector3; segB: THREE.Vector3 }[]>();
+
   // Diagnostic counters
   const diagRows: {
     id: string; segments: number; chains: number;
@@ -101,27 +104,23 @@ export function buildKagomePattern(
         continue;
       }
 
-      // Stitch marching-triangle segment pairs into connected polyline chains.
-      // Build ONE STRIP PER CHAIN so every isoline segment gets a ribbon.
-      // (Previously only the longest chain was used; ~50-70% of segments had
-      //  no ribbon despite showing up as thin isoline underlay lines.)
+      // Stitch into chains (each chain also carries segIndices for faceMap)
       const chains = stitchSegments(iso.points);
-      chains.sort((a, b) => b.length - a.length); // longest first
+      chains.sort((a, b) => b.points.length - a.points.length); // longest first
 
-      const longestChain = chains.length > 0 ? chains[0].length : 0;
+      const longestChain = chains.length > 0 ? chains[0].points.length : 0;
       let acceptedChains = 0;
 
       for (let ci = 0; ci < chains.length; ci++) {
-        const raw = chains[ci];
-        if (raw.length < 2) continue;
+        const chain = chains[ci];
+        if (chain.points.length < 2) continue;
 
-        const smoothed = smoothPolyline(raw, 4);
+        const smoothed   = smoothPolyline(chain.points, 4);
         const centerline = smoothed.map(p => projectToSurface(p));
         if (centerline.length < 2) continue;
 
-        // Give each chain a unique ID: "A1" for single chain, "A1_2" for extra chains
         const chainSuffix = chains.length > 1 ? `_${ci + 1}` : '';
-        const stripId = `${id}${chainSuffix}`;
+        const stripId     = `${id}${chainSuffix}`;
 
         const strip: Strip = {
           id: stripId,
@@ -136,6 +135,19 @@ export function buildKagomePattern(
         families[k].push(strip);
         allStrips.push(strip);
         acceptedChains++;
+
+        // ── Build faceMap for this chain's segments ──────────────────────────
+        // chain.segIndices[j] = original segment index for link j
+        // iso.faceIndices[segIdx] = which mesh face the segment lives in
+        for (const segIdx of chain.segIndices) {
+          if (segIdx >= iso.faceIndices.length) continue;
+          const fi   = iso.faceIndices[segIdx];
+          const segA = iso.points[segIdx * 2];
+          const segB = iso.points[segIdx * 2 + 1];
+          if (!segA || !segB) continue;
+          if (!faceMap.has(fi)) faceMap.set(fi, []);
+          faceMap.get(fi)!.push({ stripId, family: k, segA, segB });
+        }
       }
 
       diagRows.push({
@@ -211,29 +223,7 @@ export function buildKagomePattern(
     }
   }
 
-  // ── 3. Build face → strip-segment map from isoline faceIndices ─────────────
-  // faceMap[faceIdx] = list of {stripId, family, segA, segB}
-  const faceMap = new Map<number, { stripId: string; family: number; segA: THREE.Vector3; segB: THREE.Vector3 }[]>();
-
-  for (let k = 0; k < 3; k++) {
-    const isos = isolinesByFamily[k];
-    for (let li = 0; li < isos.length; li++) {
-      const iso = isos[li];
-      const stripId = `${String.fromCharCode(65 + k)}${li + 1}`;
-      // Verify this strip was actually built
-      if (!allStrips.find(s => s.id === stripId)) continue;
-
-      for (let si = 0; si < iso.faceIndices.length; si++) {
-        const fi = iso.faceIndices[si];
-        const segA = iso.points[si * 2];
-        const segB = iso.points[si * 2 + 1];
-        if (!segA || !segB) continue;
-
-        if (!faceMap.has(fi)) faceMap.set(fi, []);
-        faceMap.get(fi)!.push({ stripId, family: k, segA, segB });
-      }
-    }
-  }
+  // ── 3. faceMap was built inline in step 1 (each chain → per-segment entries)
 
   // ── 4. Detect junctions ────────────────────────────────────────────────────
   const junctions: Junction[] = [];
@@ -326,7 +316,22 @@ export function buildKagomePattern(
     strip.segments = segmentAtJunctions(strip);
   }
 
-  return { strips: allStrips, junctions, families };
+  // ── 8. Remove strips with no junctions (isolated, don't participate in Kagome)
+  const activeStrips = allStrips.filter(s => s.junctions.length > 0);
+  const activeSet    = new Set(activeStrips.map(s => s.id));
+  const activeFamilies: [Strip[], Strip[], Strip[]] = [
+    families[0].filter(s => activeSet.has(s.id)),
+    families[1].filter(s => activeSet.has(s.id)),
+    families[2].filter(s => activeSet.has(s.id)),
+  ];
+
+  console.log(
+    `[Kagome] junctions=${junctions.length}  ` +
+    `strips: total=${allStrips.length} active=${activeStrips.length} ` +
+    `removed=${allStrips.length - activeStrips.length}`,
+  );
+
+  return { strips: activeStrips, junctions, families: activeFamilies };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -423,52 +428,49 @@ function buildSurfaceProjector(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stitch marching-triangle segment pairs into connected polyline chains
+// Stitch marching-triangle segment pairs into connected polyline chains.
+// Each chain also records segIndices: the original segment index (i where
+// iso.points[2i]/[2i+1] is the segment) for every link in the chain.
+// segIndices.length === points.length - 1 for each chain.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
-  const n = points.length / 2;
+interface StitchedChain {
+  points:     THREE.Vector3[];
+  segIndices: number[];   // segIndices[j] = original segment index for link j
+}
+
+function stitchSegments(rawPts: THREE.Vector3[]): StitchedChain[] {
+  const n = rawPts.length / 2;
   if (n === 0) return [];
 
-  // Hash endpoint coordinates (rounded to 4 decimal places for stability)
-  // 0.002 unit grid – tolerates floating-point jitter on shared mesh edges
-  // while keeping distinct endpoints separate
   const PREC = 500;
   const hash = (p: THREE.Vector3) =>
     `${Math.round(p.x * PREC)},${Math.round(p.y * PREC)},${Math.round(p.z * PREC)}`;
 
-  // endpointMap: hash → list of (segIdx, end)
   const endpointMap = new Map<string, { segIdx: number; end: 0 | 1 }[]>();
   for (let i = 0; i < n; i++) {
     for (const end of [0, 1] as const) {
-      const h = hash(points[2 * i + end]);
+      const h = hash(rawPts[2 * i + end]);
       if (!endpointMap.has(h)) endpointMap.set(h, []);
       endpointMap.get(h)!.push({ segIdx: i, end });
     }
   }
 
   const used = new Uint8Array(n);
-  const chains: THREE.Vector3[][] = [];
+  const chains: StitchedChain[] = [];
 
-  // At a T-junction (3+ segments sharing one endpoint), we pick the segment
-  // that makes the smoothest angle (closest to 180°) with the current direction.
   function pickNext(
     curPt: THREE.Vector3,
     inDir: THREE.Vector3 | null,
   ): { segIdx: number; end: 0 | 1 } | null {
-    const h = hash(curPt);
-    const candidates = (endpointMap.get(h) ?? []).filter(c => !used[c.segIdx]);
+    const candidates = (endpointMap.get(hash(curPt)) ?? []).filter(c => !used[c.segIdx]);
     if (candidates.length === 0) return null;
     if (candidates.length === 1 || inDir === null) return candidates[0];
-
-    // Pick the segment whose direction is most aligned with inDir
-    // (i.e. the one that continues the polyline most smoothly)
-    let best = candidates[0];
-    let bestDot = -Infinity;
+    let best = candidates[0], bestDot = -Infinity;
     for (const c of candidates) {
-      const otherEnd = points[2 * c.segIdx + (1 - c.end)];
-      const segDir = new THREE.Vector3().subVectors(otherEnd, curPt).normalize();
-      const d = inDir.dot(segDir);
+      const dir = new THREE.Vector3()
+        .subVectors(rawPts[2 * c.segIdx + (1 - c.end)], curPt).normalize();
+      const d = inDir.dot(dir);
       if (d > bestDot) { bestDot = d; best = c; }
     }
     return best;
@@ -477,42 +479,43 @@ function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
   for (let start = 0; start < n; start++) {
     if (used[start]) continue;
 
-    const chain: THREE.Vector3[] = [points[2 * start].clone(), points[2 * start + 1].clone()];
+    const pts:  THREE.Vector3[] = [rawPts[2 * start].clone(), rawPts[2 * start + 1].clone()];
+    const segs: number[]        = [start];
     used[start] = 1;
 
-    // Extend forward (with direction continuity)
-    let extending = true;
-    while (extending) {
-      extending = false;
-      const tail = chain[chain.length - 1];
-      const inDir = chain.length >= 2
-        ? new THREE.Vector3().subVectors(tail, chain[chain.length - 2]).normalize()
-        : null;
+    // Forward
+    let ext = true;
+    while (ext) {
+      ext = false;
+      const tail  = pts[pts.length - 1];
+      const inDir = pts.length >= 2
+        ? new THREE.Vector3().subVectors(tail, pts[pts.length - 2]).normalize() : null;
       const c = pickNext(tail, inDir);
       if (c) {
-        chain.push(points[2 * c.segIdx + (1 - c.end)].clone());
+        pts.push(rawPts[2 * c.segIdx + (1 - c.end)].clone());
+        segs.push(c.segIdx);
         used[c.segIdx] = 1;
-        extending = true;
+        ext = true;
       }
     }
 
-    // Extend backward
-    extending = true;
-    while (extending) {
-      extending = false;
-      const head = chain[0];
-      const inDir = chain.length >= 2
-        ? new THREE.Vector3().subVectors(head, chain[1]).normalize()
-        : null;
+    // Backward
+    ext = true;
+    while (ext) {
+      ext = false;
+      const head  = pts[0];
+      const inDir = pts.length >= 2
+        ? new THREE.Vector3().subVectors(head, pts[1]).normalize() : null;
       const c = pickNext(head, inDir);
       if (c) {
-        chain.unshift(points[2 * c.segIdx + (1 - c.end)].clone());
+        pts.unshift(rawPts[2 * c.segIdx + (1 - c.end)].clone());
+        segs.unshift(c.segIdx);
         used[c.segIdx] = 1;
-        extending = true;
+        ext = true;
       }
     }
 
-    if (chain.length >= 2) chains.push(chain);
+    if (pts.length >= 2) chains.push({ points: pts, segIndices: segs });
   }
 
   return chains;
