@@ -8,7 +8,7 @@ import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
 import { computeStripeField, traceIsolines } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
-import { extractKagomeStrips, assignLayers } from '../core/kagome';
+import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
 
 export interface Viewport3DContext {
@@ -20,6 +20,7 @@ export interface Viewport3DContext {
   stripMeshes: THREE.Group;
   halfEdgeMesh: HalfEdgeMesh | null;
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]] | null;
+  stripeFields: [Float64Array, Float64Array, Float64Array] | null;
   kagomePattern: KagomePattern | null;
 }
 
@@ -76,6 +77,7 @@ export function createViewport3D(container: HTMLElement): Viewport3DContext {
     stripMeshes,
     halfEdgeMesh: null,
     isolinesByFamily: null,
+    stripeFields: null,
     kagomePattern: null,
   };
 
@@ -172,63 +174,151 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
     }
   }
 
-  // Generate isolines for 3 families (0°, 60°, 120°)
-  // stripe density: controls how many stripes appear across the surface
-  const stripDensity = 4.0;
+  // ── Phase 2: stripe fields + isoline tracing ───────────────────────────────
+  const STRIP_DENSITY = 4.0;
+  const stripeFields: [Float64Array, Float64Array, Float64Array] = [
+    computeStripeField(ctx.halfEdgeMesh, 0,                 STRIP_DENSITY),
+    computeStripeField(ctx.halfEdgeMesh, Math.PI / 3,       STRIP_DENSITY),
+    computeStripeField(ctx.halfEdgeMesh, (2 * Math.PI) / 3, STRIP_DENSITY),
+  ];
+  ctx.stripeFields = stripeFields;
+
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
 
   for (let family = 0; family < 3; family++) {
-    // Each family uses a DIFFERENT angle → different Poisson RHS → different stripes
-    const phi = (family * Math.PI) / 3;
-
-    // Compute the scalar stripe field f for this family
-    const stripeField = computeStripeField(ctx.halfEdgeMesh, phi, stripDensity);
-
-    // Trace isolines (marching triangles)
-    const isolines = traceIsolines(ctx.halfEdgeMesh, stripeField, state.strip.numIsolines);
+    const isolines = traceIsolines(ctx.halfEdgeMesh, stripeFields[family], state.strip.numIsolines);
     isolinesByFamily[family] = isolines;
 
-    // Render as LineSegments (pairs of points per face crossing)
+    // Render centerlines as LineSegments (segment pairs from marching triangles)
     const color = new THREE.Color(state.kagome.layerColors[family]);
-
-    for (const isoline of isolines) {
-      if (isoline.points.length < 2) continue;
-
-      // points are stored as segment pairs: [A0,B0, A1,B1, …]
-      const lineGeometry = new THREE.BufferGeometry().setFromPoints(isoline.points);
-      const lineMaterial = new THREE.LineBasicMaterial({ color, linewidth: 2 });
-      // Use LineSegments so disconnected pairs are rendered correctly
-      const line = new THREE.LineSegments(lineGeometry, lineMaterial);
-      ctx.stripMeshes.add(line);
+    for (const iso of isolines) {
+      if (iso.points.length < 2) continue;
+      const geo = new THREE.BufferGeometry().setFromPoints(iso.points);
+      const mat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+      ctx.stripMeshes.add(new THREE.LineSegments(geo, mat));
     }
   }
-
   ctx.isolinesByFamily = isolinesByFamily;
 
-  // Extract Kagome strips
-  ctx.kagomePattern = extractKagomeStrips(
+  // ── Phase 3: Kagome strip extraction ───────────────────────────────────────
+  ctx.kagomePattern = buildKagomePattern(
     ctx.halfEdgeMesh,
+    stripeFields,
     isolinesByFamily,
-    state.strip.widthRatio,
-    state.kagome.holeRadius
+    state.strip.numIsolines,
+    state.kagome.holeRadius,
   );
 
-  assignLayers(ctx.kagomePattern);
-
-  // Update stats
   store.getState().setStats({
     strips: ctx.kagomePattern.strips.length,
     junctions: ctx.kagomePattern.junctions.length,
   });
 
-  // Visualize junctions
-  const junctionMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffff });
-  for (const junction of ctx.kagomePattern.junctions) {
-    const sphereGeometry = new THREE.SphereGeometry(state.kagome.holeRadius, 8, 8);
-    const sphere = new THREE.Mesh(sphereGeometry, junctionMaterial);
-    sphere.position.copy(junction.position);
-    ctx.stripMeshes.add(sphere);
+  // ── Phase 3 visualization ──────────────────────────────────────────────────
+
+  // 3a. Render stitched strip centerlines as thicker colored polylines
+  //     (over strips rendered with slight normal offset; under strips darker)
+  const OVER_OFFSET  = 0.015;
+  const UNDER_ALPHA  = 0.45;
+
+  for (const strip of ctx.kagomePattern.strips) {
+    if (strip.centerline.length < 2) continue;
+
+    const isOver  = strip.layer === 2;
+    const baseColor = new THREE.Color(state.kagome.layerColors[strip.family]);
+    const color = isOver ? baseColor : baseColor.clone().multiplyScalar(UNDER_ALPHA);
+
+    const pts = strip.centerline.map(p => {
+      if (!isOver) return p.clone();
+      // Offset over-strips along the closest vertex normal
+      return p.clone().addScaledVector(ctx.halfEdgeMesh!.normals[0], OVER_OFFSET);
+    });
+
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineBasicMaterial({ color, linewidth: 3 });
+    ctx.stripMeshes.add(new THREE.Line(geo, mat));
   }
+
+  // 3b. Render junction holes as flat rings on the surface
+  for (const junc of ctx.kagomePattern.junctions) {
+    const overColor  = new THREE.Color(state.kagome.layerColors[junc.overFamily]);
+    const underColor = new THREE.Color(state.kagome.layerColors[junc.underFamily]);
+
+    // Outer ring: over-family color
+    addJunctionRing(ctx.stripMeshes, junc.position, junc.normal,
+      junc.holeRadius * 1.6, junc.holeRadius * 1.2, overColor);
+
+    // Inner disc: under-family color (the "hole")
+    addJunctionDisc(ctx.stripMeshes, junc.position, junc.normal,
+      junc.holeRadius, underColor);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Junction visualization helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildCirclePoints(
+  center: THREE.Vector3,
+  normal: THREE.Vector3,
+  radius: number,
+  segments = 24,
+): THREE.Vector3[] {
+  // Build a local 2D frame in the plane perpendicular to `normal`
+  const ref = Math.abs(normal.x) < 0.9
+    ? new THREE.Vector3(1, 0, 0)
+    : new THREE.Vector3(0, 1, 0);
+  const t1 = new THREE.Vector3().crossVectors(normal, ref).normalize();
+  const t2 = new THREE.Vector3().crossVectors(normal, t1).normalize();
+
+  const pts: THREE.Vector3[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const θ = (2 * Math.PI * i) / segments;
+    pts.push(
+      center.clone()
+        .addScaledVector(t1, Math.cos(θ) * radius)
+        .addScaledVector(t2, Math.sin(θ) * radius),
+    );
+  }
+  return pts;
+}
+
+function addJunctionRing(
+  group: THREE.Group,
+  center: THREE.Vector3,
+  normal: THREE.Vector3,
+  outerR: number,
+  innerR: number,
+  color: THREE.Color,
+): void {
+  // Two concentric circle lines
+  for (const r of [outerR, innerR]) {
+    const pts = buildCirclePoints(center, normal, r);
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+    group.add(new THREE.Line(geo, mat));
+  }
+}
+
+function addJunctionDisc(
+  group: THREE.Group,
+  center: THREE.Vector3,
+  normal: THREE.Vector3,
+  radius: number,
+  color: THREE.Color,
+): void {
+  // Filled disc using a circle outline (small sphere as center marker too)
+  const pts = buildCirclePoints(center, normal, radius);
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({ color, linewidth: 1 });
+  group.add(new THREE.Line(geo, mat));
+
+  // Small sphere at the center
+  const sphereGeo = new THREE.SphereGeometry(radius * 0.35, 8, 8);
+  const sphereMat = new THREE.MeshBasicMaterial({ color });
+  const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+  sphere.position.copy(center);
+  group.add(sphere);
 }
 
 function createGeometry(meshData: MeshData): THREE.BufferGeometry {

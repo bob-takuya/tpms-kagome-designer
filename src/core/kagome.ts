@@ -1,14 +1,30 @@
+/**
+ * kagome.ts – Phase 3: Kagome strip extraction
+ *
+ * Takes 3 stripe scalar fields + their isolines (from Phase 2) and:
+ *   1. Stitches marching-triangle segments into ordered polylines (strip centerlines)
+ *   2. Detects junctions by finding faces where 2 different families cross simultaneously
+ *   3. Computes the exact 3D intersection point of the two crossing segments in each junction face
+ *   4. Applies the kagome over/under rule: family k goes OVER family (k+1)%3
+ *   5. Segments each strip centerline at its junction positions
+ *   6. Assigns world-space width from adjacent isoline spacing
+ */
+
 import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
 import type { Isoline } from './connectionLaplacian';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Public interfaces  (kept backward-compatible with unfold.ts / dxf.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface Strip {
   id: string;
-  family: number; // 0, 1, 2 for A, B, C
-  layer: number; // 0, 1, 2 for over/under assignment
-  isolines: [Isoline, Isoline]; // Boundary isolines
-  centerline: THREE.Vector3[];
-  width: number;
+  family: number;            // 0 | 1 | 2
+  layer: number;             // 0=under, 1=neutral, 2=over  (per-junction)
+  isolines: [Isoline, Isoline];  // [left-boundary isoline, right-boundary isoline] (kept for compat)
+  centerline: THREE.Vector3[];   // stitched polyline
+  width: number;             // world-space half-width × 2
   junctions: Junction[];
   segments: StripSegment[];
 }
@@ -16,7 +32,11 @@ export interface Strip {
 export interface Junction {
   id: number;
   position: THREE.Vector3;
-  stripIds: string[];
+  normal: THREE.Vector3;     // surface normal at junction
+  stripIds: string[];        // exactly 2 strip IDs
+  familyPair: [number, number];
+  overFamily: number;        // kagome rule: family k over (k+1)%3
+  underFamily: number;
   holeRadius: number;
   faceIndex: number;
 }
@@ -24,7 +44,7 @@ export interface Junction {
 export interface StripSegment {
   startJunctionId: number | null;
   endJunctionId: number | null;
-  points: THREE.Vector3[];
+  points: THREE.Vector3[];   // ordered polyline from startJunction to endJunction
   width: number;
   faceIndices: number[];
 }
@@ -35,374 +55,433 @@ export interface KagomePattern {
   families: [Strip[], Strip[], Strip[]];
 }
 
-// Method B: Constant width ratio
-export function extractKagomeStrips(
+// ─────────────────────────────────────────────────────────────────────────────
+// Main entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build a complete Kagome pattern from the 3 stripe fields.
+ *
+ * @param mesh              Half-edge mesh (TPMS surface)
+ * @param stripeFields      3 scalar fields from the Poisson solve
+ * @param isolinesByFamily  Marching-triangle isolines for each family
+ * @param numStripes        Number of stripes per family
+ * @param holeRadius        Radius of junction holes
+ */
+export function buildKagomePattern(
   mesh: HalfEdgeMesh,
+  _stripeFields: [Float64Array, Float64Array, Float64Array],
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]],
-  widthRatio: number,
-  holeRadius: number
+  _numStripes: number,
+  holeRadius: number,
 ): KagomePattern {
+
+  // ── 1. Stitch segment pairs → ordered polylines per strip ─────────────────
   const families: [Strip[], Strip[], Strip[]] = [[], [], []];
   const allStrips: Strip[] = [];
 
-  // Create strips from isolines for each family
-  for (let family = 0; family < 3; family++) {
-    const familyIsolines = isolinesByFamily[family];
+  for (let k = 0; k < 3; k++) {
+    const isos = isolinesByFamily[k];
+    for (let li = 0; li < isos.length; li++) {
+      const iso = isos[li];
+      if (iso.points.length < 2) continue;
 
-    for (let i = 0; i < familyIsolines.length; i++) {
-      const isoline1 = familyIsolines[i];
-      const isoline2 = familyIsolines[(i + 1) % familyIsolines.length];
-
-      if (isoline1.points.length < 2 || isoline2.points.length < 2) continue;
-
-      // Calculate strip width based on distance between isolines
-      const avgWidth = calculateAverageDistance(isoline1.points, isoline2.points) * widthRatio;
+      // Stitch marching-triangle segment pairs into connected polyline chains
+      const chains = stitchSegments(iso.points);
+      // Pick the longest chain as the representative centerline
+      const centerline = chains.sort((a, b) => b.length - a.length)[0] ?? [];
+      if (centerline.length < 2) continue;
 
       const strip: Strip = {
-        id: `${String.fromCharCode(65 + family)}${i + 1}`,
-        family,
-        layer: family, // Initial layer assignment
-        isolines: [isoline1, isoline2],
-        centerline: computeCenterline(isoline1.points, isoline2.points),
-        width: avgWidth,
+        id: `${String.fromCharCode(65 + k)}${li + 1}`,
+        family: k,
+        layer: 1,
+        isolines: [iso, iso],    // placeholder; boundaries added later
+        centerline,
+        width: 0,                // computed below
         junctions: [],
-        segments: []
+        segments: [],
       };
 
-      families[family].push(strip);
+      families[k].push(strip);
       allStrips.push(strip);
     }
   }
 
-  // Find junctions (intersections between strips from different families)
-  const junctions = findJunctions(allStrips, mesh, holeRadius);
+  // ── 2. Estimate world-space strip widths from adjacent centerline spacing ──
+  for (let k = 0; k < 3; k++) {
+    const fam = families[k];
+    for (let i = 0; i < fam.length; i++) {
+      const prev = fam[(i - 1 + fam.length) % fam.length];
+      const next = fam[(i + 1) % fam.length];
+      const d1 = averageCenterlineDistance(fam[i].centerline, prev.centerline);
+      const d2 = averageCenterlineDistance(fam[i].centerline, next.centerline);
+      fam[i].width = Math.min(d1, d2) * 0.8;   // 80% of spacing
+    }
+  }
 
-  // Assign junctions to strips
-  for (const junction of junctions) {
-    for (const stripId of junction.stripIds) {
-      const strip = allStrips.find(s => s.id === stripId);
-      if (strip) {
-        strip.junctions.push(junction);
+  // ── 3. Build face → strip-segment map from isoline faceIndices ─────────────
+  // faceMap[faceIdx] = list of {stripId, family, segA, segB}
+  const faceMap = new Map<number, { stripId: string; family: number; segA: THREE.Vector3; segB: THREE.Vector3 }[]>();
+
+  for (let k = 0; k < 3; k++) {
+    const isos = isolinesByFamily[k];
+    for (let li = 0; li < isos.length; li++) {
+      const iso = isos[li];
+      const stripId = `${String.fromCharCode(65 + k)}${li + 1}`;
+      // Verify this strip was actually built
+      if (!allStrips.find(s => s.id === stripId)) continue;
+
+      for (let si = 0; si < iso.faceIndices.length; si++) {
+        const fi = iso.faceIndices[si];
+        const segA = iso.points[si * 2];
+        const segB = iso.points[si * 2 + 1];
+        if (!segA || !segB) continue;
+
+        if (!faceMap.has(fi)) faceMap.set(fi, []);
+        faceMap.get(fi)!.push({ stripId, family: k, segA, segB });
       }
     }
   }
 
-  // Segment strips at junctions
-  for (const strip of allStrips) {
-    strip.segments = segmentStripAtJunctions(strip, mesh);
-  }
-
-  return {
-    strips: allStrips,
-    junctions,
-    families
-  };
-}
-
-function calculateAverageDistance(points1: THREE.Vector3[], points2: THREE.Vector3[]): number {
-  let totalDist = 0;
-  let count = 0;
-
-  const len = Math.min(points1.length, points2.length);
-  for (let i = 0; i < len; i++) {
-    totalDist += points1[i].distanceTo(points2[i]);
-    count++;
-  }
-
-  return count > 0 ? totalDist / count : 0.1;
-}
-
-function computeCenterline(points1: THREE.Vector3[], points2: THREE.Vector3[]): THREE.Vector3[] {
-  const centerline: THREE.Vector3[] = [];
-  const len = Math.min(points1.length, points2.length);
-
-  for (let i = 0; i < len; i++) {
-    const center = new THREE.Vector3()
-      .addVectors(points1[i], points2[i])
-      .multiplyScalar(0.5);
-    centerline.push(center);
-  }
-
-  return centerline;
-}
-
-function findJunctions(
-  strips: Strip[],
-  mesh: HalfEdgeMesh,
-  holeRadius: number
-): Junction[] {
+  // ── 4. Detect junctions ────────────────────────────────────────────────────
   const junctions: Junction[] = [];
-  let junctionId = 1;
+  let jId = 1;
+  for (const [fi, segs] of faceMap) {
+    // Group segments by family
+    const byFamily = new Map<number, typeof segs>();
+    for (const s of segs) {
+      if (!byFamily.has(s.family)) byFamily.set(s.family, []);
+      byFamily.get(s.family)!.push(s);
+    }
+    if (byFamily.size < 2) continue;
 
-  // Check intersections between strips of different families
-  for (let i = 0; i < strips.length; i++) {
-    for (let j = i + 1; j < strips.length; j++) {
-      const strip1 = strips[i];
-      const strip2 = strips[j];
+    const faceVerts = mesh.faces[fi];
+    const n = computeFaceNormal(
+      mesh.vertices[faceVerts[0]],
+      mesh.vertices[faceVerts[1]],
+      mesh.vertices[faceVerts[2]],
+    );
 
-      // Skip if same family
-      if (strip1.family === strip2.family) continue;
+    const famKeys = Array.from(byFamily.keys());
+    for (let a = 0; a < famKeys.length; a++) {
+      for (let b = a + 1; b < famKeys.length; b++) {
+        const ka = famKeys[a], kb = famKeys[b];
+        const segsA = byFamily.get(ka)!;
+        const segsB = byFamily.get(kb)!;
 
-      // Find intersection points
-      const intersections = findStripIntersections(strip1, strip2, mesh);
+        for (const sa of segsA) {
+          for (const sb of segsB) {
+            const pt = intersectSegmentsInFace(sa.segA, sa.segB, sb.segA, sb.segB, n);
+            if (!pt) continue;
 
-      for (const intersection of intersections) {
-        // Check if there's already a junction nearby
-        const existingJunction = junctions.find(j =>
-          j.position.distanceTo(intersection.point) < holeRadius * 2
-        );
+            // Deduplicate: skip if a junction from the SAME two strips is already nearby
+            const dedupKey = [sa.stripId, sb.stripId].sort().join('|');
+            let tooClose = false;
+            for (const junc of junctions) {
+              if (
+                junc.stripIds.slice().sort().join('|') === dedupKey &&
+                junc.position.distanceTo(pt) < holeRadius * 3
+              ) {
+                tooClose = true;
+                break;
+              }
+            }
+            if (tooClose) continue;
 
-        if (existingJunction) {
-          if (!existingJunction.stripIds.includes(strip1.id)) {
-            existingJunction.stripIds.push(strip1.id);
+            // Kagome over/under rule: family k goes OVER family (k+1)%3
+            const overFamily = (ka + 1) % 3 === kb ? ka : kb;
+            const underFamily = overFamily === ka ? kb : ka;
+            const overStripId = overFamily === ka ? sa.stripId : sb.stripId;
+            const underStripId = overFamily === ka ? sb.stripId : sa.stripId;
+
+            junctions.push({
+              id: jId++,
+              position: pt.clone(),
+              normal: n.clone(),
+              stripIds: [overStripId, underStripId],
+              familyPair: [ka, kb],
+              overFamily,
+              underFamily,
+              holeRadius,
+              faceIndex: fi,
+            });
           }
-          if (!existingJunction.stripIds.includes(strip2.id)) {
-            existingJunction.stripIds.push(strip2.id);
-          }
-        } else {
-          junctions.push({
-            id: junctionId++,
-            position: intersection.point,
-            stripIds: [strip1.id, strip2.id],
-            holeRadius,
-            faceIndex: intersection.faceIndex
-          });
         }
       }
     }
   }
 
-  return junctions;
-}
-
-interface Intersection {
-  point: THREE.Vector3;
-  faceIndex: number;
-}
-
-function findStripIntersections(
-  strip1: Strip,
-  strip2: Strip,
-  _mesh: HalfEdgeMesh
-): Intersection[] {
-  const intersections: Intersection[] = [];
-
-  // Check centerline intersections
-  for (let i = 0; i < strip1.centerline.length - 1; i++) {
-    const a1 = strip1.centerline[i];
-    const a2 = strip1.centerline[i + 1];
-
-    for (let j = 0; j < strip2.centerline.length - 1; j++) {
-      const b1 = strip2.centerline[j];
-      const b2 = strip2.centerline[j + 1];
-
-      // Check if line segments are close enough to be considered intersecting
-      const intersection = findSegmentIntersection3D(a1, a2, b1, b2);
-
-      if (intersection) {
-        const faceIndex = Math.min(
-          strip1.isolines[0].faceIndices[Math.min(i, strip1.isolines[0].faceIndices.length - 1)] || 0,
-          strip2.isolines[0].faceIndices[Math.min(j, strip2.isolines[0].faceIndices.length - 1)] || 0
-        );
-
-        intersections.push({
-          point: intersection,
-          faceIndex
-        });
-      }
+  // ── 5. Assign junctions to strips ─────────────────────────────────────────
+  const stripById = new Map(allStrips.map(s => [s.id, s]));
+  for (const junc of junctions) {
+    for (const sid of junc.stripIds) {
+      const strip = stripById.get(sid);
+      if (strip && !strip.junctions.includes(junc)) strip.junctions.push(junc);
     }
   }
 
-  return intersections;
+  // ── 6. Over/under layer assignment ────────────────────────────────────────
+  for (const junc of junctions) {
+    const overStrip = stripById.get(junc.stripIds[0]);  // over strip
+    const underStrip = stripById.get(junc.stripIds[1]); // under strip
+    // Promote "over" strip if it isn't already
+    if (overStrip && overStrip.layer < 2) overStrip.layer = 2;
+    if (underStrip && underStrip.layer > 0) underStrip.layer = 0;
+  }
+
+  // ── 7. Segment each strip at its junction points ───────────────────────────
+  for (const strip of allStrips) {
+    strip.segments = segmentAtJunctions(strip);
+  }
+
+  return { strips: allStrips, junctions, families };
 }
 
-function findSegmentIntersection3D(
-  a1: THREE.Vector3,
-  a2: THREE.Vector3,
-  b1: THREE.Vector3,
-  b2: THREE.Vector3
-): THREE.Vector3 | null {
-  // Find closest points between two line segments in 3D
-  const d1 = new THREE.Vector3().subVectors(a2, a1);
-  const d2 = new THREE.Vector3().subVectors(b2, b1);
-  const r = new THREE.Vector3().subVectors(a1, b1);
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy entry points kept for backward-compatibility
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const a = d1.dot(d1);
-  const e = d2.dot(d2);
-  const f = d2.dot(r);
+/** @deprecated Use buildKagomePattern instead */
+export function extractKagomeStrips(
+  mesh: HalfEdgeMesh,
+  isolinesByFamily: [Isoline[], Isoline[], Isoline[]],
+  _widthRatio: number,
+  holeRadius: number,
+): KagomePattern {
+  // No stripe fields available in legacy path → build empty fields
+  const empty = new Float64Array(mesh.vertices.length);
+  return buildKagomePattern(
+    mesh,
+    [empty, empty, empty],
+    isolinesByFamily,
+    isolinesByFamily[0].length,
+    holeRadius,
+  );
+}
 
-  const EPSILON = 1e-6;
+/** @deprecated Layer assignment is now done inside buildKagomePattern */
+export function assignLayers(_pattern: KagomePattern): void { /* no-op */ }
 
-  let s: number, t: number;
+// ─────────────────────────────────────────────────────────────────────────────
+// Stitch marching-triangle segment pairs into connected polyline chains
+// ─────────────────────────────────────────────────────────────────────────────
 
-  if (a <= EPSILON && e <= EPSILON) {
-    s = t = 0;
-  } else if (a <= EPSILON) {
-    s = 0;
-    t = Math.max(0, Math.min(1, f / e));
-  } else {
-    const c = d1.dot(r);
-    if (e <= EPSILON) {
-      t = 0;
-      s = Math.max(0, Math.min(1, -c / a));
-    } else {
-      const b = d1.dot(d2);
-      const denom = a * e - b * b;
+function stitchSegments(points: THREE.Vector3[]): THREE.Vector3[][] {
+  const n = points.length / 2;
+  if (n === 0) return [];
 
-      if (Math.abs(denom) > EPSILON) {
-        s = Math.max(0, Math.min(1, (b * f - c * e) / denom));
-      } else {
-        s = 0;
-      }
+  // Hash endpoint coordinates (rounded to 4 decimal places for stability)
+  const PREC = 1e4;
+  const hash = (p: THREE.Vector3) =>
+    `${Math.round(p.x * PREC)},${Math.round(p.y * PREC)},${Math.round(p.z * PREC)}`;
 
-      t = (b * s + f) / e;
-
-      if (t < 0) {
-        t = 0;
-        s = Math.max(0, Math.min(1, -c / a));
-      } else if (t > 1) {
-        t = 1;
-        s = Math.max(0, Math.min(1, (b - c) / a));
-      }
+  // endpointMap: hash → list of (segIdx, end)
+  const endpointMap = new Map<string, { segIdx: number; end: 0 | 1 }[]>();
+  for (let i = 0; i < n; i++) {
+    for (const end of [0, 1] as const) {
+      const h = hash(points[2 * i + end]);
+      if (!endpointMap.has(h)) endpointMap.set(h, []);
+      endpointMap.get(h)!.push({ segIdx: i, end });
     }
   }
 
-  const c1 = a1.clone().add(d1.clone().multiplyScalar(s));
-  const c2 = b1.clone().add(d2.clone().multiplyScalar(t));
+  const used = new Uint8Array(n);
+  const chains: THREE.Vector3[][] = [];
 
-  const dist = c1.distanceTo(c2);
+  for (let start = 0; start < n; start++) {
+    if (used[start]) continue;
 
-  // If segments are close enough, return midpoint
-  const threshold = 0.1; // Adjust based on mesh scale
-  if (dist < threshold) {
-    return c1.clone().add(c2).multiplyScalar(0.5);
+    const chain: THREE.Vector3[] = [points[2 * start].clone(), points[2 * start + 1].clone()];
+    used[start] = 1;
+
+    // Extend forward
+    let extending = true;
+    while (extending) {
+      extending = false;
+      const h = hash(chain[chain.length - 1]);
+      for (const { segIdx, end } of endpointMap.get(h) ?? []) {
+        if (used[segIdx]) continue;
+        chain.push(points[2 * segIdx + (1 - end)].clone());
+        used[segIdx] = 1;
+        extending = true;
+        break;
+      }
+    }
+
+    // Extend backward
+    extending = true;
+    while (extending) {
+      extending = false;
+      const h = hash(chain[0]);
+      for (const { segIdx, end } of endpointMap.get(h) ?? []) {
+        if (used[segIdx]) continue;
+        chain.unshift(points[2 * segIdx + (1 - end)].clone());
+        used[segIdx] = 1;
+        extending = true;
+        break;
+      }
+    }
+
+    if (chain.length >= 2) chains.push(chain);
   }
 
-  return null;
+  return chains;
 }
 
-function segmentStripAtJunctions(strip: Strip, _mesh: HalfEdgeMesh): StripSegment[] {
-  const segments: StripSegment[] = [];
+// ─────────────────────────────────────────────────────────────────────────────
+// Segment a strip's centerline at its junction positions
+// ─────────────────────────────────────────────────────────────────────────────
+
+function segmentAtJunctions(strip: Strip): StripSegment[] {
+  const cl = strip.centerline;
+  if (cl.length < 2) return [];
 
   if (strip.junctions.length === 0) {
-    // No junctions - single segment
-    segments.push({
+    return [{
       startJunctionId: null,
       endJunctionId: null,
-      points: [...strip.centerline],
+      points: [...cl],
       width: strip.width,
-      faceIndices: strip.isolines[0].faceIndices
-    });
-    return segments;
+      faceIndices: [],
+    }];
   }
 
-  // Sort junctions by position along centerline
-  const sortedJunctions = sortJunctionsAlongStrip(strip);
+  // Map each junction to the closest index on the centerline
+  const juncPoints: { jId: number; clIdx: number }[] =
+    strip.junctions
+      .map(j => ({ jId: j.id, clIdx: closestPointIndex(cl, j.position) }))
+      .sort((a, b) => a.clIdx - b.clIdx);
 
-  // Create segments between junctions
-  let lastIdx = 0;
+  const segments: StripSegment[] = [];
+  let prevIdx = 0;
+  let prevJId: number | null = null;
 
-  for (let i = 0; i < sortedJunctions.length; i++) {
-    const junction = sortedJunctions[i];
-    const junctionIdx = findClosestPointIndex(strip.centerline, junction.position);
-
-    if (junctionIdx > lastIdx) {
+  for (const { jId, clIdx } of juncPoints) {
+    if (clIdx > prevIdx) {
       segments.push({
-        startJunctionId: i === 0 ? null : sortedJunctions[i - 1].id,
-        endJunctionId: junction.id,
-        points: strip.centerline.slice(lastIdx, junctionIdx + 1),
+        startJunctionId: prevJId,
+        endJunctionId: jId,
+        points: cl.slice(prevIdx, clIdx + 1),
         width: strip.width,
-        faceIndices: strip.isolines[0].faceIndices.slice(lastIdx, junctionIdx + 1)
+        faceIndices: [],
       });
     }
-
-    lastIdx = junctionIdx;
+    prevIdx = clIdx;
+    prevJId = jId;
   }
 
-  // Final segment after last junction
-  if (lastIdx < strip.centerline.length - 1) {
+  // Final segment after the last junction
+  if (prevIdx < cl.length - 1) {
     segments.push({
-      startJunctionId: sortedJunctions[sortedJunctions.length - 1].id,
+      startJunctionId: prevJId,
       endJunctionId: null,
-      points: strip.centerline.slice(lastIdx),
+      points: cl.slice(prevIdx),
       width: strip.width,
-      faceIndices: strip.isolines[0].faceIndices.slice(lastIdx)
+      faceIndices: [],
     });
   }
 
-  return segments;
+  return segments.filter(s => s.points.length >= 2);
 }
 
-function sortJunctionsAlongStrip(strip: Strip): Junction[] {
-  return [...strip.junctions].sort((a, b) => {
-    const idxA = findClosestPointIndex(strip.centerline, a.position);
-    const idxB = findClosestPointIndex(strip.centerline, b.position);
-    return idxA - idxB;
-  });
+// ─────────────────────────────────────────────────────────────────────────────
+// Intersection of two coplanar segments inside a triangular face
+//
+// Uses 2D coordinates in the face plane (first segment AB defines the x-axis).
+// Returns a 3D point on segment AB (or null if they don't intersect in [0,1]×[0,1]).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function intersectSegmentsInFace(
+  A: THREE.Vector3, B: THREE.Vector3,
+  C: THREE.Vector3, D: THREE.Vector3,
+  faceNormal: THREE.Vector3,
+): THREE.Vector3 | null {
+  const AB = new THREE.Vector3().subVectors(B, A);
+  const lenAB = AB.length();
+  if (lenAB < 1e-12) return null;
+
+  // Local 2D frame: u along AB, w perpendicular in face plane
+  const u = AB.clone().divideScalar(lenAB);
+  const w = new THREE.Vector3().crossVectors(faceNormal, u).normalize();
+
+  const dot3 = (v: THREE.Vector3, d: THREE.Vector3) =>
+    (v.x - A.x) * d.x + (v.y - A.y) * d.y + (v.z - A.z) * d.z;
+
+  // 2D coords (A is origin)
+  // B2 = (lenAB, 0)  [by construction]
+  const C2x = dot3(C, u), C2y = dot3(C, w);
+  const D2x = dot3(D, u), D2y = dot3(D, w);
+
+  // Line 1: (0,0)→(lenAB,0), parametric s·(lenAB,0), s∈[0,1]
+  // Line 2: (C2x,C2y)→(D2x,D2y), parametric C + t·(D-C), t∈[0,1]
+  //
+  // At intersection: y=0  →  C2y + t·(D2y-C2y)=0  →  t = -C2y/(D2y-C2y)
+  // Then x = C2x + t·(D2x-C2x)  →  s = x/lenAB
+
+  const ddy = D2y - C2y;
+
+  if (Math.abs(ddy) < 1e-10) {
+    // Segments parallel within face → use centroid of the 4 endpoints
+    return A.clone().add(B).add(C).add(D).multiplyScalar(0.25);
+  }
+
+  const t = -C2y / ddy;
+  if (t < -0.02 || t > 1.02) return null;
+
+  const px = C2x + t * (D2x - C2x);
+  const s = px / lenAB;
+  if (s < -0.02 || s > 1.02) return null;
+
+  const sClamped = Math.max(0, Math.min(1, s));
+  return new THREE.Vector3().lerpVectors(A, B, sClamped);
 }
 
-function findClosestPointIndex(points: THREE.Vector3[], target: THREE.Vector3): number {
-  let minDist = Infinity;
-  let minIdx = 0;
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
+function computeFaceNormal(
+  v0: THREE.Vector3,
+  v1: THREE.Vector3,
+  v2: THREE.Vector3,
+): THREE.Vector3 {
+  const e1 = new THREE.Vector3().subVectors(v1, v0);
+  const e2 = new THREE.Vector3().subVectors(v2, v0);
+  return new THREE.Vector3().crossVectors(e1, e2).normalize();
+}
+
+function closestPointIndex(points: THREE.Vector3[], target: THREE.Vector3): number {
+  let minD = Infinity, idx = 0;
   for (let i = 0; i < points.length; i++) {
-    const dist = points[i].distanceTo(target);
-    if (dist < minDist) {
-      minDist = dist;
-      minIdx = i;
-    }
+    const d = points[i].distanceToSquared(target);
+    if (d < minD) { minD = d; idx = i; }
   }
-
-  return minIdx;
+  return idx;
 }
 
-// Assign layers for over/under weaving pattern
-export function assignLayers(pattern: KagomePattern): void {
-  // Classic Kagome: each family goes over one family and under another
-  // Family A (0): over B, under C
-  // Family B (1): over C, under A
-  // Family C (2): over A, under B
-
-  for (const junction of pattern.junctions) {
-    const stripFamilies = junction.stripIds.map(id => {
-      const strip = pattern.strips.find(s => s.id === id);
-      return strip ? strip.family : -1;
-    }).filter(f => f >= 0);
-
-    if (stripFamilies.length >= 2) {
-      // Determine layer order at this junction
-      for (const stripId of junction.stripIds) {
-        const strip = pattern.strips.find(s => s.id === stripId);
-        if (!strip) continue;
-
-        const otherFamilies = stripFamilies.filter(f => f !== strip.family);
-
-        // Assign layer based on weaving pattern
-        let layer = 1; // Middle by default
-
-        for (const otherFamily of otherFamilies) {
-          if ((strip.family + 1) % 3 === otherFamily) {
-            // This strip goes over
-            layer = 2;
-          } else if ((strip.family + 2) % 3 === otherFamily) {
-            // This strip goes under
-            layer = 0;
-          }
-        }
-
-        strip.layer = layer;
-      }
-    }
+function averageCenterlineDistance(cl1: THREE.Vector3[], cl2: THREE.Vector3[]): number {
+  const len = Math.min(cl1.length, cl2.length, 10);
+  if (len === 0) return 0.1;
+  let sum = 0;
+  for (let i = 0; i < len; i++) {
+    const idx1 = Math.floor(i * cl1.length / len);
+    const idx2 = Math.floor(i * cl2.length / len);
+    sum += cl1[idx1].distanceTo(cl2[idx2]);
   }
+  return sum / len;
 }
 
-// Generate hole geometry at junctions
+// ─────────────────────────────────────────────────────────────────────────────
+// Kept for downstream compatibility (generateJunctionHoles in old code)
+// ─────────────────────────────────────────────────────────────────────────────
+
 export function generateJunctionHoles(
   junctions: Junction[],
-  radius: number
+  radius: number,
 ): { centers: THREE.Vector3[]; radii: number[] } {
   return {
     centers: junctions.map(j => j.position.clone()),
-    radii: junctions.map(() => radius)
+    radii: junctions.map(() => radius),
   };
 }
