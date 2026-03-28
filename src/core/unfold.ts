@@ -151,13 +151,16 @@ function computeGeodesicData(
   }
 
   // ── Clamp extreme curvatures to avoid self-intersecting strips ─────────────
-  const maxKappa = 2.0;  // reasonable limit for strips
+  const maxKappa = 0.8;  // physical limit: radius of curvature ≥ 1.25 world units
   for (let i = 0; i < n; i++) {
     kappaG[i] = Math.max(-maxKappa, Math.min(maxKappa, kappaG[i]));
   }
 
   // ── Compute 2D tangents by integrating geodesic curvature ──────────────────
   // θ(s) = ∫ κ_g ds  →  tangent2D = (cos θ, sin θ)
+  // Guard: if total |θ| exceeds 120° the strip spirals back on itself.
+  // Beyond that threshold we freeze θ so the remainder unfolds as a straight line.
+  const MAX_TOTAL_THETA = (2 * Math.PI) / 3;  // 120° – physical bending limit
   const tangents2D: THREE.Vector2[] = [];
   let theta = 0;  // initial angle (strip starts pointing in +x direction)
   tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
@@ -165,7 +168,12 @@ function computeGeodesicData(
   for (let i = 1; i < n; i++) {
     const ds = arcLengths[i] - arcLengths[i - 1];
     const kAvg = (kappaG[i - 1] + kappaG[i]) / 2;
-    theta += kAvg * ds;
+    const dTheta = kAvg * ds;
+    const nextTheta = theta + dTheta;
+    // Freeze accumulation once the strip would exceed the bending limit
+    theta = Math.abs(nextTheta) <= MAX_TOTAL_THETA
+      ? nextTheta
+      : Math.sign(nextTheta) * MAX_TOTAL_THETA;
     tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
   }
 
