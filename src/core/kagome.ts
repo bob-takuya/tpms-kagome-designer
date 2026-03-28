@@ -693,16 +693,23 @@ function closestPointIndex(points: THREE.Vector3[], target: THREE.Vector3): numb
   return idx;
 }
 
+// Nearest-neighbour average: sample K points from cl1, find closest point in cl2.
+// Index-based comparison is wrong when two adjacent isolines start at geometrically
+// distant positions (common on periodic TPMS surfaces).
 function averageCenterlineDistance(cl1: THREE.Vector3[], cl2: THREE.Vector3[]): number {
-  const len = Math.min(cl1.length, cl2.length, 10);
-  if (len === 0) return 0.1;
+  const K = Math.min(cl1.length, 8);
+  if (K === 0 || cl2.length === 0) return 0.1;
   let sum = 0;
-  for (let i = 0; i < len; i++) {
-    const idx1 = Math.floor(i * cl1.length / len);
-    const idx2 = Math.floor(i * cl2.length / len);
-    sum += cl1[idx1].distanceTo(cl2[idx2]);
+  for (let k = 0; k < K; k++) {
+    const p = cl1[Math.floor(k * cl1.length / K)];
+    let minD2 = Infinity;
+    for (const q of cl2) {
+      const d2 = p.distanceToSquared(q);
+      if (d2 < minD2) minD2 = d2;
+    }
+    sum += Math.sqrt(minD2);
   }
-  return sum / len;
+  return sum / K;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

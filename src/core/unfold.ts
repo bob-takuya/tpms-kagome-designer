@@ -205,9 +205,14 @@ function unrollGeodesic(
   // Integrate along the curve
   for (let i = 1; i < n; i++) {
     const ds = geodesic.arcLengths[i] - geodesic.arcLengths[i - 1];
-    // Use average tangent for better accuracy
-    const tAvg = geodesic.tangents2D[i - 1].clone().add(geodesic.tangents2D[i]).multiplyScalar(0.5);
-    tAvg.normalize();
+    // Average of consecutive 2D tangents for smoother centerline.
+    // Guard: if tangents are nearly anti-parallel (dθ ≈ π), their sum ≈ 0 and
+    // normalize() returns (0,0), causing zero advancement → "abnormally short" strip.
+    // Fall back to the previous tangent direction in that case.
+    const tSum = geodesic.tangents2D[i - 1].clone().add(geodesic.tangents2D[i]);
+    const tAvg = tSum.lengthSq() > 1e-10
+      ? tSum.normalize()
+      : geodesic.tangents2D[i - 1].clone();
 
     x += tAvg.x * ds;
     y += tAvg.y * ds;
