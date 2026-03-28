@@ -92,15 +92,21 @@ function buildNormalLookup(mesh: HalfEdgeMesh): (p: THREE.Vector3) => THREE.Vect
 // ─────────────────────────────────────────────────────────────────────────────
 // Compute geodesic curvature along the centerline
 //
-// κ_g = (dt/ds) · n_s,  where:
-//   t   = tangent vector (along the curve)
-//   n_s = in-surface perpendicular = normalize(surfNormal × t)
+// Discrete geodesic unrolling via parallel transport
+//
+// At each step we project the next 3D tangent onto the previous tangent plane,
+// then measure the signed rotation angle (dθ) using the surface normal as
+// the reference axis.  No numerical differentiation → no κ_g noise.
+//
+// This is equivalent to computing ∫ κ_g ds sequentially along arc length s:
+//   • Normal curvature κ_n  → absorbed by the projection (flattened out)
+//   • Geodesic curvature κ_g → preserved as the 2D bending angle dθ
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface GeodesicData {
-  arcLengths:  number[];   // cumulative arc length at each point
-  kappaG:      number[];   // geodesic curvature at each point
-  tangents2D:  THREE.Vector2[];  // 2D tangent directions after unrolling
+  arcLengths: number[];   // cumulative arc length at each point
+  kappaG:     number[];   // (kept for downstream compat; set to dθ/ds approximation)
+  tangents2D: THREE.Vector2[];  // 2D tangent directions after unrolling
 }
 
 function computeGeodesicData(
@@ -110,7 +116,7 @@ function computeGeodesicData(
   const n = cl3.length;
   const getNorm = buildNormalLookup(mesh);
 
-  // ── Tangents (forward difference for stability) ────────────────────────────
+  // ── Unit tangents ──────────────────────────────────────────────────────────
   const tangents3D: THREE.Vector3[] = [];
   for (let i = 0; i < n; i++) {
     const pa = cl3[Math.max(0, i - 1)];
@@ -123,59 +129,49 @@ function computeGeodesicData(
   // ── Surface normals ────────────────────────────────────────────────────────
   const surfNormals: THREE.Vector3[] = cl3.map(p => getNorm(p));
 
-  // ── In-surface perpendicular: n_s = normalize(surfNormal × t) ──────────────
-  const nPerps: THREE.Vector3[] = tangents3D.map((t, i) => {
-    let ns = new THREE.Vector3().crossVectors(surfNormals[i], t);
-    if (ns.lengthSq() < 1e-10) ns.set(0, 0, 1).cross(t);
-    return ns.normalize();
-  });
-
   // ── Arc lengths (cumulative) ───────────────────────────────────────────────
   const arcLengths: number[] = [0];
   for (let i = 1; i < n; i++) {
     arcLengths.push(arcLengths[i - 1] + cl3[i - 1].distanceTo(cl3[i]));
   }
 
-  // ── Geodesic curvature: κ_g = (dt/ds) · n_s  (central difference) ──────────
-  const kappaG: number[] = new Array(n).fill(0);
-  for (let i = 1; i < n - 1; i++) {
-    const ds = cl3[i - 1].distanceTo(cl3[i + 1]);
-    if (ds < 1e-12) continue;
-    const dt = new THREE.Vector3().subVectors(tangents3D[i + 1], tangents3D[i - 1]);
-    kappaG[i] = dt.dot(nPerps[i]) / ds;
-  }
-  // Extrapolate endpoints
-  if (n >= 2) {
-    kappaG[0] = kappaG[1];
-    kappaG[n - 1] = kappaG[n - 2];
-  }
-
-  // ── Clamp extreme curvatures to avoid self-intersecting strips ─────────────
-  const maxKappa = 0.8;  // physical limit: radius of curvature ≥ 1.25 world units
-  for (let i = 0; i < n; i++) {
-    kappaG[i] = Math.max(-maxKappa, Math.min(maxKappa, kappaG[i]));
-  }
-
-  // ── Compute 2D tangents by integrating geodesic curvature ──────────────────
-  // θ(s) = ∫ κ_g ds  →  tangent2D = (cos θ, sin θ)
-  // Guard: if total |θ| exceeds 120° the strip spirals back on itself.
-  // Beyond that threshold we freeze θ so the remainder unfolds as a straight line.
-  const MAX_TOTAL_THETA = (2 * Math.PI) / 3;  // 120° – physical bending limit
+  // ── Parallel-transport unrolling ───────────────────────────────────────────
+  // At each step i → i+1:
+  //   1. Project tangents3D[i+1] onto the tangent plane at point i
+  //      (this removes the normal-curvature component – "stretching it out")
+  //   2. Measure the signed angle dθ between t_prev and the projected vector
+  //      (this IS the discrete geodesic curvature contribution – "kept as-is")
+  //   3. Accumulate θ and emit the 2D tangent (cos θ, sin θ)
   const tangents2D: THREE.Vector2[] = [];
-  let theta = 0;  // initial angle (strip starts pointing in +x direction)
-  tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
+  const kappaG: number[] = new Array(n).fill(0);
+  let theta = 0;
+  tangents2D.push(new THREE.Vector2(1, 0));
 
   for (let i = 1; i < n; i++) {
-    const ds = arcLengths[i] - arcLengths[i - 1];
-    const kAvg = (kappaG[i - 1] + kappaG[i]) / 2;
-    const dTheta = kAvg * ds;
-    const nextTheta = theta + dTheta;
-    // Freeze accumulation once the strip would exceed the bending limit
-    theta = Math.abs(nextTheta) <= MAX_TOTAL_THETA
-      ? nextTheta
-      : Math.sign(nextTheta) * MAX_TOTAL_THETA;
+    const n_i  = surfNormals[i - 1];          // surface normal at previous point
+    const tPrv = tangents3D[i - 1];           // tangent at previous point
+    const tNxt = tangents3D[i].clone();       // tangent at current point
+
+    // Project tNxt onto the tangent plane at i-1 (removes κ_n contribution)
+    const proj = tNxt.addScaledVector(n_i, -tNxt.dot(n_i));
+    if (proj.lengthSq() < 1e-20) {
+      tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
+      continue;
+    }
+    proj.normalize();
+
+    // Signed angle in the tangent plane (n_i as the rotation axis)
+    const cross = new THREE.Vector3().crossVectors(tPrv, proj);
+    const dTheta = Math.atan2(cross.dot(n_i), tPrv.dot(proj));
+
+    theta += dTheta;
     tangents2D.push(new THREE.Vector2(Math.cos(theta), Math.sin(theta)));
+
+    // Store approximate κ_g for downstream compat (ds > 0 guaranteed by arcLengths check)
+    const ds = arcLengths[i] - arcLengths[i - 1];
+    kappaG[i] = ds > 1e-12 ? dTheta / ds : 0;
   }
+  kappaG[0] = kappaG[1] ?? 0;
 
   return { arcLengths, kappaG, tangents2D };
 }
