@@ -75,7 +75,7 @@ export function buildKagomePattern(
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]],
   _numStripes:      number,
   holeRadius:       number,
-  widthMethod:      'A' | 'B' = 'A',
+  widthMethod:      'A' | 'B' = 'B',
   widthRatio:       number    = 0.75,
   stripWidthWorld:  number    = 0,    // world units; used when widthMethod='B'
 ): KagomePattern {
