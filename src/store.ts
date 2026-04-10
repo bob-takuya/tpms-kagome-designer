@@ -88,7 +88,7 @@ const defaultState: AppState = {
     numIsolines:  8,
     stripWidthMm: 10,   // 10 mm default
     widthRatio:   0.75, // method A: 75% of inter-isoline spacing
-    method:       'A' as 'A' | 'B',
+    method:       'B' as 'A' | 'B',
   },
   kagome: {
     holeRadiusMm: 2,    // 2 mm default
