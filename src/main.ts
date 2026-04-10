@@ -1,8 +1,9 @@
 import './style.css';
 import { store } from './store';
 import { createSidebar, downloadFile } from './ui/sidebar';
-import { createViewport3D, regenerateMesh, regeneratePattern, updateColors } from './ui/viewport3d';
+import { createViewport3D, regenerateMesh, regeneratePattern, updateColors, highlightStrip } from './ui/viewport3d';
 import { createViewport2D, regenerateUnfold, getUnfoldedStrips } from './ui/viewport2d';
+import { showStripDetail, hideStripDetail } from './ui/stripDetail';
 import { createStatusBar } from './ui/statusbar';
 import { generateDXF, generateJunctionCSV } from './export/dxf';
 import { generateSVG } from './export/svg';
@@ -88,6 +89,33 @@ window.addEventListener('update-colors', () => {
   updateColors(ctx3D);
 });
 
+// ─── Strip click → show 2D unfold overlay ──────────────────────────────────
+
+window.addEventListener('strip-selected', ((e: CustomEvent<{ stripId: string }>) => {
+  const { stripId } = e.detail;
+  if (!ctx3D.kagomePattern || !ctx3D.halfEdgeMesh) return;
+
+  const strip = ctx3D.kagomePattern.strips.find(s => s.id === stripId);
+  if (!strip) return;
+
+  showStripDetail(
+    viewport3DContainer as HTMLElement,
+    strip,
+    ctx3D.halfEdgeMesh,
+    ctx3D.kagomePattern.junctions,
+  );
+}) as EventListener);
+
+window.addEventListener('strip-deselected', () => {
+  hideStripDetail();
+  highlightStrip(ctx3D, null);
+});
+
+// Hide overlay when pattern is regenerated
+window.addEventListener('regenerate-mesh', () => {
+  hideStripDetail();
+});
+
 window.addEventListener('export-dxf', () => {
   const strips = getUnfoldedStrips(ctx2D);
   if (strips.length === 0) {
@@ -145,5 +173,7 @@ declare global {
     'export-dxf': CustomEvent;
     'export-svg': CustomEvent;
     'export-csv': CustomEvent;
+    'strip-selected': CustomEvent<{ stripId: string }>;
+    'strip-deselected': CustomEvent;
   }
 }
