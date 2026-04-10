@@ -133,7 +133,31 @@ function buildRHS(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 4 – Real-valued CG solver   L · f = b,  with f[0] = 0 (Dirichlet pin)
+// Find connected components of the mesh graph; return one representative vertex
+// per component.  These are used as Dirichlet pins in the CG solve so that the
+// solution is well-defined even on multi-component meshes (e.g. Schwarz-D).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function findComponentPins(L: CotanL): number[] {
+  const visited = new Uint8Array(L.n);
+  const pins: number[] = [];
+  for (let start = 0; start < L.n; start++) {
+    if (visited[start]) continue;
+    pins.push(start);                        // one pin per component
+    const stack = [start];
+    while (stack.length) {
+      const v = stack.pop()!;
+      if (visited[v]) continue;
+      visited[v] = 1;
+      for (const { j } of L.adj[v]) if (!visited[j]) stack.push(j);
+    }
+  }
+  return pins;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 4 – Real-valued CG solver   L · f = b,  with one Dirichlet pin per
+// connected component (f[pin] = 0).  Handles multi-sheet surfaces like Schwarz-D.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function solveCG(
@@ -145,19 +169,25 @@ function solveCG(
   const n = L.n;
   const f = new Float64Array(n);   // initial x = 0
 
-  // Modified b: pin vertex 0
-  const bm = b.slice() as Float64Array;
-  bm[0] = 0;
+  // Pin one vertex per connected component at f = 0
+  const pins = new Set(findComponentPins(L));
 
-  // A·x  (Laplacian with Dirichlet at vertex 0)
+  // Modified b: zero out pinned rows
+  const bm = b.slice() as Float64Array;
+  for (const p of pins) bm[p] = 0;
+
+  // A·x  (Laplacian with Dirichlet at all pinned vertices)
   function matvec(x: Float64Array): Float64Array {
     const y = new Float64Array(n);
-    y[0] = x[0]; // pinned row: A[0,0] = 1, rest 0
-    for (let i = 1; i < n; i++) {
+    for (let i = 0; i < n; i++) {
+      if (pins.has(i)) {
+        y[i] = x[i];  // pinned row: identity
+        continue;
+      }
       y[i] = L.diag[i] * x[i];
       for (const { j, w } of L.adj[i]) {
-        if (j !== 0) y[i] -= w * x[j];
-        // skip j==0 column (Dirichlet)
+        if (!pins.has(j)) y[i] -= w * x[j];
+        // skip pinned columns (Dirichlet)
       }
     }
     return y;
@@ -207,13 +237,13 @@ export function traceIsolines(
   f: Float64Array,
   numIsolines: number,
 ): Isoline[] {
-  // Determine the min/max of f across all vertices
-  let fMin = f[0];
-  let fMax = f[0];
-  for (let i = 1; i < f.length; i++) {
-    if (f[i] < fMin) fMin = f[i];
-    if (f[i] > fMax) fMax = f[i];
-  }
+  // Use percentile-based range (p2–p98) instead of absolute min/max.
+  // This prevents extreme outlier values (e.g. from near-degenerate triangles in
+  // the Schwarz-D surface) from pushing all isoline levels into an empty region.
+  const sorted = Array.from(f).sort((a, b) => a - b);
+  const n = sorted.length;
+  const fMin = sorted[Math.max(0,          Math.floor(0.02 * n))];
+  const fMax = sorted[Math.min(n - 1,      Math.floor(0.98 * n))];
   if (fMax - fMin < 1e-10) return [];
 
   const isolines: Isoline[] = [];

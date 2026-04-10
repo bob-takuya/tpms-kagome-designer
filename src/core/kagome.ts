@@ -115,9 +115,29 @@ export function buildKagomePattern(
       const longestChain = chains.length > 0 ? chains[0].points.length : 0;
       let acceptedChains = 0;
 
+      // Minimum arc length threshold: ~10% of the longest chain's arc length,
+      // but at least 0.1 world units.  Removes:
+      //   (a) 2-point isolated segments that failed to stitch (zero arc)
+      //   (b) tiny closed loops smaller than one junction hole
+      //   (c) boundary fragments too short to weave physically
+      let longestArc = 0;
+      for (const ch of chains) {
+        let a = 0;
+        for (let i = 1; i < ch.points.length; i++) a += ch.points[i].distanceTo(ch.points[i - 1]);
+        if (a > longestArc) longestArc = a;
+      }
+      const minArc = Math.max(0.1, longestArc * 0.10);
+
       for (let ci = 0; ci < chains.length; ci++) {
         const chain = chains[ci];
-        if (chain.points.length < 2) continue;
+        // Always skip single-point or no-point chains
+        if (chain.points.length < 4) continue;
+        // Skip chains shorter than minimum arc threshold
+        let chainArc = 0;
+        for (let i = 1; i < chain.points.length; i++) {
+          chainArc += chain.points[i].distanceTo(chain.points[i - 1]);
+        }
+        if (chainArc < minArc) continue;
 
         const smoothed   = smoothPolyline(chain.points, 4);
         const centerline = smoothed.map(p => projectToSurface(p));
@@ -365,14 +385,56 @@ export function buildKagomePattern(
     strip.segments = segmentAtJunctions(strip);
   }
 
-  // ── 8. Log junction coverage (do not prune – isolated strips still useful for 2D unfold)
-  const withJunc = allStrips.filter(s => s.junctions.length > 0).length;
+  // ── 8. Prune isolated short strips (no junctions + too short to be physically meaningful)
+  //
+  // Isolated strips (0 junctions) contribute nothing to the Kagome weave pattern.
+  // Short ones are either boundary fragments or tiny closed loops from the domain edge.
+  // Keep isolated strips only if they are long enough to be potentially useful (e.g. unfold export).
+  //
+  // Threshold: 20% of the average non-isolated strip arc length (minimum 0.3 world units).
+  // Junction-connected strips are ALWAYS kept regardless of length.
+  const connectedArcs = allStrips
+    .filter(s => s.junctions.length > 0)
+    .map(s => {
+      let arc = 0;
+      for (let i = 1; i < s.centerline.length; i++) arc += s.centerline[i].distanceTo(s.centerline[i - 1]);
+      return arc;
+    });
+  const avgConnectedArc = connectedArcs.length > 0
+    ? connectedArcs.reduce((a, b) => a + b, 0) / connectedArcs.length
+    : 1.0;
+  // Isolated strips (no junctions) need a higher bar: at least 1.0 world units
+  // (= 50 mm at the default 50 mm/unit scale), or 25% of the average connected strip.
+  const minIsolatedArc = Math.max(1.0, avgConnectedArc * 0.25);
+
+  const pruned: Strip[] = [];
+  const finalStrips: Strip[] = [];
+  for (const s of allStrips) {
+    if (s.junctions.length > 0) {
+      finalStrips.push(s);
+      continue;
+    }
+    let arc = 0;
+    for (let i = 1; i < s.centerline.length; i++) arc += s.centerline[i].distanceTo(s.centerline[i - 1]);
+    if (arc >= minIsolatedArc) {
+      finalStrips.push(s);
+    } else {
+      pruned.push(s);
+    }
+  }
+
+  // Rebuild families from finalStrips
+  for (let k = 0; k < 3; k++) families[k] = families[k].filter(s => finalStrips.includes(s));
+
+  const withJunc = finalStrips.filter(s => s.junctions.length > 0).length;
   console.log(
     `[Kagome] junctions=${junctions.length}  ` +
-    `strips: total=${allStrips.length}  with-junctions=${withJunc}  isolated=${allStrips.length - withJunc}`,
+    `strips: total=${finalStrips.length}  with-junctions=${withJunc}  ` +
+    `isolated=${finalStrips.length - withJunc}  pruned=${pruned.length}` +
+    (pruned.length > 0 ? ` (${pruned.map(s => s.id).join(',')})` : ''),
   );
 
-  return { strips: allStrips, junctions, families };
+  return { strips: finalStrips, junctions, families };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
