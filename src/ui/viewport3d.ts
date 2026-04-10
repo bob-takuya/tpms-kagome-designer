@@ -81,6 +81,9 @@ export function createViewport3D(container: HTMLElement): Viewport3DContext {
 
   regenerateMesh(ctx);
 
+  // ── Click → raycast strip selection ─────────────────────────────────────
+  setupStripClick(ctx, renderer.domElement, camera);
+
   function animate() {
     requestAnimationFrame(animate);
     controls.update();
@@ -337,4 +340,69 @@ function createGeometry(meshData: MeshData): THREE.BufferGeometry {
 export function updateColors(ctx: Viewport3DContext): void {
   // Full regeneration is the safest approach given the interleaved layers
   regeneratePattern(ctx);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Strip click detection (raycast) + highlight
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Distinguish click from orbit-drag: record mousedown position, and only
+ * treat mouseup as a click if the cursor moved less than 4 px.
+ */
+function setupStripClick(
+  ctx: Viewport3DContext,
+  domElement: HTMLCanvasElement,
+  camera: THREE.PerspectiveCamera,
+): void {
+  const raycaster = new THREE.Raycaster();
+  const mouse     = new THREE.Vector2();
+  const downPos   = new THREE.Vector2();
+
+  domElement.addEventListener('mousedown', (e) => {
+    downPos.set(e.clientX, e.clientY);
+  });
+
+  domElement.addEventListener('mouseup', (e) => {
+    const dx = e.clientX - downPos.x;
+    const dy = e.clientY - downPos.y;
+    if (dx * dx + dy * dy > 16) return; // drag → ignore
+
+    const rect = domElement.getBoundingClientRect();
+    mouse.x =  ((e.clientX - rect.left) / rect.width)  * 2 - 1;
+    mouse.y = -((e.clientY - rect.top)  / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    // Only test strip ribbon meshes (they carry userData.stripId)
+    const targets = ctx.stripMeshes.children.filter(
+      (c): c is THREE.Mesh => c instanceof THREE.Mesh && !!c.userData.stripId,
+    );
+    const hits = raycaster.intersectObjects(targets, false);
+
+    if (hits.length > 0) {
+      const stripId = hits[0].object.userData.stripId as string;
+      highlightStrip(ctx, stripId);
+      window.dispatchEvent(new CustomEvent('strip-selected', { detail: { stripId } }));
+    } else {
+      highlightStrip(ctx, null);
+      window.dispatchEvent(new CustomEvent('strip-deselected'));
+    }
+  });
+}
+
+/**
+ * Dim all strips except the selected one.  Pass `null` to reset.
+ */
+export function highlightStrip(ctx: Viewport3DContext, stripId: string | null): void {
+  for (const child of ctx.stripMeshes.children) {
+    if (!(child instanceof THREE.Mesh) || !child.userData.stripId) continue;
+    const mat = child.material as THREE.MeshBasicMaterial;
+    if (stripId === null) {
+      // Reset all to full opacity
+      mat.opacity = 1.0;
+    } else {
+      mat.opacity = child.userData.stripId === stripId ? 1.0 : 0.12;
+    }
+  }
 }
