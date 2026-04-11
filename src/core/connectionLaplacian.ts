@@ -433,8 +433,8 @@ function computeVertexAreas(mesh: HalfEdgeMesh): Float64Array {
 function inversePowerIteration(
   L: ComplexCotanL,
   M: Float64Array,
-  outerIter = 20,
-  cgIter = 600,
+  outerIter = 8,
+  cgIter = 300,
 ): { re: Float64Array; im: Float64Array } {
   const n = L.n;
   const SIGMA = 1e-4;
