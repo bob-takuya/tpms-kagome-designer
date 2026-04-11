@@ -102,21 +102,28 @@ function buildCotanL(mesh: HalfEdgeMesh): CotanL {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Right-hand side for family k  (guided Poisson solve)
+//
+// Supports two modes:
+//   (a) Fixed angle φ in every local frame (original comb-frame approach)
+//   (b) Per-vertex direction angles from the Connection Laplacian eigenvector
+//       (globally smooth direction field)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildRHS(
   mesh: HalfEdgeMesh,
   frames: VertexFrames,
   L: CotanL,
-  phi: number,
+  directionAngles: Float64Array | number, // per-vertex angle OR uniform angle
   density: number,
 ): Float64Array {
   const n = mesh.vertices.length;
   const b = new Float64Array(n);
+  const uniform = typeof directionAngles === 'number';
 
   for (let vi = 0; vi < n; vi++) {
-    const d = frames.t1[vi].clone().multiplyScalar(Math.cos(phi))
-      .addScaledVector(frames.t2[vi], Math.sin(phi));
+    const angle = uniform ? directionAngles : directionAngles[vi];
+    const d = frames.t1[vi].clone().multiplyScalar(Math.cos(angle))
+      .addScaledVector(frames.t2[vi], Math.sin(angle));
 
     for (const { j: vj, w } of L.adj[vi]) {
       const edge = new THREE.Vector3().subVectors(mesh.vertices[vj], mesh.vertices[vi]);
@@ -264,6 +271,10 @@ export function traceIsolines(
 // Public entry point – stripe field via guided Poisson solve
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Compute a stripe field for one family (backward-compatible API).
+ * Uses the comb-frame approach with a fixed angle φ in every local frame.
+ */
 export function computeStripeField(
   mesh: HalfEdgeMesh,
   phi: number,
@@ -276,16 +287,86 @@ export function computeStripeField(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Connection Laplacian singularity detection (for future branching support)
+// Connection Laplacian eigenvector-guided stripe generation
 //
-// The pure eigenproblem L_∇·ψ = λ·M·ψ gives ONE globally optimal direction
-// field.  Adding φ_k to the connection is a gauge transform and does NOT
-// differentiate the 3 kagome families.  Therefore:
-//   - Stripe generation uses the guided Poisson solve (above)
-//   - The connection Laplacian is used ONLY for singularity detection
+// 1. Solve the Connection Laplacian eigenproblem to find the smoothest
+//    1-direction field on the surface (globally optimal, handles topology).
+// 2. Use the eigenvector's phase θ_i as the base direction at each vertex.
+// 3. For each kagome family k = 0,1,2: rotate by k·60° → Poisson RHS.
+// 4. Solve 3 Poisson problems with these improved per-vertex directions.
 //
-// Future work: n-RoSy fields (n=6) or guided complex optimization could
-// replace the Poisson solve while properly handling 3-family separation.
+// Advantage over the comb-frame approach: the direction field is globally
+// smooth (no frame discontinuities), and singularities are detected via |ψ|.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface GuidedStripeResult {
+  fields:        [Float64Array, Float64Array, Float64Array];
+  amplitude:     Float64Array;
+  singularities: number[];
+}
+
+/**
+ * Compute all 3 kagome stripe fields using the Connection Laplacian
+ * eigenvector for globally smooth direction guidance.
+ */
+export function computeGuidedStripeFields(
+  mesh: HalfEdgeMesh,
+  density = 4.0,
+): GuidedStripeResult {
+  const frames = buildVertexFrames(mesh);
+  const areas  = computeVertexAreas(mesh);
+  const realL  = buildCotanL(mesh);
+
+  // Step 1: Connection Laplacian eigenvector → optimal direction field
+  console.time('[Stripe] connection eigenvector');
+  const cplxL = buildComplexCotanL(mesh, frames);
+  const { re, im } = inversePowerIteration(cplxL, areas);
+  console.timeEnd('[Stripe] connection eigenvector');
+
+  // Extract per-vertex phase (direction) and amplitude
+  const n = mesh.vertices.length;
+  const eigenDir  = new Float64Array(n);
+  const amplitude = new Float64Array(n);
+  let maxAmp = 0;
+  for (let i = 0; i < n; i++) {
+    eigenDir[i]  = Math.atan2(im[i], re[i]);
+    amplitude[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
+    if (amplitude[i] > maxAmp) maxAmp = amplitude[i];
+  }
+
+  // Detect singularities
+  const ampThresh = 0.01 * maxAmp;
+  const singularities: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (amplitude[i] < ampThresh) singularities.push(i);
+  }
+  console.log(
+    `[Stripe] eigenvector: ${singularities.length} singularities ` +
+    `(${(100 * singularities.length / n).toFixed(1)}%)`,
+  );
+
+  // Step 2: For each family k, build Poisson RHS using eigenvector direction + k·60°
+  const fields: [Float64Array, Float64Array, Float64Array] = [
+    new Float64Array(0), new Float64Array(0), new Float64Array(0),
+  ];
+
+  for (let k = 0; k < 3; k++) {
+    const dirAngles = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      dirAngles[i] = eigenDir[i] + k * Math.PI / 3;
+    }
+
+    console.time(`[Stripe] Poisson family ${k}`);
+    const b = buildRHS(mesh, frames, realL, dirAngles, density);
+    fields[k] = solveCG(realL, b, 800, 1e-6);
+    console.timeEnd(`[Stripe] Poisson family ${k}`);
+  }
+
+  return { fields, amplitude, singularities };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connection Laplacian internals
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ComplexNeighbor {
@@ -344,15 +425,19 @@ function computeVertexAreas(mesh: HalfEdgeMesh): Float64Array {
   return areas;
 }
 
-/** Detect singularities via Connection Laplacian smallest eigenvector */
-export function detectSingularities(mesh: HalfEdgeMesh): StripeFieldResult {
-  const frames = buildVertexFrames(mesh);
-  const L = buildComplexCotanL(mesh, frames);
-  const M = computeVertexAreas(mesh);
+// ─────────────────────────────────────────────────────────────────────────────
+// Inverse power iteration for the smallest eigenvector of the
+// complex connection Laplacian  (L + σM)ψ = Mψ_old
+// ─────────────────────────────────────────────────────────────────────────────
+
+function inversePowerIteration(
+  L: ComplexCotanL,
+  M: Float64Array,
+  outerIter = 20,
+  cgIter = 600,
+): { re: Float64Array; im: Float64Array } {
   const n = L.n;
   const SIGMA = 1e-4;
-  const OUTER = 20;
-  const CG_ITER = 600;
 
   let psiRe: Float64Array = new Float64Array(n);
   let psiIm: Float64Array = new Float64Array(n);
@@ -363,7 +448,7 @@ export function detectSingularities(mesh: HalfEdgeMesh): StripeFieldResult {
   }
   normC(psiRe, psiIm, M);
 
-  for (let iter = 0; iter < OUTER; iter++) {
+  for (let iter = 0; iter < outerIter; iter++) {
     const bRe = new Float64Array(n);
     const bIm = new Float64Array(n);
     for (let i = 0; i < n; i++) { bRe[i] = M[i] * psiRe[i]; bIm[i] = M[i] * psiIm[i]; }
@@ -376,13 +461,13 @@ export function detectSingularities(mesh: HalfEdgeMesh): StripeFieldResult {
     let pIm = Float64Array.from(rIm);
     let rr = d2(rRe, rIm, rRe, rIm);
 
-    for (let cg = 0; cg < CG_ITER; cg++) {
+    for (let cg = 0; cg < cgIter; cg++) {
       const ApRe = new Float64Array(n);
       const ApIm = new Float64Array(n);
       for (let i = 0; i < n; i++) {
-        const d = L.diag[i] + SIGMA * M[i];
-        ApRe[i] = d * pRe[i];
-        ApIm[i] = d * pIm[i];
+        const dd = L.diag[i] + SIGMA * M[i];
+        ApRe[i] = dd * pRe[i];
+        ApIm[i] = dd * pIm[i];
         for (const { j, w, cosR, sinR } of L.adj[i]) {
           ApRe[i] -= w * (cosR * pRe[j] - sinR * pIm[j]);
           ApIm[i] -= w * (sinR * pRe[j] + cosR * pIm[j]);
@@ -405,12 +490,23 @@ export function detectSingularities(mesh: HalfEdgeMesh): StripeFieldResult {
     psiRe = xRe; psiIm = xIm;
   }
 
+  return { re: psiRe, im: psiIm };
+}
+
+/** Detect singularities via Connection Laplacian smallest eigenvector */
+export function detectSingularities(mesh: HalfEdgeMesh): StripeFieldResult {
+  const frames = buildVertexFrames(mesh);
+  const L = buildComplexCotanL(mesh, frames);
+  const M = computeVertexAreas(mesh);
+  const { re, im } = inversePowerIteration(L, M);
+
+  const n = L.n;
   const phase = new Float64Array(n);
   const amplitude = new Float64Array(n);
   let maxAmp = 0;
   for (let i = 0; i < n; i++) {
-    phase[i] = Math.atan2(psiIm[i], psiRe[i]);
-    amplitude[i] = Math.sqrt(psiRe[i] * psiRe[i] + psiIm[i] * psiIm[i]);
+    phase[i] = Math.atan2(im[i], re[i]);
+    amplitude[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
     if (amplitude[i] > maxAmp) maxAmp = amplitude[i];
   }
   const thresh = 0.01 * maxAmp;
