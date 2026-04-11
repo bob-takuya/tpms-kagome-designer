@@ -140,7 +140,8 @@ export function buildKagomePattern(
         if (chainArc < minArc) continue;
 
         const smoothed   = smoothPolyline(chain.points, 4);
-        const centerline = smoothed.map(p => projectToSurface(p));
+        const projected  = smoothed.map(p => projectToSurface(p));
+        const centerline = adaptiveSubdivide(projected, projectToSurface);
         if (centerline.length < 2) continue;
 
         const chainSuffix = chains.length > 1 ? `_${ci + 1}` : '';
@@ -433,6 +434,9 @@ export function buildKagomePattern(
     `isolated=${finalStrips.length - withJunc}  pruned=${pruned.length}` +
     (pruned.length > 0 ? ` (${pruned.map(s => s.id).join(',')})` : ''),
   );
+
+  // ── Curvature continuity report ──────────────────────────────────────────
+  logCurvatureReport(finalStrips);
 
   return { strips: finalStrips, junctions, families };
 }
@@ -786,4 +790,136 @@ export function generateJunctionHoles(
     centers: junctions.map(j => j.position.clone()),
     radii: junctions.map(() => radius),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adaptive subdivision – insert midpoints where turning angle exceeds threshold
+//
+// On a TPMS with grid=50, edge length ≈ 2π/50 ≈ 0.126.
+// Max geodesic curvature at saddle ≈ √2 → expected dθ/step ≈ 10°.
+// Angles > 15° indicate discretization artifacts; we subdivide there.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_ANGLE_DEG = 15;
+const MAX_SUBDIV_ITER = 3;
+
+function adaptiveSubdivide(
+  pts: THREE.Vector3[],
+  projectFn: (p: THREE.Vector3) => THREE.Vector3,
+): THREE.Vector3[] {
+  const maxAngleRad = MAX_ANGLE_DEG * Math.PI / 180;
+  let current = pts;
+
+  for (let iter = 0; iter < MAX_SUBDIV_ITER; iter++) {
+    let needsSubdiv = false;
+    const next: THREE.Vector3[] = [current[0]];
+
+    for (let i = 1; i < current.length - 1; i++) {
+      const v0 = current[i - 1], v1 = current[i], v2 = current[i + 1];
+      const d1 = new THREE.Vector3().subVectors(v1, v0);
+      const d2 = new THREE.Vector3().subVectors(v2, v1);
+      const len1 = d1.length(), len2 = d2.length();
+
+      if (len1 < 1e-10 || len2 < 1e-10) {
+        next.push(v1);
+        continue;
+      }
+
+      d1.divideScalar(len1);
+      d2.divideScalar(len2);
+      const cosA = Math.max(-1, Math.min(1, d1.dot(d2)));
+      const angle = Math.acos(cosA);
+
+      if (angle > maxAngleRad) {
+        // Insert midpoint before v1 (between v0 and v1)
+        const mid1 = new THREE.Vector3().addVectors(v0, v1).multiplyScalar(0.5);
+        next.push(projectFn(mid1));
+        next.push(v1);
+        // Insert midpoint after v1 (between v1 and v2)
+        const mid2 = new THREE.Vector3().addVectors(v1, v2).multiplyScalar(0.5);
+        next.push(projectFn(mid2));
+        needsSubdiv = true;
+      } else {
+        next.push(v1);
+      }
+    }
+
+    next.push(current[current.length - 1]);
+    current = next;
+
+    if (!needsSubdiv) break;
+
+    // Re-smooth the subdivided polyline (lightweight – 2 iterations)
+    current = smoothPolyline(current, 2);
+    current = current.map(p => projectFn(p));
+  }
+
+  return current;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Curvature continuity diagnostics – logs angle statistics per strip
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface AngleStats {
+  stripId: string;
+  numPts: number;
+  maxAngleDeg: number;
+  meanAngleDeg: number;
+  p95AngleDeg: number;
+  sharpCount: number;   // points with angle > MAX_ANGLE_DEG
+}
+
+function computeAngleStats(stripId: string, pts: THREE.Vector3[]): AngleStats {
+  const angles: number[] = [];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d1 = new THREE.Vector3().subVectors(pts[i], pts[i - 1]);
+    const d2 = new THREE.Vector3().subVectors(pts[i + 1], pts[i]);
+    const len1 = d1.length(), len2 = d2.length();
+    if (len1 < 1e-10 || len2 < 1e-10) continue;
+    d1.divideScalar(len1);
+    d2.divideScalar(len2);
+    const cosA = Math.max(-1, Math.min(1, d1.dot(d2)));
+    angles.push(Math.acos(cosA) * 180 / Math.PI);
+  }
+
+  if (angles.length === 0) {
+    return { stripId, numPts: pts.length, maxAngleDeg: 0, meanAngleDeg: 0, p95AngleDeg: 0, sharpCount: 0 };
+  }
+
+  angles.sort((a, b) => a - b);
+  const mean = angles.reduce((s, a) => s + a, 0) / angles.length;
+  const p95  = angles[Math.min(angles.length - 1, Math.floor(0.95 * angles.length))];
+  const maxA = angles[angles.length - 1];
+  const sharp = angles.filter(a => a > MAX_ANGLE_DEG).length;
+
+  return { stripId, numPts: pts.length, maxAngleDeg: maxA, meanAngleDeg: mean, p95AngleDeg: p95, sharpCount: sharp };
+}
+
+export function logCurvatureReport(strips: Strip[]): void {
+  const stats = strips.map(s => computeAngleStats(s.id, s.centerline));
+  const hasSharp = stats.filter(s => s.sharpCount > 0);
+
+  console.group(`[Curvature] ${strips.length} strips — threshold ${MAX_ANGLE_DEG}°`);
+  console.log(`All smooth: ${stats.length - hasSharp.length}/${stats.length}`);
+
+  if (hasSharp.length > 0) {
+    console.warn(`${hasSharp.length} strip(s) still have sharp angles:`);
+    if (typeof console.table === 'function') {
+      console.table(hasSharp.map(s => ({
+        id: s.stripId,
+        pts: s.numPts,
+        maxAngle: s.maxAngleDeg.toFixed(1) + '°',
+        p95: s.p95AngleDeg.toFixed(1) + '°',
+        mean: s.meanAngleDeg.toFixed(1) + '°',
+        sharpPts: s.sharpCount,
+      })));
+    }
+  }
+
+  // Global summary
+  const allMax = Math.max(...stats.map(s => s.maxAngleDeg));
+  const allMean = stats.reduce((s, st) => s + st.meanAngleDeg, 0) / stats.length;
+  console.log(`Global: max=${allMax.toFixed(1)}°  mean=${allMean.toFixed(1)}°`);
+  console.groupEnd();
 }
