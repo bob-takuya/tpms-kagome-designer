@@ -6,7 +6,7 @@ import { marchingCubes } from '../core/marchingCubes';
 import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
-import { computeStripeFieldFull, traceIsolines } from '../core/connectionLaplacian';
+import { computeStripeField, traceIsolines } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
 import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
@@ -166,22 +166,18 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // Clear previous overlays
   clearGroup(ctx.stripMeshes);
 
-  // ── Stage 2 – Stripe fields via Connection Laplacian eigenvector ────────
-  const phis = [0, Math.PI / 3, (2 * Math.PI) / 3];
-  const fieldResults = phis.map(phi => computeStripeFieldFull(mesh, phi));
-
+  // ── Stage 2 – Stripe fields via guided Poisson solve + isoline tracing ──
+  const STRIP_DENSITY = 4.0;
   const stripeFields: [Float64Array, Float64Array, Float64Array] = [
-    fieldResults[0].phase,
-    fieldResults[1].phase,
-    fieldResults[2].phase,
+    computeStripeField(mesh, 0,                   STRIP_DENSITY),
+    computeStripeField(mesh, Math.PI / 3,         STRIP_DENSITY),
+    computeStripeField(mesh, (2 * Math.PI) / 3,   STRIP_DENSITY),
   ];
   ctx.stripeFields = stripeFields;
 
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
   for (let k = 0; k < 3; k++) {
-    isolinesByFamily[k] = traceIsolines(
-      mesh, fieldResults[k].phase, state.strip.numIsolines, fieldResults[k].amplitude,
-    );
+    isolinesByFamily[k] = traceIsolines(mesh, stripeFields[k], state.strip.numIsolines);
   }
   ctx.isolinesByFamily = isolinesByFamily;
 
