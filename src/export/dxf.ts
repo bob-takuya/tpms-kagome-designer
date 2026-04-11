@@ -7,11 +7,12 @@
  *   SCORE                   → fold / centerlines                 (laser: score / engrave)
  *   LABEL                   → text annotations                   (laser: skip or light mark)
  *
- * Each strip outline is a single closed LWPOLYLINE on its CUT_* layer.
- * OpenNest can select all closed curves from CUT layers for nesting.
+ * Each strip is a DXF BLOCK (outline + holes + fold + label).
+ * OpenNest can move block instances as a unit so internal features
+ * travel with the outline during nesting.
  *
- * Format: R12-compatible core (POLYLINE+VERTEX+SEQEND) with AC1012 header
- * for maximum Rhino / ODA compatibility.
+ * Format: AC1009 (R12) – no entity handles, no BLOCK_RECORD, no subclass
+ * markers.  Uses POLYLINE+VERTEX+SEQEND for closed outlines.
  * All coordinates are in millimeters.
  */
 
@@ -65,44 +66,27 @@ export function generateDXF(
   writeStyleTable(L);
   w(L, 0, 'ENDSEC');
 
-  // ── ENTITIES (flat – no BLOCKs) ───────────────────────────────────────────
+  // ── BLOCKS (one per strip) ────────────────────────────────────────────────
+  w(L, 0, 'SECTION');
+  w(L, 2, 'BLOCKS');
+
+  for (const strip of strips) {
+    writeStripBlock(L, strip, includeHoleIds, includeFoldLines);
+  }
+
+  w(L, 0, 'ENDSEC');
+
+  // ── ENTITIES (one INSERT per strip) ───────────────────────────────────────
   w(L, 0, 'SECTION');
   w(L, 2, 'ENTITIES');
 
   for (const strip of strips) {
-    const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
-
-    for (const seg of strip.segments) {
-      // ── Closed outline (single closed polyline for OpenNest) ─────────────
-      if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
-        const outline = [
-          ...seg.leftBoundary,
-          ...seg.rightBoundary.slice().reverse(),
-        ];
-        addClosedPolyline(L, outline, cutLayer);
-      }
-
-      // ── Fold / score line ───────────────────────────────────────────────
-      if (includeFoldLines && seg.centerline.length > 1) {
-        addOpenPolyline(L, seg.centerline, 'SCORE');
-      }
-
-      // ── Junction holes ──────────────────────────────────────────────────
-      for (const hole of seg.holes) {
-        addCircle(L, hole.center, hole.radius, 'HOLE');
-
-        if (includeHoleIds) {
-          addText(L, hole.center, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
-        }
-      }
-    }
-
-    // ── Strip label ─────────────────────────────────────────────────────────
-    if (strip.segments.length > 0 && strip.segments[0].centerline.length > 0) {
-      const labelPos = strip.segments[0].centerline[0].clone();
-      labelPos.y += strip.segments[0].width * 0.5;
-      addText(L, labelPos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
-    }
+    w(L, 0, 'INSERT');
+    w(L, 8, '0');
+    w(L, 2, blockNameFor(strip));
+    w(L, 10, fmt(strip.boundingBox.minX));
+    w(L, 20, fmt(strip.boundingBox.minY));
+    w(L, 30, '0.0');
   }
 
   w(L, 0, 'ENDSEC');
@@ -127,6 +111,72 @@ export function generateJunctionCSV(strips: UnfoldedStrip[]): string {
     }
   }
   return rows.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Block writer
+// ─────────────────────────────────────────────────────────────────────────────
+
+function blockNameFor(strip: UnfoldedStrip): string {
+  return `S_${strip.stripId.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`;
+}
+
+function writeStripBlock(
+  L: string[],
+  strip: UnfoldedStrip,
+  includeHoleIds: boolean,
+  includeFoldLines: boolean,
+): void {
+  const name     = blockNameFor(strip);
+  const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
+  const ox       = strip.boundingBox.minX;
+  const oy       = strip.boundingBox.minY;
+
+  // R12 BLOCK – no handle, no flags beyond 70
+  w(L, 0, 'BLOCK');
+  w(L, 8, '0');
+  w(L, 2, name);
+  w(L, 70, '0');
+  w(L, 10, '0.0');  w(L, 20, '0.0');  w(L, 30, '0.0');
+
+  for (const seg of strip.segments) {
+    // Closed outline
+    if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
+      const outline = [
+        ...seg.leftBoundary,
+        ...seg.rightBoundary.slice().reverse(),
+      ].map(p => new THREE.Vector2(p.x - ox, p.y - oy));
+      addClosedPolyline(L, outline, cutLayer);
+    }
+
+    // Fold / score line
+    if (includeFoldLines && seg.centerline.length > 1) {
+      const cl = seg.centerline.map(p => new THREE.Vector2(p.x - ox, p.y - oy));
+      addOpenPolyline(L, cl, 'SCORE');
+    }
+
+    // Holes
+    for (const hole of seg.holes) {
+      const c = new THREE.Vector2(hole.center.x - ox, hole.center.y - oy);
+      addCircle(L, c, hole.radius, 'HOLE');
+      if (includeHoleIds) {
+        addText(L, c, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
+      }
+    }
+  }
+
+  // Strip label
+  if (strip.segments.length > 0 && strip.segments[0].centerline.length > 0) {
+    const pt = strip.segments[0].centerline[0];
+    const pos = new THREE.Vector2(
+      pt.x - ox,
+      pt.y - oy + strip.segments[0].width * 0.5,
+    );
+    addText(L, pos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
+  }
+
+  w(L, 0, 'ENDBLK');
+  w(L, 8, '0');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,7 +256,7 @@ function writeStyleTable(L: string[]): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entity writers (R12 POLYLINE + VERTEX + SEQEND for max compatibility)
+// Entity writers (R12 POLYLINE + VERTEX + SEQEND)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function addClosedPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
