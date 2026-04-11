@@ -12,8 +12,9 @@
  * After nesting, "Explode" the blocks to get flat geometry per layer for the
  * laser-cutter driver.
  *
- * Format: AutoCAD R2000 (AC1015) with all required symbol tables,
- * entity handles, and INSUNITS = mm.
+ * Format: AutoCAD R12 (AC1009) – maximum compatibility with all CAD readers.
+ * Uses POLYLINE+VERTEX+SEQEND (R12 closed polylines) instead of LWPOLYLINE.
+ * All coordinates are in millimeters.
  */
 
 import * as THREE from 'three';
@@ -40,15 +41,6 @@ export const DXF_LAYERS: Record<string, DXFLayer> = {
 const CUT_LAYERS = ['CUT_A', 'CUT_B', 'CUT_C'];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle counter (reset per export call)
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _handle = 0x100;
-function nextHandle(): string {
-  return (_handle++).toString(16).toUpperCase();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,74 +49,53 @@ export function generateDXF(
   includeHoleIds: boolean,
   includeFoldLines: boolean,
 ): string {
-  _handle = 0x100;
   const L: string[] = [];
 
-  // Pre-compute block names (needed by BLOCK_RECORD table)
-  const blockNames = strips.map(s => blockNameFor(s));
-
   // ── HEADER ────────────────────────────────────────────────────────────────
-  dxf(L, 0, 'SECTION');
-  dxf(L, 2, 'HEADER');
-  dxf(L, 9, '$ACADVER');  dxf(L, 1, 'AC1015');   // AutoCAD R2000
-  dxf(L, 9, '$INSUNITS'); dxf(L, 70, '4');        // 4 = millimeters
-  dxf(L, 9, '$HANDSEED'); dxf(L, 5, 'FFFF');
-  dxf(L, 0, 'ENDSEC');
+  w(L, 0, 'SECTION');
+  w(L, 2, 'HEADER');
+  w(L, 9, '$ACADVER');
+  w(L, 1, 'AC1009');
+  w(L, 9, '$INSBASE');
+  w(L, 10, '0'); w(L, 20, '0'); w(L, 30, '0');
+  w(L, 9, '$EXTMIN');
+  w(L, 10, '0'); w(L, 20, '0'); w(L, 30, '0');
+  w(L, 9, '$EXTMAX');
+  w(L, 10, '1000'); w(L, 20, '1000'); w(L, 30, '0');
+  w(L, 0, 'ENDSEC');
 
-  // ── TABLES (all 9 required R2000 symbol tables) ───────────────────────────
-  dxf(L, 0, 'SECTION');
-  dxf(L, 2, 'TABLES');
-  writeVportTable(L);
+  // ── TABLES ────────────────────────────────────────────────────────────────
+  w(L, 0, 'SECTION');
+  w(L, 2, 'TABLES');
   writeLtypeTable(L);
   writeLayerTable(L);
-  writeStyleTable(L);
-  writeViewTable(L);
-  writeUcsTable(L);
-  writeAppidTable(L);
-  writeDimstyleTable(L);
-  writeBlockRecordTable(L, blockNames);
-  dxf(L, 0, 'ENDSEC');
+  w(L, 0, 'ENDSEC');
 
   // ── BLOCKS ────────────────────────────────────────────────────────────────
-  dxf(L, 0, 'SECTION');
-  dxf(L, 2, 'BLOCKS');
+  w(L, 0, 'SECTION');
+  w(L, 2, 'BLOCKS');
 
-  // Required built-in blocks for R2000
-  writeBuiltinBlock(L, '*MODEL_SPACE');
-  writeBuiltinBlock(L, '*PAPER_SPACE');
-
-  // One block per strip (outline + holes + fold + label grouped together)
   for (const strip of strips) {
     writeStripBlock(L, strip, includeHoleIds, includeFoldLines);
   }
 
-  dxf(L, 0, 'ENDSEC');
+  w(L, 0, 'ENDSEC');
 
   // ── ENTITIES (one INSERT per strip block) ─────────────────────────────────
-  dxf(L, 0, 'SECTION');
-  dxf(L, 2, 'ENTITIES');
+  w(L, 0, 'SECTION');
+  w(L, 2, 'ENTITIES');
 
   for (const strip of strips) {
-    dxf(L, 0, 'INSERT');
-    dxf(L, 5, nextHandle());
-    dxf(L, 8, '0');
-    dxf(L, 2, blockNameFor(strip));
-    dxf(L, 10, fmt(strip.boundingBox.minX));
-    dxf(L, 20, fmt(strip.boundingBox.minY));
-    dxf(L, 30, '0');
+    w(L, 0, 'INSERT');
+    w(L, 8, '0');
+    w(L, 2, blockNameFor(strip));
+    w(L, 10, fmt(strip.boundingBox.minX));
+    w(L, 20, fmt(strip.boundingBox.minY));
+    w(L, 30, '0');
   }
 
-  dxf(L, 0, 'ENDSEC');
-
-  // ── OBJECTS (minimal – required by R2000) ─────────────────────────────────
-  dxf(L, 0, 'SECTION');
-  dxf(L, 2, 'OBJECTS');
-  dxf(L, 0, 'DICTIONARY');
-  dxf(L, 5, nextHandle());
-  dxf(L, 330, '0');
-  dxf(L, 0, 'ENDSEC');
-
-  dxf(L, 0, 'EOF');
+  w(L, 0, 'ENDSEC');
+  w(L, 0, 'EOF');
 
   return L.join('\n');
 }
@@ -155,18 +126,6 @@ function blockNameFor(strip: UnfoldedStrip): string {
   return `STRIP_${strip.stripId.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`;
 }
 
-function writeBuiltinBlock(L: string[], name: string): void {
-  dxf(L, 0, 'BLOCK');
-  dxf(L, 5, nextHandle());
-  dxf(L, 8, '0');
-  dxf(L, 2, name);
-  dxf(L, 70, '0');
-  dxf(L, 10, '0'); dxf(L, 20, '0'); dxf(L, 30, '0');
-  dxf(L, 0, 'ENDBLK');
-  dxf(L, 5, nextHandle());
-  dxf(L, 8, '0');
-}
-
 /**
  * Write one BLOCK containing all geometry for a single strip.
  *
@@ -186,17 +145,15 @@ function writeStripBlock(
   const oy       = strip.boundingBox.minY;
 
   // Block header
-  dxf(L, 0, 'BLOCK');
-  dxf(L, 5, nextHandle());
-  dxf(L, 8, '0');
-  dxf(L, 2, name);
-  dxf(L, 70, '0');
-  dxf(L, 10, '0'); dxf(L, 20, '0'); dxf(L, 30, '0');
+  w(L, 0, 'BLOCK');
+  w(L, 8, '0');
+  w(L, 2, name);
+  w(L, 70, '0');
+  w(L, 10, '0'); w(L, 20, '0'); w(L, 30, '0');
 
   for (const seg of strip.segments) {
-    // ── Closed outline (single LWPOLYLINE for OpenNest) ───────────────────
+    // ── Closed outline (single closed POLYLINE for OpenNest) ──────────────
     // Path: left[0] → left[N-1] → right[N-1] → right[0] → close
-    // The closed flag auto-connects right[0] back to left[0] (start cap).
     if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
       const outline = [
         ...seg.leftBoundary,
@@ -208,7 +165,7 @@ function writeStripBlock(
     // ── Fold / score line (centerline) ────────────────────────────────────
     if (includeFoldLines && seg.centerline.length > 1) {
       const cl = seg.centerline.map(p => new THREE.Vector2(p.x - ox, p.y - oy));
-      addPolyline(L, cl, 'SCORE');
+      addOpenPolyline(L, cl, 'SCORE');
     }
 
     // ── Junction holes ────────────────────────────────────────────────────
@@ -233,217 +190,108 @@ function writeStripBlock(
   }
 
   // Block footer
-  dxf(L, 0, 'ENDBLK');
-  dxf(L, 5, nextHandle());
-  dxf(L, 8, '0');
+  w(L, 0, 'ENDBLK');
+  w(L, 8, '0');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Symbol-table writers (all 9 tables required by AC1015 / R2000)
+// Table writers (R12 – only LTYPE and LAYER required)
 // ─────────────────────────────────────────────────────────────────────────────
-
-function writeVportTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'VPORT');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '1');
-  // Default viewport
-  dxf(L, 0, 'VPORT'); dxf(L, 5, nextHandle());
-  dxf(L, 2, '*ACTIVE');
-  dxf(L, 70, '0');
-  dxf(L, 10, '0'); dxf(L, 20, '0');       // lower-left corner
-  dxf(L, 11, '1'); dxf(L, 21, '1');       // upper-right corner
-  dxf(L, 12, '0'); dxf(L, 22, '0');       // center point
-  dxf(L, 13, '0'); dxf(L, 23, '0');       // snap base point
-  dxf(L, 14, '1'); dxf(L, 24, '1');       // snap spacing
-  dxf(L, 15, '0'); dxf(L, 25, '0');       // grid spacing
-  dxf(L, 16, '0'); dxf(L, 26, '0'); dxf(L, 36, '1');  // view direction
-  dxf(L, 17, '0'); dxf(L, 27, '0'); dxf(L, 37, '0');  // view target
-  dxf(L, 40, '1');    // view height
-  dxf(L, 41, '1');    // viewport aspect ratio
-  dxf(L, 42, '50');   // lens length
-  dxf(L, 43, '0');    // front clipping
-  dxf(L, 44, '0');    // back clipping
-  dxf(L, 50, '0');    // snap rotation angle
-  dxf(L, 51, '0');    // twist angle
-  dxf(L, 0, 'ENDTAB');
-}
 
 function writeLtypeTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'LTYPE');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '2');
+  w(L, 0, 'TABLE');
+  w(L, 2, 'LTYPE');
+  w(L, 70, '2');
 
   // CONTINUOUS
-  dxf(L, 0, 'LTYPE'); dxf(L, 5, nextHandle());
-  dxf(L, 2, 'CONTINUOUS'); dxf(L, 70, '0');
-  dxf(L, 3, 'Solid line');
-  dxf(L, 72, '65'); dxf(L, 73, '0'); dxf(L, 40, '0.0');
+  w(L, 0, 'LTYPE');
+  w(L, 2, 'CONTINUOUS');
+  w(L, 70, '0');
+  w(L, 3, 'Solid line');
+  w(L, 72, '65'); w(L, 73, '0'); w(L, 40, '0.0');
 
   // CENTER (dash-dot for fold / score lines)
-  dxf(L, 0, 'LTYPE'); dxf(L, 5, nextHandle());
-  dxf(L, 2, 'CENTER'); dxf(L, 70, '0');
-  dxf(L, 3, 'Center ____ _ ____');
-  dxf(L, 72, '65'); dxf(L, 73, '4'); dxf(L, 40, '2.0');
-  dxf(L, 49, '1.25'); dxf(L, 49, '-0.25');
-  dxf(L, 49, '0.25'); dxf(L, 49, '-0.25');
+  w(L, 0, 'LTYPE');
+  w(L, 2, 'CENTER');
+  w(L, 70, '0');
+  w(L, 3, 'Center ____ _ ____');
+  w(L, 72, '65'); w(L, 73, '4'); w(L, 40, '2.0');
+  w(L, 49, '1.25'); w(L, 49, '-0.25');
+  w(L, 49, '0.25'); w(L, 49, '-0.25');
 
-  dxf(L, 0, 'ENDTAB');
+  w(L, 0, 'ENDTAB');
 }
 
 function writeLayerTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'LAYER');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, String(Object.keys(DXF_LAYERS).length + 1)); // +1 for layer 0
+  const allLayers = [
+    { name: '0', color: 7, ltype: 'CONTINUOUS' },
+    ...Object.values(DXF_LAYERS).map(l => ({
+      name: l.name,
+      color: l.color,
+      ltype: l.name === 'SCORE' ? 'CENTER' : 'CONTINUOUS',
+    })),
+  ];
 
-  // Default layer 0 (required)
-  dxf(L, 0, 'LAYER'); dxf(L, 5, nextHandle());
-  dxf(L, 2, '0');
-  dxf(L, 70, '0');
-  dxf(L, 62, '7');
-  dxf(L, 6, 'CONTINUOUS');
+  w(L, 0, 'TABLE');
+  w(L, 2, 'LAYER');
+  w(L, 70, String(allLayers.length));
 
-  for (const layer of Object.values(DXF_LAYERS)) {
-    dxf(L, 0, 'LAYER'); dxf(L, 5, nextHandle());
-    dxf(L, 2, layer.name);
-    dxf(L, 70, '0');
-    dxf(L, 62, String(layer.color));
-    dxf(L, 6, layer.name === 'SCORE' ? 'CENTER' : 'CONTINUOUS');
+  for (const layer of allLayers) {
+    w(L, 0, 'LAYER');
+    w(L, 2, layer.name);
+    w(L, 70, '0');
+    w(L, 62, String(layer.color));
+    w(L, 6, layer.ltype);
   }
 
-  dxf(L, 0, 'ENDTAB');
-}
-
-function writeStyleTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'STYLE');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '1');
-
-  // STANDARD text style (required for TEXT entities)
-  dxf(L, 0, 'STYLE'); dxf(L, 5, nextHandle());
-  dxf(L, 2, 'STANDARD');
-  dxf(L, 70, '0');
-  dxf(L, 40, '0');     // text height (0 = variable)
-  dxf(L, 41, '1');     // width factor
-  dxf(L, 50, '0');     // oblique angle
-  dxf(L, 71, '0');     // text generation flags
-  dxf(L, 42, '2.5');   // last height used
-  dxf(L, 3, 'txt');    // primary font file
-  dxf(L, 4, '');       // big font file
-
-  dxf(L, 0, 'ENDTAB');
-}
-
-function writeViewTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'VIEW');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '0');
-  dxf(L, 0, 'ENDTAB');
-}
-
-function writeUcsTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'UCS');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '0');
-  dxf(L, 0, 'ENDTAB');
-}
-
-function writeAppidTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'APPID');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '1');
-
-  dxf(L, 0, 'APPID'); dxf(L, 5, nextHandle());
-  dxf(L, 2, 'ACAD');
-  dxf(L, 70, '0');
-
-  dxf(L, 0, 'ENDTAB');
-}
-
-function writeDimstyleTable(L: string[]): void {
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'DIMSTYLE');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, '1');
-  dxf(L, 100, 'AcDbDimStyleTable');
-
-  dxf(L, 0, 'DIMSTYLE');
-  dxf(L, 105, nextHandle());
-  dxf(L, 2, 'STANDARD');
-  dxf(L, 70, '0');
-  dxf(L, 41, '2.5');    // DIMASZ – arrow size
-  dxf(L, 42, '0.625');  // DIMEXO – extension line offset
-  dxf(L, 43, '3.75');   // DIMDLI – dimension line increment
-  dxf(L, 44, '1.25');   // DIMEXE – extension line extension
-  dxf(L, 140, '2.5');   // DIMTXT – text height
-  dxf(L, 77, '1');      // DIMTAD – text above dim line
-  dxf(L, 271, '2');     // DIMDEC – decimal places
-
-  dxf(L, 0, 'ENDTAB');
-}
-
-/** BLOCK_RECORD table – must have an entry for every BLOCK definition */
-function writeBlockRecordTable(L: string[], userBlockNames: string[]): void {
-  const total = 2 + userBlockNames.length; // *MODEL_SPACE + *PAPER_SPACE + user blocks
-  dxf(L, 0, 'TABLE');
-  dxf(L, 2, 'BLOCK_RECORD');
-  dxf(L, 5, nextHandle());
-  dxf(L, 70, String(total));
-
-  dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
-  dxf(L, 2, '*MODEL_SPACE');
-
-  dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
-  dxf(L, 2, '*PAPER_SPACE');
-
-  for (const name of userBlockNames) {
-    dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
-    dxf(L, 2, name);
-  }
-
-  dxf(L, 0, 'ENDTAB');
+  w(L, 0, 'ENDTAB');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entity writers
+// Entity writers (R12 POLYLINE + VERTEX + SEQEND)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Closed LWPOLYLINE – the nestable outline for OpenNest */
+/** Closed polyline (R12 POLYLINE with flag 1) – the nestable outline for OpenNest */
 function addClosedPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
-  dxf(L, 0, 'LWPOLYLINE'); dxf(L, 5, nextHandle());
-  dxf(L, 8, layer);
-  dxf(L, 90, String(pts.length));
-  dxf(L, 70, '1'); // 1 = closed polyline
+  w(L, 0, 'POLYLINE');
+  w(L, 8, layer);
+  w(L, 66, '1');   // vertices follow
+  w(L, 70, '1');   // 1 = closed polyline
   for (const p of pts) {
-    dxf(L, 10, fmt(p.x));
-    dxf(L, 20, fmt(p.y));
+    w(L, 0, 'VERTEX');
+    w(L, 8, layer);
+    w(L, 10, fmt(p.x));
+    w(L, 20, fmt(p.y));
+    w(L, 30, '0');
   }
+  w(L, 0, 'SEQEND');
+  w(L, 8, layer);
 }
 
-/** Open LWPOLYLINE – for fold / score lines */
-function addPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
-  dxf(L, 0, 'LWPOLYLINE'); dxf(L, 5, nextHandle());
-  dxf(L, 8, layer);
-  dxf(L, 90, String(pts.length));
-  dxf(L, 70, '0'); // 0 = open polyline
+/** Open polyline (R12 POLYLINE with flag 0) – for fold / score lines */
+function addOpenPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
+  w(L, 0, 'POLYLINE');
+  w(L, 8, layer);
+  w(L, 66, '1');   // vertices follow
+  w(L, 70, '0');   // 0 = open polyline
   for (const p of pts) {
-    dxf(L, 10, fmt(p.x));
-    dxf(L, 20, fmt(p.y));
+    w(L, 0, 'VERTEX');
+    w(L, 8, layer);
+    w(L, 10, fmt(p.x));
+    w(L, 20, fmt(p.y));
+    w(L, 30, '0');
   }
+  w(L, 0, 'SEQEND');
+  w(L, 8, layer);
 }
 
 function addCircle(L: string[], center: THREE.Vector2, radius: number, layer: string): void {
-  dxf(L, 0, 'CIRCLE'); dxf(L, 5, nextHandle());
-  dxf(L, 8, layer);
-  dxf(L, 10, fmt(center.x));
-  dxf(L, 20, fmt(center.y));
-  dxf(L, 40, fmt(radius));
+  w(L, 0, 'CIRCLE');
+  w(L, 8, layer);
+  w(L, 10, fmt(center.x));
+  w(L, 20, fmt(center.y));
+  w(L, 30, '0');
+  w(L, 40, fmt(radius));
 }
 
 function addText(
@@ -453,16 +301,17 @@ function addText(
   layer: string,
   height: number,
 ): void {
-  dxf(L, 0, 'TEXT'); dxf(L, 5, nextHandle());
-  dxf(L, 8, layer);
-  dxf(L, 10, fmt(pos.x));
-  dxf(L, 20, fmt(pos.y));
-  dxf(L, 40, fmt(height));
-  dxf(L, 7, 'STANDARD');  // text style
-  dxf(L, 1, text);
-  dxf(L, 72, '1'); // center horizontal alignment
-  dxf(L, 11, fmt(pos.x));
-  dxf(L, 21, fmt(pos.y));
+  w(L, 0, 'TEXT');
+  w(L, 8, layer);
+  w(L, 10, fmt(pos.x));
+  w(L, 20, fmt(pos.y));
+  w(L, 30, '0');
+  w(L, 40, fmt(height));
+  w(L, 1, text);
+  w(L, 72, '1'); // center horizontal alignment
+  w(L, 11, fmt(pos.x));
+  w(L, 21, fmt(pos.y));
+  w(L, 31, '0');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,7 +319,7 @@ function addText(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Push one DXF group-code / value pair */
-function dxf(L: string[], code: number, value: string): void {
+function w(L: string[], code: number, value: string): void {
   L.push(String(code), value);
 }
 
