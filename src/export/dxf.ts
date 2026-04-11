@@ -12,7 +12,8 @@
  * After nesting, "Explode" the blocks to get flat geometry per layer for the
  * laser-cutter driver.
  *
- * Format: AutoCAD R2000 (AC1015) with entity handles and INSUNITS = mm.
+ * Format: AutoCAD R2000 (AC1015) with all required symbol tables,
+ * entity handles, and INSUNITS = mm.
  */
 
 import * as THREE from 'three';
@@ -59,6 +60,9 @@ export function generateDXF(
   _handle = 0x100;
   const L: string[] = [];
 
+  // Pre-compute block names (needed by BLOCK_RECORD table)
+  const blockNames = strips.map(s => blockNameFor(s));
+
   // ── HEADER ────────────────────────────────────────────────────────────────
   dxf(L, 0, 'SECTION');
   dxf(L, 2, 'HEADER');
@@ -67,11 +71,18 @@ export function generateDXF(
   dxf(L, 9, '$HANDSEED'); dxf(L, 5, 'FFFF');
   dxf(L, 0, 'ENDSEC');
 
-  // ── TABLES ────────────────────────────────────────────────────────────────
+  // ── TABLES (all 9 required R2000 symbol tables) ───────────────────────────
   dxf(L, 0, 'SECTION');
   dxf(L, 2, 'TABLES');
+  writeVportTable(L);
   writeLtypeTable(L);
   writeLayerTable(L);
+  writeStyleTable(L);
+  writeViewTable(L);
+  writeUcsTable(L);
+  writeAppidTable(L);
+  writeDimstyleTable(L);
+  writeBlockRecordTable(L, blockNames);
   dxf(L, 0, 'ENDSEC');
 
   // ── BLOCKS ────────────────────────────────────────────────────────────────
@@ -104,6 +115,15 @@ export function generateDXF(
   }
 
   dxf(L, 0, 'ENDSEC');
+
+  // ── OBJECTS (minimal – required by R2000) ─────────────────────────────────
+  dxf(L, 0, 'SECTION');
+  dxf(L, 2, 'OBJECTS');
+  dxf(L, 0, 'DICTIONARY');
+  dxf(L, 5, nextHandle());
+  dxf(L, 330, '0');
+  dxf(L, 0, 'ENDSEC');
+
   dxf(L, 0, 'EOF');
 
   return L.join('\n');
@@ -219,8 +239,35 @@ function writeStripBlock(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table writers
+// Symbol-table writers (all 9 tables required by AC1015 / R2000)
 // ─────────────────────────────────────────────────────────────────────────────
+
+function writeVportTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'VPORT');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '1');
+  // Default viewport
+  dxf(L, 0, 'VPORT'); dxf(L, 5, nextHandle());
+  dxf(L, 2, '*ACTIVE');
+  dxf(L, 70, '0');
+  dxf(L, 10, '0'); dxf(L, 20, '0');       // lower-left corner
+  dxf(L, 11, '1'); dxf(L, 21, '1');       // upper-right corner
+  dxf(L, 12, '0'); dxf(L, 22, '0');       // center point
+  dxf(L, 13, '0'); dxf(L, 23, '0');       // snap base point
+  dxf(L, 14, '1'); dxf(L, 24, '1');       // snap spacing
+  dxf(L, 15, '0'); dxf(L, 25, '0');       // grid spacing
+  dxf(L, 16, '0'); dxf(L, 26, '0'); dxf(L, 36, '1');  // view direction
+  dxf(L, 17, '0'); dxf(L, 27, '0'); dxf(L, 37, '0');  // view target
+  dxf(L, 40, '1');    // view height
+  dxf(L, 41, '1');    // viewport aspect ratio
+  dxf(L, 42, '50');   // lens length
+  dxf(L, 43, '0');    // front clipping
+  dxf(L, 44, '0');    // back clipping
+  dxf(L, 50, '0');    // snap rotation angle
+  dxf(L, 51, '0');    // twist angle
+  dxf(L, 0, 'ENDTAB');
+}
 
 function writeLtypeTable(L: string[]): void {
   dxf(L, 0, 'TABLE');
@@ -249,15 +296,115 @@ function writeLayerTable(L: string[]): void {
   dxf(L, 0, 'TABLE');
   dxf(L, 2, 'LAYER');
   dxf(L, 5, nextHandle());
-  dxf(L, 70, String(Object.keys(DXF_LAYERS).length));
+  dxf(L, 70, String(Object.keys(DXF_LAYERS).length + 1)); // +1 for layer 0
+
+  // Default layer 0 (required)
+  dxf(L, 0, 'LAYER'); dxf(L, 5, nextHandle());
+  dxf(L, 2, '0');
+  dxf(L, 70, '0');
+  dxf(L, 62, '7');
+  dxf(L, 6, 'CONTINUOUS');
 
   for (const layer of Object.values(DXF_LAYERS)) {
     dxf(L, 0, 'LAYER'); dxf(L, 5, nextHandle());
     dxf(L, 2, layer.name);
     dxf(L, 70, '0');
     dxf(L, 62, String(layer.color));
-    // SCORE layer uses CENTER linetype (dash-dot), others use solid
     dxf(L, 6, layer.name === 'SCORE' ? 'CENTER' : 'CONTINUOUS');
+  }
+
+  dxf(L, 0, 'ENDTAB');
+}
+
+function writeStyleTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'STYLE');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '1');
+
+  // STANDARD text style (required for TEXT entities)
+  dxf(L, 0, 'STYLE'); dxf(L, 5, nextHandle());
+  dxf(L, 2, 'STANDARD');
+  dxf(L, 70, '0');
+  dxf(L, 40, '0');     // text height (0 = variable)
+  dxf(L, 41, '1');     // width factor
+  dxf(L, 50, '0');     // oblique angle
+  dxf(L, 71, '0');     // text generation flags
+  dxf(L, 42, '2.5');   // last height used
+  dxf(L, 3, 'txt');    // primary font file
+  dxf(L, 4, '');       // big font file
+
+  dxf(L, 0, 'ENDTAB');
+}
+
+function writeViewTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'VIEW');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '0');
+  dxf(L, 0, 'ENDTAB');
+}
+
+function writeUcsTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'UCS');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '0');
+  dxf(L, 0, 'ENDTAB');
+}
+
+function writeAppidTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'APPID');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '1');
+
+  dxf(L, 0, 'APPID'); dxf(L, 5, nextHandle());
+  dxf(L, 2, 'ACAD');
+  dxf(L, 70, '0');
+
+  dxf(L, 0, 'ENDTAB');
+}
+
+function writeDimstyleTable(L: string[]): void {
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'DIMSTYLE');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, '1');
+  dxf(L, 100, 'AcDbDimStyleTable');
+
+  dxf(L, 0, 'DIMSTYLE');
+  dxf(L, 105, nextHandle());
+  dxf(L, 2, 'STANDARD');
+  dxf(L, 70, '0');
+  dxf(L, 41, '2.5');    // DIMASZ – arrow size
+  dxf(L, 42, '0.625');  // DIMEXO – extension line offset
+  dxf(L, 43, '3.75');   // DIMDLI – dimension line increment
+  dxf(L, 44, '1.25');   // DIMEXE – extension line extension
+  dxf(L, 140, '2.5');   // DIMTXT – text height
+  dxf(L, 77, '1');      // DIMTAD – text above dim line
+  dxf(L, 271, '2');     // DIMDEC – decimal places
+
+  dxf(L, 0, 'ENDTAB');
+}
+
+/** BLOCK_RECORD table – must have an entry for every BLOCK definition */
+function writeBlockRecordTable(L: string[], userBlockNames: string[]): void {
+  const total = 2 + userBlockNames.length; // *MODEL_SPACE + *PAPER_SPACE + user blocks
+  dxf(L, 0, 'TABLE');
+  dxf(L, 2, 'BLOCK_RECORD');
+  dxf(L, 5, nextHandle());
+  dxf(L, 70, String(total));
+
+  dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
+  dxf(L, 2, '*MODEL_SPACE');
+
+  dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
+  dxf(L, 2, '*PAPER_SPACE');
+
+  for (const name of userBlockNames) {
+    dxf(L, 0, 'BLOCK_RECORD'); dxf(L, 5, nextHandle());
+    dxf(L, 2, name);
   }
 
   dxf(L, 0, 'ENDTAB');
@@ -311,6 +458,7 @@ function addText(
   dxf(L, 10, fmt(pos.x));
   dxf(L, 20, fmt(pos.y));
   dxf(L, 40, fmt(height));
+  dxf(L, 7, 'STANDARD');  // text style
   dxf(L, 1, text);
   dxf(L, 72, '1'); // center horizontal alignment
   dxf(L, 11, fmt(pos.x));
