@@ -7,13 +7,17 @@
  *   SCORE                   → fold / centerlines                 (laser: score / engrave)
  *   LABEL                   → text annotations                   (laser: skip or light mark)
  *
- * Each strip is a DXF BLOCK (outline + holes + fold + label).
- * OpenNest can move block instances as a unit so internal features
- * travel with the outline during nesting.
+ * Export strategy for OpenNest compatibility:
+ *   - Strip outlines are flat closed POLYLINEs in ENTITIES (OpenNest input)
+ *   - Each strip's internal features (holes + fold + label) are grouped in
+ *     a BLOCK and placed via INSERT at the same position
+ *   - After nesting, apply OpenNest's Transform output to both the outline
+ *     curve and the matching INT_* block instance
  *
- * Format: AC1009 (R12) – no entity handles, no BLOCK_RECORD, no subclass
- * markers.  Uses POLYLINE+VERTEX+SEQEND for closed outlines.
- * All coordinates are in millimeters.
+ * The i-th closed polyline on CUT_* layers corresponds to the i-th INSERT
+ * of an INT_* block – they share the same index order.
+ *
+ * Format: AC1009 (R12).  All coordinates in mm.
  */
 
 import * as THREE from 'three';
@@ -25,16 +29,16 @@ import type { UnfoldedStrip } from '../core/unfold';
 
 export interface DXFLayer {
   name: string;
-  color: number; // AutoCAD Color Index (ACI)
+  color: number;
 }
 
 export const DXF_LAYERS: Record<string, DXFLayer> = {
-  CUT_A: { name: 'CUT_A', color: 1 }, // Red    – Family 0 outlines
-  CUT_B: { name: 'CUT_B', color: 2 }, // Yellow – Family 1 outlines
-  CUT_C: { name: 'CUT_C', color: 3 }, // Green  – Family 2 outlines
-  HOLE:  { name: 'HOLE',  color: 4 }, // Cyan   – Junction holes
-  SCORE: { name: 'SCORE', color: 6 }, // Magenta – Fold / centerlines
-  LABEL: { name: 'LABEL', color: 7 }, // White  – Strip IDs & hole IDs
+  CUT_A: { name: 'CUT_A', color: 1 },
+  CUT_B: { name: 'CUT_B', color: 2 },
+  CUT_C: { name: 'CUT_C', color: 3 },
+  HOLE:  { name: 'HOLE',  color: 4 },
+  SCORE: { name: 'SCORE', color: 6 },
+  LABEL: { name: 'LABEL', color: 7 },
 };
 
 const CUT_LAYERS = ['CUT_A', 'CUT_B', 'CUT_C'];
@@ -55,7 +59,7 @@ export function generateDXF(
   w(L, 2, 'HEADER');
   w(L, 9, '$ACADVER');     w(L, 1, 'AC1009');
   w(L, 9, '$INSBASE');     w(L, 10, '0.0'); w(L, 20, '0.0'); w(L, 30, '0.0');
-  w(L, 9, '$MEASUREMENT'); w(L, 70, '1');   // metric
+  w(L, 9, '$MEASUREMENT'); w(L, 70, '1');
   w(L, 0, 'ENDSEC');
 
   // ── TABLES ────────────────────────────────────────────────────────────────
@@ -66,26 +70,42 @@ export function generateDXF(
   writeStyleTable(L);
   w(L, 0, 'ENDSEC');
 
-  // ── BLOCKS (one per strip) ────────────────────────────────────────────────
+  // ── BLOCKS (internal features only – holes, fold, label per strip) ────────
   w(L, 0, 'SECTION');
   w(L, 2, 'BLOCKS');
 
   for (const strip of strips) {
-    writeStripBlock(L, strip, includeHoleIds, includeFoldLines);
+    writeInternalBlock(L, strip, includeHoleIds, includeFoldLines);
   }
 
   w(L, 0, 'ENDSEC');
 
-  // ── ENTITIES (one INSERT per strip) ───────────────────────────────────────
+  // ── ENTITIES ──────────────────────────────────────────────────────────────
+  // Outlines (flat) and INSERTs are emitted in the same order so that
+  // the i-th outline corresponds to the i-th INSERT.
   w(L, 0, 'SECTION');
   w(L, 2, 'ENTITIES');
 
   for (const strip of strips) {
+    const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
+
+    for (const seg of strip.segments) {
+      // ── Flat closed outline (feed this to OpenNest) ───────────────────
+      if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
+        const outline = [
+          ...seg.leftBoundary,
+          ...seg.rightBoundary.slice().reverse(),
+        ];
+        addClosedPolyline(L, outline, cutLayer);
+      }
+    }
+
+    // ── INSERT for internal-features block (apply OpenNest Transform) ───
     w(L, 0, 'INSERT');
     w(L, 8, '0');
-    w(L, 2, blockNameFor(strip));
-    w(L, 10, fmt(strip.boundingBox.minX));
-    w(L, 20, fmt(strip.boundingBox.minY));
+    w(L, 2, intBlockName(strip));
+    w(L, 10, '0.0');
+    w(L, 20, '0.0');
     w(L, 30, '0.0');
   }
 
@@ -114,25 +134,21 @@ export function generateJunctionCSV(strips: UnfoldedStrip[]): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Block writer
+// Internal-features block (holes + fold + label – NOT the outline)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function blockNameFor(strip: UnfoldedStrip): string {
-  return `S_${strip.stripId.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`;
+function intBlockName(strip: UnfoldedStrip): string {
+  return `INT_${strip.stripId.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`;
 }
 
-function writeStripBlock(
+function writeInternalBlock(
   L: string[],
   strip: UnfoldedStrip,
   includeHoleIds: boolean,
   includeFoldLines: boolean,
 ): void {
-  const name     = blockNameFor(strip);
-  const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
-  const ox       = strip.boundingBox.minX;
-  const oy       = strip.boundingBox.minY;
+  const name = intBlockName(strip);
 
-  // R12 BLOCK – no handle, no flags beyond 70
   w(L, 0, 'BLOCK');
   w(L, 8, '0');
   w(L, 2, name);
@@ -140,39 +156,25 @@ function writeStripBlock(
   w(L, 10, '0.0');  w(L, 20, '0.0');  w(L, 30, '0.0');
 
   for (const seg of strip.segments) {
-    // Closed outline
-    if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
-      const outline = [
-        ...seg.leftBoundary,
-        ...seg.rightBoundary.slice().reverse(),
-      ].map(p => new THREE.Vector2(p.x - ox, p.y - oy));
-      addClosedPolyline(L, outline, cutLayer);
-    }
-
     // Fold / score line
     if (includeFoldLines && seg.centerline.length > 1) {
-      const cl = seg.centerline.map(p => new THREE.Vector2(p.x - ox, p.y - oy));
-      addOpenPolyline(L, cl, 'SCORE');
+      addOpenPolyline(L, seg.centerline, 'SCORE');
     }
 
     // Holes
     for (const hole of seg.holes) {
-      const c = new THREE.Vector2(hole.center.x - ox, hole.center.y - oy);
-      addCircle(L, c, hole.radius, 'HOLE');
+      addCircle(L, hole.center, hole.radius, 'HOLE');
       if (includeHoleIds) {
-        addText(L, c, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
+        addText(L, hole.center, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
       }
     }
   }
 
   // Strip label
   if (strip.segments.length > 0 && strip.segments[0].centerline.length > 0) {
-    const pt = strip.segments[0].centerline[0];
-    const pos = new THREE.Vector2(
-      pt.x - ox,
-      pt.y - oy + strip.segments[0].width * 0.5,
-    );
-    addText(L, pos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
+    const labelPos = strip.segments[0].centerline[0].clone();
+    labelPos.y += strip.segments[0].width * 0.5;
+    addText(L, labelPos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
   }
 
   w(L, 0, 'ENDBLK');
@@ -263,7 +265,7 @@ function addClosedPolyline(L: string[], pts: THREE.Vector2[], layer: string): vo
   w(L, 0, 'POLYLINE');
   w(L, 8, layer);
   w(L, 66, '1');
-  w(L, 70, '1');   // closed
+  w(L, 70, '1');
   for (const p of pts) {
     w(L, 0, 'VERTEX');
     w(L, 8, layer);
@@ -280,7 +282,7 @@ function addOpenPolyline(L: string[], pts: THREE.Vector2[], layer: string): void
   w(L, 8, layer);
   w(L, 6, 'CENTER');
   w(L, 66, '1');
-  w(L, 70, '0');   // open
+  w(L, 70, '0');
   for (const p of pts) {
     w(L, 0, 'VERTEX');
     w(L, 8, layer);
