@@ -7,12 +7,11 @@
  *   SCORE                   → fold / centerlines                 (laser: score / engrave)
  *   LABEL                   → text annotations                   (laser: skip or light mark)
  *
- * Each strip is emitted as a DXF BLOCK so that OpenNest (Rhino / Grasshopper)
- * can treat outline + holes + fold lines as a single nestable unit.
- * After nesting, "Explode" the blocks to get flat geometry per layer for the
- * laser-cutter driver.
+ * Each strip outline is a single closed LWPOLYLINE on its CUT_* layer.
+ * OpenNest can select all closed curves from CUT layers for nesting.
  *
- * Format: AutoCAD R14 (AC1014) with all 9 required symbol tables.
+ * Format: R12-compatible core (POLYLINE+VERTEX+SEQEND) with AC1012 header
+ * for maximum Rhino / ODA compatibility.
  * All coordinates are in millimeters.
  */
 
@@ -40,13 +39,6 @@ export const DXF_LAYERS: Record<string, DXFLayer> = {
 const CUT_LAYERS = ['CUT_A', 'CUT_B', 'CUT_C'];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Handle counter (reset per export call)
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _h = 0x20;
-function H(): string { return (_h++).toString(16).toUpperCase(); }
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,58 +47,62 @@ export function generateDXF(
   includeHoleIds: boolean,
   includeFoldLines: boolean,
 ): string {
-  _h = 0x20;
   const L: string[] = [];
 
-  // Pre-compute block names for BLOCK_RECORD table
-  const blockNames = strips.map(s => blockNameFor(s));
-
   // ── HEADER ────────────────────────────────────────────────────────────────
-  w(L, 0, 'SECTION');  w(L, 2, 'HEADER');
-  w(L, 9, '$ACADVER'); w(L, 1, 'AC1014');
-  w(L, 9, '$INSBASE'); w(L, 10, '0.0'); w(L, 20, '0.0'); w(L, 30, '0.0');
-  w(L, 9, '$INSUNITS'); w(L, 70, '4');        // 4 = mm
-  w(L, 9, '$MEASUREMENT'); w(L, 70, '1');     // 1 = metric
+  w(L, 0, 'SECTION');
+  w(L, 2, 'HEADER');
+  w(L, 9, '$ACADVER');     w(L, 1, 'AC1009');
+  w(L, 9, '$INSBASE');     w(L, 10, '0.0'); w(L, 20, '0.0'); w(L, 30, '0.0');
+  w(L, 9, '$MEASUREMENT'); w(L, 70, '1');   // metric
   w(L, 0, 'ENDSEC');
 
-  // ── TABLES (all 9 symbol tables required by R14) ──────────────────────────
-  w(L, 0, 'SECTION');  w(L, 2, 'TABLES');
-  writeVportTable(L);
+  // ── TABLES ────────────────────────────────────────────────────────────────
+  w(L, 0, 'SECTION');
+  w(L, 2, 'TABLES');
   writeLtypeTable(L);
   writeLayerTable(L);
   writeStyleTable(L);
-  writeViewTable(L);
-  writeUcsTable(L);
-  writeAppidTable(L);
-  writeDimstyleTable(L);
-  writeBlockRecordTable(L, blockNames);
   w(L, 0, 'ENDSEC');
 
-  // ── BLOCKS ────────────────────────────────────────────────────────────────
-  w(L, 0, 'SECTION');  w(L, 2, 'BLOCKS');
-
-  // Built-in blocks
-  writeEmptyBlock(L, '*MODEL_SPACE');
-  writeEmptyBlock(L, '*PAPER_SPACE');
-
-  // One block per strip
-  for (const strip of strips) {
-    writeStripBlock(L, strip, includeHoleIds, includeFoldLines);
-  }
-
-  w(L, 0, 'ENDSEC');
-
-  // ── ENTITIES ──────────────────────────────────────────────────────────────
-  w(L, 0, 'SECTION');  w(L, 2, 'ENTITIES');
+  // ── ENTITIES (flat – no BLOCKs) ───────────────────────────────────────────
+  w(L, 0, 'SECTION');
+  w(L, 2, 'ENTITIES');
 
   for (const strip of strips) {
-    w(L, 0, 'INSERT');
-    w(L, 5, H());
-    w(L, 8, '0');
-    w(L, 2, blockNameFor(strip));
-    w(L, 10, fmt(strip.boundingBox.minX));
-    w(L, 20, fmt(strip.boundingBox.minY));
-    w(L, 30, '0.0');
+    const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
+
+    for (const seg of strip.segments) {
+      // ── Closed outline (single closed polyline for OpenNest) ─────────────
+      if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
+        const outline = [
+          ...seg.leftBoundary,
+          ...seg.rightBoundary.slice().reverse(),
+        ];
+        addClosedPolyline(L, outline, cutLayer);
+      }
+
+      // ── Fold / score line ───────────────────────────────────────────────
+      if (includeFoldLines && seg.centerline.length > 1) {
+        addOpenPolyline(L, seg.centerline, 'SCORE');
+      }
+
+      // ── Junction holes ──────────────────────────────────────────────────
+      for (const hole of seg.holes) {
+        addCircle(L, hole.center, hole.radius, 'HOLE');
+
+        if (includeHoleIds) {
+          addText(L, hole.center, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
+        }
+      }
+    }
+
+    // ── Strip label ─────────────────────────────────────────────────────────
+    if (strip.segments.length > 0 && strip.segments[0].centerline.length > 0) {
+      const labelPos = strip.segments[0].centerline[0].clone();
+      labelPos.y += strip.segments[0].width * 0.5;
+      addText(L, labelPos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
+    }
   }
 
   w(L, 0, 'ENDSEC');
@@ -134,54 +130,33 @@ export function generateJunctionCSV(strips: UnfoldedStrip[]): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Symbol-table writers (all 9 required tables)
+// Table writers
 // ─────────────────────────────────────────────────────────────────────────────
 
-function writeVportTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'VPORT');  w(L, 5, H());  w(L, 70, '1');
-
-  w(L, 0, 'VPORT');  w(L, 5, H());
-  w(L, 2, '*ACTIVE');
-  w(L, 70, '0');
-  w(L, 10, '0.0');  w(L, 20, '0.0');   // lower-left
-  w(L, 11, '1.0');  w(L, 21, '1.0');   // upper-right
-  w(L, 12, '0.0');  w(L, 22, '0.0');   // view center
-  w(L, 13, '0.0');  w(L, 23, '0.0');   // snap base
-  w(L, 14, '1.0');  w(L, 24, '1.0');   // snap spacing
-  w(L, 15, '0.0');  w(L, 25, '0.0');   // grid spacing
-  w(L, 16, '0.0');  w(L, 26, '0.0');  w(L, 36, '1.0');  // view dir
-  w(L, 17, '0.0');  w(L, 27, '0.0');  w(L, 37, '0.0');  // view target
-  w(L, 40, '1.0');   // view height
-  w(L, 41, '1.0');   // aspect ratio
-  w(L, 42, '50.0');  // lens length
-  w(L, 43, '0.0');   // front clip
-  w(L, 44, '0.0');   // back clip
-  w(L, 50, '0.0');   // snap rotation
-  w(L, 51, '0.0');   // twist angle
-
-  w(L, 0, 'ENDTAB');
-}
-
 function writeLtypeTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'LTYPE');  w(L, 5, H());  w(L, 70, '3');
+  w(L, 0, 'TABLE');
+  w(L, 2, 'LTYPE');
+  w(L, 70, '2');
 
-  // ByBlock
-  w(L, 0, 'LTYPE');  w(L, 5, H());
-  w(L, 2, 'BYBLOCK');  w(L, 70, '0');
-  w(L, 3, '');  w(L, 72, '65');  w(L, 73, '0');  w(L, 40, '0.0');
+  w(L, 0, 'LTYPE');
+  w(L, 2, 'CONTINUOUS');
+  w(L, 70, '0');
+  w(L, 3, 'Solid line');
+  w(L, 72, '65');
+  w(L, 73, '0');
+  w(L, 40, '0.0');
 
-  // CONTINUOUS
-  w(L, 0, 'LTYPE');  w(L, 5, H());
-  w(L, 2, 'CONTINUOUS');  w(L, 70, '0');
-  w(L, 3, 'Solid line');  w(L, 72, '65');  w(L, 73, '0');  w(L, 40, '0.0');
-
-  // CENTER
-  w(L, 0, 'LTYPE');  w(L, 5, H());
-  w(L, 2, 'CENTER');  w(L, 70, '0');
+  w(L, 0, 'LTYPE');
+  w(L, 2, 'CENTER');
+  w(L, 70, '0');
   w(L, 3, 'Center ____ _ ____');
-  w(L, 72, '65');  w(L, 73, '4');  w(L, 40, '2.0');
-  w(L, 49, '1.25');  w(L, 49, '-0.25');
-  w(L, 49, '0.25');  w(L, 49, '-0.25');
+  w(L, 72, '65');
+  w(L, 73, '4');
+  w(L, 40, '2.0');
+  w(L, 49, '1.25');
+  w(L, 49, '-0.25');
+  w(L, 49, '0.25');
+  w(L, 49, '-0.25');
 
   w(L, 0, 'ENDTAB');
 }
@@ -196,11 +171,12 @@ function writeLayerTable(L: string[]): void {
     })),
   ];
 
-  w(L, 0, 'TABLE');  w(L, 2, 'LAYER');  w(L, 5, H());
+  w(L, 0, 'TABLE');
+  w(L, 2, 'LAYER');
   w(L, 70, String(allLayers.length));
 
   for (const ly of allLayers) {
-    w(L, 0, 'LAYER');  w(L, 5, H());
+    w(L, 0, 'LAYER');
     w(L, 2, ly.name);
     w(L, 70, '0');
     w(L, 62, String(ly.color));
@@ -211,184 +187,63 @@ function writeLayerTable(L: string[]): void {
 }
 
 function writeStyleTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'STYLE');  w(L, 5, H());  w(L, 70, '1');
+  w(L, 0, 'TABLE');
+  w(L, 2, 'STYLE');
+  w(L, 70, '1');
 
-  w(L, 0, 'STYLE');  w(L, 5, H());
+  w(L, 0, 'STYLE');
   w(L, 2, 'STANDARD');
   w(L, 70, '0');
-  w(L, 40, '0.0');   // height (0=variable)
-  w(L, 41, '1.0');   // width factor
-  w(L, 50, '0.0');   // oblique angle
-  w(L, 71, '0');     // generation flags
-  w(L, 42, '2.5');   // last height
-  w(L, 3, 'txt');    // font file
-  w(L, 4, '');       // big font
-
-  w(L, 0, 'ENDTAB');
-}
-
-function writeViewTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'VIEW');  w(L, 5, H());  w(L, 70, '0');
-  w(L, 0, 'ENDTAB');
-}
-
-function writeUcsTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'UCS');  w(L, 5, H());  w(L, 70, '0');
-  w(L, 0, 'ENDTAB');
-}
-
-function writeAppidTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'APPID');  w(L, 5, H());  w(L, 70, '1');
-
-  w(L, 0, 'APPID');  w(L, 5, H());
-  w(L, 2, 'ACAD');
-  w(L, 70, '0');
-
-  w(L, 0, 'ENDTAB');
-}
-
-function writeDimstyleTable(L: string[]): void {
-  w(L, 0, 'TABLE');  w(L, 2, 'DIMSTYLE');  w(L, 5, H());  w(L, 70, '1');
-
-  w(L, 0, 'DIMSTYLE');  w(L, 5, H());
-  w(L, 2, 'STANDARD');
-  w(L, 70, '0');
-  w(L, 3, '');       // DIMPOST
-  w(L, 4, '');       // DIMAPOST
-  w(L, 40, '1.0');   // DIMSCALE
-  w(L, 41, '2.5');   // DIMASZ
-  w(L, 42, '0.625'); // DIMEXO
-  w(L, 43, '3.75');  // DIMDLI
-  w(L, 44, '1.25');  // DIMEXE
-  w(L, 140, '2.5');  // DIMTXT
-  w(L, 77, '1');     // DIMTAD
-  w(L, 271, '2');    // DIMDEC
-
-  w(L, 0, 'ENDTAB');
-}
-
-function writeBlockRecordTable(L: string[], userBlockNames: string[]): void {
-  const count = 2 + userBlockNames.length;
-  w(L, 0, 'TABLE');  w(L, 2, 'BLOCK_RECORD');  w(L, 5, H());
-  w(L, 70, String(count));
-
-  w(L, 0, 'BLOCK_RECORD');  w(L, 5, H());
-  w(L, 2, '*MODEL_SPACE');
-
-  w(L, 0, 'BLOCK_RECORD');  w(L, 5, H());
-  w(L, 2, '*PAPER_SPACE');
-
-  for (const name of userBlockNames) {
-    w(L, 0, 'BLOCK_RECORD');  w(L, 5, H());
-    w(L, 2, name);
-  }
+  w(L, 40, '0.0');
+  w(L, 41, '1.0');
+  w(L, 50, '0.0');
+  w(L, 71, '0');
+  w(L, 42, '2.5');
+  w(L, 3, 'txt');
+  w(L, 4, '');
 
   w(L, 0, 'ENDTAB');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Block writers
-// ─────────────────────────────────────────────────────────────────────────────
-
-function blockNameFor(strip: UnfoldedStrip): string {
-  return `STRIP_${strip.stripId.replace(/[^A-Za-z0-9_]/g, '_').toUpperCase()}`;
-}
-
-function writeEmptyBlock(L: string[], name: string): void {
-  w(L, 0, 'BLOCK');  w(L, 5, H());
-  w(L, 8, '0');
-  w(L, 2, name);
-  w(L, 70, '0');
-  w(L, 10, '0.0');  w(L, 20, '0.0');  w(L, 30, '0.0');
-  w(L, 0, 'ENDBLK');  w(L, 5, H());
-  w(L, 8, '0');
-}
-
-function writeStripBlock(
-  L: string[],
-  strip: UnfoldedStrip,
-  includeHoleIds: boolean,
-  includeFoldLines: boolean,
-): void {
-  const name     = blockNameFor(strip);
-  const cutLayer = CUT_LAYERS[strip.family] ?? 'CUT_A';
-  const ox       = strip.boundingBox.minX;
-  const oy       = strip.boundingBox.minY;
-
-  w(L, 0, 'BLOCK');  w(L, 5, H());
-  w(L, 8, '0');
-  w(L, 2, name);
-  w(L, 70, '0');
-  w(L, 10, '0.0');  w(L, 20, '0.0');  w(L, 30, '0.0');
-
-  for (const seg of strip.segments) {
-    // Closed outline
-    if (seg.leftBoundary.length > 0 && seg.rightBoundary.length > 0) {
-      const outline = [
-        ...seg.leftBoundary,
-        ...seg.rightBoundary.slice().reverse(),
-      ].map(p => new THREE.Vector2(p.x - ox, p.y - oy));
-      addClosedPolyline(L, outline, cutLayer);
-    }
-
-    // Fold / score line
-    if (includeFoldLines && seg.centerline.length > 1) {
-      const cl = seg.centerline.map(p => new THREE.Vector2(p.x - ox, p.y - oy));
-      addPolyline(L, cl, 'SCORE');
-    }
-
-    // Holes
-    for (const hole of seg.holes) {
-      const c = new THREE.Vector2(hole.center.x - ox, hole.center.y - oy);
-      addCircle(L, c, hole.radius, 'HOLE');
-      if (includeHoleIds) {
-        addText(L, c, String(hole.junctionId), 'LABEL', hole.radius * 0.8);
-      }
-    }
-  }
-
-  // Strip label
-  if (strip.segments.length > 0 && strip.segments[0].centerline.length > 0) {
-    const pt = strip.segments[0].centerline[0];
-    const pos = new THREE.Vector2(
-      pt.x - ox,
-      pt.y - oy + strip.segments[0].width * 0.5,
-    );
-    addText(L, pos, strip.stripId, 'LABEL', strip.segments[0].width * 0.3);
-  }
-
-  w(L, 0, 'ENDBLK');  w(L, 5, H());
-  w(L, 8, '0');
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Entity writers
+// Entity writers (R12 POLYLINE + VERTEX + SEQEND for max compatibility)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function addClosedPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
-  w(L, 0, 'LWPOLYLINE');  w(L, 5, H());
+  w(L, 0, 'POLYLINE');
   w(L, 8, layer);
-  w(L, 90, String(pts.length));
-  w(L, 70, '1'); // closed
+  w(L, 66, '1');
+  w(L, 70, '1');   // closed
   for (const p of pts) {
+    w(L, 0, 'VERTEX');
+    w(L, 8, layer);
     w(L, 10, fmt(p.x));
     w(L, 20, fmt(p.y));
+    w(L, 30, '0.0');
   }
+  w(L, 0, 'SEQEND');
+  w(L, 8, layer);
 }
 
-function addPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
-  w(L, 0, 'LWPOLYLINE');  w(L, 5, H());
+function addOpenPolyline(L: string[], pts: THREE.Vector2[], layer: string): void {
+  w(L, 0, 'POLYLINE');
   w(L, 8, layer);
-  w(L, 90, String(pts.length));
-  w(L, 70, '0'); // open
+  w(L, 6, 'CENTER');
+  w(L, 66, '1');
+  w(L, 70, '0');   // open
   for (const p of pts) {
+    w(L, 0, 'VERTEX');
+    w(L, 8, layer);
     w(L, 10, fmt(p.x));
     w(L, 20, fmt(p.y));
+    w(L, 30, '0.0');
   }
+  w(L, 0, 'SEQEND');
+  w(L, 8, layer);
 }
 
 function addCircle(L: string[], center: THREE.Vector2, radius: number, layer: string): void {
-  w(L, 0, 'CIRCLE');  w(L, 5, H());
+  w(L, 0, 'CIRCLE');
   w(L, 8, layer);
   w(L, 10, fmt(center.x));
   w(L, 20, fmt(center.y));
@@ -403,18 +258,13 @@ function addText(
   layer: string,
   height: number,
 ): void {
-  w(L, 0, 'TEXT');  w(L, 5, H());
+  w(L, 0, 'TEXT');
   w(L, 8, layer);
   w(L, 10, fmt(pos.x));
   w(L, 20, fmt(pos.y));
   w(L, 30, '0.0');
   w(L, 40, fmt(height));
-  w(L, 7, 'STANDARD');
   w(L, 1, text);
-  w(L, 72, '1'); // center horizontal
-  w(L, 11, fmt(pos.x));
-  w(L, 21, fmt(pos.y));
-  w(L, 31, '0.0');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
