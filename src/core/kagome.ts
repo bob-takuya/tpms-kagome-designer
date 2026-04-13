@@ -141,8 +141,15 @@ export function buildKagomePattern(
 
         const smoothed   = smoothPolyline(chain.points, 4);
         const projected  = smoothed.map(p => projectToSurface(p));
-        const centerline = adaptiveSubdivide(projected, projectToSurface);
-        if (centerline.length < 2) continue;
+        const subdivided = adaptiveSubdivide(projected, projectToSurface);
+        if (subdivided.length < 2) continue;
+
+        // Keep only the longest sharp-free sub-polyline (> 30° → discard).
+        // Topologically bad stitches are almost always at one end of the
+        // chain or in a short region; taking the longest clean piece gives
+        // us the best of both worlds (clean geometry + preserved topology).
+        const centerline = largestSmoothSubPolyline(subdivided, 30);
+        if (centerline.length < 4) continue;
 
         const chainSuffix = chains.length > 1 ? `_${ci + 1}` : '';
         const stripId     = `${id}${chainSuffix}`;
@@ -154,7 +161,7 @@ export function buildKagomePattern(
           isolines: [iso, iso],
           centerline,
           width: 0,
-          widths: new Array(centerline.length).fill(0),  // filled in step 2
+          widths: new Array(centerline.length).fill(0),
           junctions: [],
           segments: [],
         };
@@ -790,6 +797,63 @@ export function generateJunctionHoles(
     centers: junctions.map(j => j.position.clone()),
     radii: junctions.map(() => radius),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Split a polyline at sharp corners – returns a list of sub-polylines
+//
+// When the turning angle at a vertex exceeds the threshold, we break the
+// polyline there, producing two separate pieces.  The shared corner vertex
+// becomes an endpoint of both pieces (not used as an interior vertex of
+// either).  This prevents topologically bad stitches from contaminating
+// otherwise good strips.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Return the longest contiguous sub-polyline free of sharp corners.
+ * "Sharp" = turning angle > maxAngleDeg at an interior vertex.
+ * The sharp vertex itself is excluded from all pieces.
+ */
+function largestSmoothSubPolyline(
+  pts: THREE.Vector3[],
+  maxAngleDeg: number,
+): THREE.Vector3[] {
+  if (pts.length < 3) return pts;
+  const maxRad = maxAngleDeg * Math.PI / 180;
+
+  // Find break vertices
+  const breaks: number[] = [];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d1 = new THREE.Vector3().subVectors(pts[i], pts[i - 1]);
+    const d2 = new THREE.Vector3().subVectors(pts[i + 1], pts[i]);
+    if (d1.lengthSq() < 1e-14 || d2.lengthSq() < 1e-14) continue;
+    d1.normalize(); d2.normalize();
+    const cos = Math.max(-1, Math.min(1, d1.dot(d2)));
+    if (Math.acos(cos) > maxRad) breaks.push(i);
+  }
+
+  if (breaks.length === 0) return pts;
+
+  // Build intervals [start, end) avoiding break vertices
+  const intervals: Array<[number, number]> = [];
+  let s = 0;
+  for (const b of breaks) {
+    if (b > s) intervals.push([s, b]);
+    s = b + 1;
+  }
+  if (s < pts.length) intervals.push([s, pts.length]);
+
+  // Pick the longest interval (by arc length)
+  let bestArc = 0;
+  let bestInterval: [number, number] = [0, pts.length];
+  for (const [lo, hi] of intervals) {
+    if (hi - lo < 2) continue;
+    let arc = 0;
+    for (let i = lo + 1; i < hi; i++) arc += pts[i].distanceTo(pts[i - 1]);
+    if (arc > bestArc) { bestArc = arc; bestInterval = [lo, hi]; }
+  }
+
+  return pts.slice(bestInterval[0], bestInterval[1]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
