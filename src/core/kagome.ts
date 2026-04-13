@@ -13,7 +13,6 @@
 import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
 import type { Isoline } from './connectionLaplacian';
-import { buildFaceAdjacency, traceGeodesic, findContainingFace } from './geodesic';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public interfaces  (kept backward-compatible with unfold.ts / dxf.ts)
@@ -84,9 +83,6 @@ export function buildKagomePattern(
   // Build surface projector once (shared across all strips)
   const projectToSurface = buildSurfaceProjector(mesh);
 
-  // Build face adjacency once (for geodesic tracing)
-  const faceAdj = buildFaceAdjacency(mesh);
-
   // ── 1. Stitch segment pairs → ordered polylines per strip ─────────────────
   const families: [Strip[], Strip[], Strip[]] = [[], [], []];
   const allStrips: Strip[] = [];
@@ -143,14 +139,7 @@ export function buildKagomePattern(
         }
         if (chainArc < minArc) continue;
 
-        // ── Replace the stitched chain with a geodesic trace ────────────────
-        // The isoline chain gives us the topology (which strip exists and
-        // roughly where).  We replace its geometry with the straightest
-        // possible path on the surface: a geodesic passing through the
-        // chain's midpoint in the direction of the average tangent.
-        const geodesicChain = replaceChainWithGeodesic(mesh, faceAdj, chain.points, chainArc);
-
-        const smoothed   = smoothPolyline(geodesicChain, 2);
+        const smoothed   = smoothPolyline(chain.points, 4);
         const projected  = smoothed.map(p => projectToSurface(p));
         const centerline = adaptiveSubdivide(projected, projectToSurface);
         if (centerline.length < 2) continue;
@@ -787,62 +776,6 @@ function averageCenterlineDistance(cl1: THREE.Vector3[], cl2: THREE.Vector3[]): 
     sum += Math.sqrt(minD2);
   }
   return sum / K;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Replace a stitched isoline chain with a geodesic trace
-//
-// The isoline chain establishes topology (one strip, approximate location).
-// We replace its geometry with the straightest possible path: a geodesic
-// through the chain's midpoint, in the direction of the local tangent,
-// traced forward and backward to match the original arc length.
-// ─────────────────────────────────────────────────────────────────────────────
-
-function replaceChainWithGeodesic(
-  mesh: HalfEdgeMesh,
-  adj: ReturnType<typeof buildFaceAdjacency>,
-  chainPts: THREE.Vector3[],
-  arcLength: number,
-): THREE.Vector3[] {
-  if (chainPts.length < 3) return chainPts;
-
-  // Midpoint by arc length (more robust than index-midpoint)
-  let half = 0;
-  let midIdx = 0;
-  const target = arcLength * 0.5;
-  for (let i = 1; i < chainPts.length; i++) {
-    const d = chainPts[i].distanceTo(chainPts[i - 1]);
-    if (half + d >= target) { midIdx = i; break; }
-    half += d;
-    midIdx = i;
-  }
-  const midPt = chainPts[midIdx].clone();
-
-  // Estimate tangent at midpoint via a short window average
-  const W = Math.min(3, Math.floor(chainPts.length / 4));
-  const a = Math.max(0, midIdx - W);
-  const b = Math.min(chainPts.length - 1, midIdx + W);
-  const tangent = new THREE.Vector3().subVectors(chainPts[b], chainPts[a]);
-  if (tangent.lengthSq() < 1e-14) return chainPts;
-  tangent.normalize();
-
-  // Find the face containing the midpoint
-  const startFace = findContainingFace(mesh, midPt);
-
-  // Trace forward and backward, each for half the arc length
-  const halfLen = arcLength * 0.5;
-  const forward  = traceGeodesic(mesh, adj, startFace, midPt, tangent, halfLen);
-  const backward = traceGeodesic(mesh, adj, startFace, midPt, tangent.clone().negate(), halfLen);
-
-  // Concatenate: reversed backward (excluding shared midpoint) + forward
-  const combined: THREE.Vector3[] = [];
-  for (let i = backward.length - 1; i >= 1; i--) combined.push(backward[i]);
-  for (let i = 0; i < forward.length; i++) combined.push(forward[i]);
-
-  // Sanity: if geodesic trace failed (too short), fall back to original chain
-  if (combined.length < 3) return chainPts;
-
-  return combined;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
