@@ -18,7 +18,8 @@ import { marchingCubes } from '../src/core/marchingCubes';
 import { buildHalfEdgeMesh } from '../src/core/halfEdge';
 import type { HalfEdgeMesh } from '../src/core/halfEdge';
 import {
-  computeGuidedStripeFields, computeStripeField, traceIsolines,
+  computeGuidedStripeFields, computeStripeField, computeKnoppelStripeFields,
+  traceIsolines, traceZeroCrossings,
 } from '../src/core/connectionLaplacian';
 import { buildKagomePattern } from '../src/core/kagome';
 import type { KagomePattern, Strip } from '../src/core/kagome';
@@ -261,7 +262,7 @@ function percentile(arr: number[], p: number): number {
 // Pipeline runner
 // ─────────────────────────────────────────────────────────────────────────────
 
-type StripeMode = 'guided' | 'poisson';
+type StripeMode = 'guided' | 'poisson' | 'knoppel';
 
 function runPipeline(params: TestParams, mode: StripeMode = 'guided'): {
   mesh: HalfEdgeMesh;
@@ -277,9 +278,22 @@ function runPipeline(params: TestParams, mode: StripeMode = 'guided'): {
   const t1 = Date.now();
 
   let stripeFields: [Float64Array, Float64Array, Float64Array];
-  if (mode === 'guided') {
+  let isolines: [any, any, any] = [[], [], []];
+
+  if (mode === 'knoppel') {
+    // Knöppel 2015: twisted eigensolve per family → Re(ψ) zero crossings
+    const omega = 4.0;   // stripe frequency (tuneable)
+    const psi = computeKnoppelStripeFields(mesh, omega);
+    stripeFields = [psi[0].re, psi[1].re, psi[2].re];
+    for (let k = 0; k < 3; k++) {
+      isolines[k] = traceZeroCrossings(mesh, psi[k].re);
+    }
+  } else if (mode === 'guided') {
     const guided = computeGuidedStripeFields(mesh, params.density);
     stripeFields = guided.fields;
+    for (let k = 0; k < 3; k++) {
+      isolines[k] = traceIsolines(mesh, stripeFields[k], params.numIsolines);
+    }
   } else {
     // Old comb-frame Poisson
     stripeFields = [
@@ -287,11 +301,9 @@ function runPipeline(params: TestParams, mode: StripeMode = 'guided'): {
       computeStripeField(mesh, Math.PI / 3,         params.density),
       computeStripeField(mesh, (2 * Math.PI) / 3,   params.density),
     ];
-  }
-
-  const isolines: [any, any, any] = [[], [], []];
-  for (let k = 0; k < 3; k++) {
-    isolines[k] = traceIsolines(mesh, stripeFields[k], params.numIsolines);
+    for (let k = 0; k < 3; k++) {
+      isolines[k] = traceIsolines(mesh, stripeFields[k], params.numIsolines);
+    }
   }
   const t2 = Date.now();
 
@@ -343,13 +355,18 @@ function main() {
   console.log('='.repeat(60));
 
   const modeArg = process.argv[2] as StripeMode | undefined;
-  const modes: StripeMode[] = modeArg ? [modeArg] : ['guided', 'poisson'];
+  const modes: StripeMode[] = modeArg ? [modeArg] : ['guided', 'poisson', 'knoppel'];
   const surfaces: TestParams['surface'][] = ['gyroid', 'schwarzP', 'schwarzD'];
-  const byMode: Record<StripeMode, number[]> = { guided: [], poisson: [] };
+  const byMode: Record<StripeMode, number[]> = { guided: [], poisson: [], knoppel: [] };
 
   for (const mode of modes) {
+    const modeLabels: Record<StripeMode, string> = {
+      guided:  '3-RoSy guided Poisson',
+      poisson: 'Old comb-frame Poisson',
+      knoppel: 'Knöppel 2015 Stripe Patterns',
+    };
     console.log('\n' + '█'.repeat(60));
-    console.log(`█ MODE: ${mode === 'guided' ? '3-RoSy guided Poisson' : 'Old comb-frame Poisson'}`);
+    console.log(`█ MODE: ${modeLabels[mode]}`);
     console.log('█'.repeat(60));
 
     const results: Array<{ label: string; m: Metrics; timings: any }> = [];

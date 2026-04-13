@@ -413,6 +413,194 @@ export function computeGuidedStripeFields(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Per-mesh cache for frames + vertex areas (avoids rebuilding)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _cache: { mesh: HalfEdgeMesh; frames: VertexFrames; areas: Float64Array } | null = null;
+
+function ensureCache(mesh: HalfEdgeMesh): { frames: VertexFrames; areas: Float64Array } {
+  if (_cache?.mesh === mesh) return _cache;
+  const frames = buildVertexFrames(mesh);
+  const areas  = computeVertexAreas(mesh);
+  _cache = { mesh, frames, areas };
+  return { frames, areas };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Knöppel et al. 2015 "Stripe Patterns on Surfaces" — proper eigenvalue formulation
+//
+// For each kagome family k, compute a complex scalar ψ_k minimizing
+//     E(ψ) = ∫|∇ψ − iω·X_k·ψ|² dA
+// where X_k is the direction field for family k and ω is the stripe frequency.
+//
+// The discrete form is a Hermitian generalized eigenproblem:
+//     L_k ψ = λ M ψ
+// with edge-wise twisted Laplacian:
+//     L[i,i] += w_ij
+//     L[j,j] += w_ij
+//     L[i,j] -= w_ij · e^{−i·ω·⟨e_ij, X⟩_avg}
+//     L[j,i] -= w_ij · e^{+i·ω·⟨e_ij, X⟩_avg}
+//
+// Stripes are extracted as zero-crossings of Re(ψ_k) per face (see traceZeroCrossings).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Knöppel 2015 stripe pattern computation.
+ *
+ * Returns THREE complex fields (Re, Im per vertex) — one per kagome family.
+ * Stripes are extracted from Re(ψ) zero-crossings by traceZeroCrossings.
+ *
+ * @param omega  Stripe frequency (radians per world unit along X).
+ *               Higher = more stripes.  Typical: 3-6 for TPMS at grid=40.
+ */
+export function computeKnoppelStripeFields(
+  mesh: HalfEdgeMesh,
+  omega: number = 4.0,
+): { re: Float64Array; im: Float64Array }[] {
+  const { frames, areas } = ensureCache(mesh);
+
+  // Step 1: 3-RoSy eigenvector to get direction field
+  const cplxL = buildComplexCotanL(mesh, frames);
+  console.time('[Knoppel] 3-RoSy direction field');
+  const eig = inversePowerIteration(cplxL, areas);
+  console.timeEnd('[Knoppel] 3-RoSy direction field');
+
+  const n = mesh.vertices.length;
+  const eigenDir = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    eigenDir[i] = Math.atan2(eig.im[i], eig.re[i]) / 3;
+  }
+
+  // Step 2: For each family, build twisted Laplacian and solve smallest eigenvector
+  const results: { re: Float64Array; im: Float64Array }[] = [];
+  for (let k = 0; k < 3; k++) {
+    const dirAngles = new Float64Array(n);
+    for (let i = 0; i < n; i++) dirAngles[i] = eigenDir[i] + k * Math.PI / 3;
+
+    console.time(`[Knoppel] family ${k} twisted eigensolve`);
+    const L_k = buildKnoppelMatrix(mesh, frames, dirAngles, omega);
+    const psi = inversePowerIteration(L_k, areas);
+    console.timeEnd(`[Knoppel] family ${k} twisted eigensolve`);
+
+    results.push({ re: psi.re, im: psi.im });
+  }
+
+  return results;
+}
+
+/**
+ * Build the twisted Laplacian for Knöppel 2015 stripe energy.
+ *
+ * dirAngles[v] = angle of the desired stripe direction in the local frame at vertex v.
+ */
+function buildKnoppelMatrix(
+  mesh: HalfEdgeMesh,
+  frames: VertexFrames,
+  dirAngles: Float64Array,
+  omega: number,
+): ComplexCotanL {
+  const n = mesh.vertices.length;
+  const diag = new Float64Array(n);
+  const adj: ComplexNeighbor[][] = Array.from({ length: n }, () => []);
+
+  for (let heIdx = 0; heIdx < mesh.halfEdges.length; heIdx++) {
+    const he = mesh.halfEdges[heIdx];
+    if (he.twin !== -1 && heIdx > he.twin) continue;
+
+    const vi = getHalfEdgeStart(mesh, heIdx);
+    const vj = he.vertex;
+    const w = Math.max(0, cotangentWeight(mesh, heIdx));
+
+    // Direction X_i and X_j in 3D via local tangent frames
+    const Xi_x = Math.cos(dirAngles[vi]);
+    const Xi_y = Math.sin(dirAngles[vi]);
+    const Xj_x = Math.cos(dirAngles[vj]);
+    const Xj_y = Math.sin(dirAngles[vj]);
+
+    const t1i = frames.t1[vi], t2i = frames.t2[vi];
+    const t1j = frames.t1[vj], t2j = frames.t2[vj];
+    const Xi = new THREE.Vector3(
+      t1i.x * Xi_x + t2i.x * Xi_y,
+      t1i.y * Xi_x + t2i.y * Xi_y,
+      t1i.z * Xi_x + t2i.z * Xi_y,
+    );
+    const Xj = new THREE.Vector3(
+      t1j.x * Xj_x + t2j.x * Xj_y,
+      t1j.y * Xj_x + t2j.y * Xj_y,
+      t1j.z * Xj_x + t2j.z * Xj_y,
+    );
+
+    // Edge vector
+    const e = new THREE.Vector3().subVectors(mesh.vertices[vj], mesh.vertices[vi]);
+
+    // Projected lengths onto X at each endpoint
+    const proj_i = e.dot(Xi);
+    const proj_j = e.dot(Xj);
+
+    // Line field sign handling: if the two projections disagree in sign,
+    // flip one (the field is undirected; pick the side that gives consistent sign).
+    let avgProj: number;
+    if (proj_i * proj_j < 0) {
+      avgProj = (Math.abs(proj_i) + Math.abs(proj_j)) / 2
+                * (proj_i + proj_j >= 0 ? 1 : -1);
+    } else {
+      avgProj = (proj_i + proj_j) / 2;
+    }
+
+    const targetPhase = omega * avgProj;
+
+    diag[vi] += w;
+    diag[vj] += w;
+
+    // L[i,j] = −w · e^{−i·targetPhase}
+    // L[j,i] = −w · e^{+i·targetPhase}   (makes the matrix Hermitian)
+    adj[vi].push({ j: vj, w, cosR: Math.cos(-targetPhase), sinR: Math.sin(-targetPhase) });
+    adj[vj].push({ j: vi, w, cosR: Math.cos( targetPhase), sinR: Math.sin( targetPhase) });
+  }
+
+  return { n, diag, adj };
+}
+
+/**
+ * Trace zero-crossings of a real scalar field on a triangle mesh.
+ *
+ * For each face where sign(f) changes across edges, emit a line segment
+ * connecting the two zero-crossing points.  This is marching triangles
+ * at level = 0, used for extracting stripes from Re(ψ) in the Knöppel pipeline.
+ */
+export function traceZeroCrossings(
+  mesh: HalfEdgeMesh,
+  f: Float64Array,
+): Isoline[] {
+  const pts: THREE.Vector3[] = [];
+  const faceIds: number[] = [];
+
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    const face = mesh.faces[fi];
+    const v = [face[0], face[1], face[2]];
+    const fv = [f[v[0]], f[v[1]], f[v[2]]];
+
+    const crossPts: THREE.Vector3[] = [];
+    for (let e = 0; e < 3; e++) {
+      const a = e, b = (e + 1) % 3;
+      const fa_ = fv[a], fb_ = fv[b];
+      if ((fa_ <= 0 && 0 < fb_) || (fb_ <= 0 && 0 < fa_)) {
+        const t = (0 - fa_) / (fb_ - fa_);
+        crossPts.push(
+          new THREE.Vector3().lerpVectors(mesh.vertices[v[a]], mesh.vertices[v[b]], t),
+        );
+      }
+    }
+    if (crossPts.length === 2) {
+      pts.push(crossPts[0], crossPts[1]);
+      faceIds.push(fi);
+    }
+  }
+
+  return pts.length > 0 ? [{ points: pts, faceIndices: faceIds }] : [];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Connection Laplacian internals
 // ─────────────────────────────────────────────────────────────────────────────
 
