@@ -323,26 +323,73 @@ export function computeGuidedStripeFields(
   const { re, im } = inversePowerIteration(cplxL, areas);
   console.timeEnd('[Stripe] connection eigenvector');
 
-  // Extract per-vertex phase (direction) and amplitude
+  // Extract per-vertex 3-RoSy direction θ = arg(w) / 3  and amplitude
+  // θ ∈ [−π/3, π/3] (= [−60°, +60°]).  Since the field has 3-fold symmetry,
+  // this uniquely determines the stripe direction modulo 60°.
   const n = mesh.vertices.length;
   const eigenDir  = new Float64Array(n);
   const amplitude = new Float64Array(n);
   let maxAmp = 0;
   for (let i = 0; i < n; i++) {
-    eigenDir[i]  = Math.atan2(im[i], re[i]);
+    eigenDir[i]  = Math.atan2(im[i], re[i]) / 3;
     amplitude[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
     if (amplitude[i] > maxAmp) maxAmp = amplitude[i];
   }
 
-  // Detect singularities
+  // Detect singularities (vertices where |ψ| ≈ 0)
   const ampThresh = 0.01 * maxAmp;
   const singularities: number[] = [];
   for (let i = 0; i < n; i++) {
     if (amplitude[i] < ampThresh) singularities.push(i);
   }
+
+  // Phase 5 (spec): detect per-face singularities via 3-RoSy holonomy.
+  // For face (i,j,k), sum the wrapped phase jumps around the loop:
+  //   ϕ_ij = arg(w[j] · e^{−3iα_ij} · conj(w[i])) / 3
+  // holonomy Σϕ rounded to multiples of 2π/3 gives the index ∈ {0, ±1/3}.
+  const faceSingIndex = new Int8Array(mesh.faces.length);
+  let nSingFaces = 0;
+  const ALPHA_IJ = (vi: number, vj: number): number => {
+    // Look up precomputed 3-α between vi and vj (use neighbor table)
+    for (const nb of cplxL.adj[vi]) {
+      if (nb.j === vj) return Math.atan2(nb.sinR, nb.cosR); // 3α_ij
+    }
+    return 0;
+  };
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    const f = mesh.faces[fi];
+    let total = 0;
+    for (let e = 0; e < 3; e++) {
+      const a = f[e], b = f[(e + 1) % 3];
+      const alpha3 = ALPHA_IJ(a, b);
+      // arg(w[b] / (e^{3iα} · w[a])) in one step:
+      //   w[b] · e^{−3iα} · conj(w[a])
+      const wbRe = re[b], wbIm = im[b];
+      const waRe = re[a], waIm = im[a];
+      // e^{−3iα}
+      const cR = Math.cos(-alpha3), cI = Math.sin(-alpha3);
+      // e^{−3iα} · conj(w[a]) = (cR + i·cI)(waRe − i·waIm)
+      const cRc = cR * waRe + cI * waIm;
+      const cIc = cI * waRe - cR * waIm;
+      // w[b] · that = (wbRe + i·wbIm)(cRc + i·cIc)
+      const pR = wbRe * cRc - wbIm * cIc;
+      const pI = wbRe * cIc + wbIm * cRc;
+      // Wrapped phase jump
+      total += Math.atan2(pI, pR);
+    }
+    // Wrap to (−π, π]
+    total = total - 2 * Math.PI * Math.round(total / (2 * Math.PI));
+    const idx = Math.round(total / (2 * Math.PI / 3));
+    if (idx !== 0) {
+      faceSingIndex[fi] = idx as -1 | 0 | 1;
+      nSingFaces++;
+    }
+  }
+
   console.log(
-    `[Stripe] eigenvector: ${singularities.length} singularities ` +
-    `(${(100 * singularities.length / n).toFixed(1)}%)`,
+    `[Stripe] 3-RoSy eigenvector: ` +
+    `${singularities.length} vertex zeros (${(100 * singularities.length / n).toFixed(1)}%), ` +
+    `${nSingFaces} face singularities`,
   );
 
   // Step 2: For each family k, build Poisson RHS using eigenvector direction + k·60°
@@ -390,6 +437,19 @@ function connectionAngle(
   return alphaJ - alphaI;
 }
 
+/**
+ * Build the 3-RoSy connection Laplacian.
+ *
+ * For the complex variable w[v] = exp(3i·θ[v]), the Dirichlet energy
+ *   E = Σ_{(i,j)∈E} w_ij · |w[j] − e^{3i·α_ij} · w[i]|²
+ * yields the Hermitian matrix:
+ *   L[i,i] = Σ_j w_ij
+ *   L[i,j] = −w_ij · e^{+3i·α_ij}   (stored in adj[vi] as the vi→vj entry)
+ *   L[j,i] = −w_ij · e^{−3i·α_ij}   (stored in adj[vj] as the vj→vi entry)
+ *
+ * The factor of 3 encodes the 3-RoSy symmetry: rotating θ by 2π/3 leaves
+ * the field unchanged.  The 3 kagome families are then at θ, θ+π/3, θ+2π/3.
+ */
 function buildComplexCotanL(mesh: HalfEdgeMesh, frames: VertexFrames): ComplexCotanL {
   const n = mesh.vertices.length;
   const diag = new Float64Array(n);
@@ -403,9 +463,11 @@ function buildComplexCotanL(mesh: HalfEdgeMesh, frames: VertexFrames): ComplexCo
     const w = Math.max(0, cotangentWeight(mesh, heIdx));
     diag[vi] += w;
     diag[vj] += w;
-    const omega = connectionAngle(mesh, frames, vi, vj);
-    adj[vi].push({ j: vj, w, cosR: Math.cos(omega),  sinR: Math.sin(omega) });
-    adj[vj].push({ j: vi, w, cosR: Math.cos(-omega), sinR: Math.sin(-omega) });
+
+    // 3-RoSy: multiply the connection angle by 3
+    const omega3 = 3 * connectionAngle(mesh, frames, vi, vj);
+    adj[vi].push({ j: vj, w, cosR: Math.cos( omega3), sinR: Math.sin( omega3) });
+    adj[vj].push({ j: vi, w, cosR: Math.cos(-omega3), sinR: Math.sin(-omega3) });
   }
 
   return { n, diag, adj };
