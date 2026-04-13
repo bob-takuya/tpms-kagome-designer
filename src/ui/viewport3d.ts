@@ -6,7 +6,7 @@ import { marchingCubes } from '../core/marchingCubes';
 import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
-import { computeGuidedStripeFields, traceIsolines } from '../core/connectionLaplacian';
+import { computeKnoppelStripeFields, traceZeroCrossings } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
 import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
@@ -166,15 +166,22 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // Clear previous overlays
   clearGroup(ctx.stripMeshes);
 
-  // ── Stage 2 – Stripe fields via Connection Laplacian guided Poisson ─────
-  const STRIP_DENSITY = 4.0;
-  const guided = computeGuidedStripeFields(mesh, STRIP_DENSITY);
-  const stripeFields = guided.fields;
+  // ── Stage 2 – Stripe fields via Knöppel 2015 "Stripe Patterns on Surfaces" ──
+  // Twisted eigenvalue problem per family: L_k ψ = λ M ψ where
+  //   L_k has edge phases ω·⟨e_ij, X_k⟩ encoded in the off-diagonals.
+  // Stripes = zero-crossings of Re(ψ) per triangle face.
+  // numIsolines controls the target stripe density via ω ≈ numIsolines / 2.
+  const omega = Math.max(1, state.strip.numIsolines / 2);
+  const psi = computeKnoppelStripeFields(mesh, omega);
+
+  const stripeFields: [Float64Array, Float64Array, Float64Array] = [
+    psi[0].re, psi[1].re, psi[2].re,
+  ];
   ctx.stripeFields = stripeFields;
 
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
   for (let k = 0; k < 3; k++) {
-    isolinesByFamily[k] = traceIsolines(mesh, stripeFields[k], state.strip.numIsolines);
+    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re);
   }
   ctx.isolinesByFamily = isolinesByFamily;
 
