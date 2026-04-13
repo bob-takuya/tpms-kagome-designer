@@ -139,7 +139,7 @@ export function buildKagomePattern(
         }
         if (chainArc < minArc) continue;
 
-        const smoothed   = smoothPolyline(chain.points, 4);
+        const smoothed   = smoothPolyline(chain.points, 2);
         const projected  = smoothed.map(p => projectToSurface(p));
         const subdivided = adaptiveSubdivide(projected, projectToSurface);
         if (subdivided.length < 2) continue;
