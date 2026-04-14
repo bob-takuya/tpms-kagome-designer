@@ -16,6 +16,9 @@
 #include "alg2.h"
 #include "pipeline.h"
 
+#include <map>
+#include <tuple>
+
 #include <cstdio>
 #include <cmath>
 
@@ -129,24 +132,80 @@ void marchGrid(Fn f, double lo, double hi, int res, std::vector<Tri>& tris) {
     }
 }
 
+// Build a guaranteed-manifold icosphere by recursively subdividing an
+// icosahedron. Every subdivision step replaces each triangle with 4
+// sub-triangles, keeping vertex sharing along edges exact (each new
+// midpoint is keyed by the ordered edge endpoint indices, not by 3D
+// coordinates). Produces meshes of known topology (genus 0, χ=2).
+inline Mesh buildIcosphere(int subdivisions) {
+    const double t = (1.0 + std::sqrt(5.0)) / 2.0;
+    std::vector<Eigen::Vector3d> V = {
+        {-1,  t,  0}, { 1,  t,  0}, {-1, -t,  0}, { 1, -t,  0},
+        { 0, -1,  t}, { 0,  1,  t}, { 0, -1, -t}, { 0,  1, -t},
+        { t,  0, -1}, { t,  0,  1}, {-t,  0, -1}, {-t,  0,  1},
+    };
+    for (auto& p : V) p.normalize();
+
+    std::vector<Eigen::Vector3i> F = {
+        {0,11,5},{0,5,1},{0,1,7},{0,7,10},{0,10,11},
+        {1,5,9},{5,11,4},{11,10,2},{10,7,6},{7,1,8},
+        {3,9,4},{3,4,2},{3,2,6},{3,6,8},{3,8,9},
+        {4,9,5},{2,4,11},{6,2,10},{8,6,7},{9,8,1}
+    };
+
+    for (int s = 0; s < subdivisions; ++s) {
+        std::map<std::pair<int,int>, int> mid;
+        auto getMid = [&](int a, int b) -> int {
+            auto k = std::make_pair(std::min(a,b), std::max(a,b));
+            auto it = mid.find(k);
+            if (it != mid.end()) return it->second;
+            Eigen::Vector3d m = (V[a] + V[b]).normalized();
+            int id = (int)V.size();
+            V.push_back(m);
+            mid[k] = id;
+            return id;
+        };
+        std::vector<Eigen::Vector3i> F2;
+        F2.reserve(F.size() * 4);
+        for (const auto& f : F) {
+            int a = f[0], b = f[1], c = f[2];
+            int ab = getMid(a,b), bc = getMid(b,c), ca = getMid(c,a);
+            F2.push_back({a,  ab, ca});
+            F2.push_back({b,  bc, ab});
+            F2.push_back({c,  ca, bc});
+            F2.push_back({ab, bc, ca});
+        }
+        F = std::move(F2);
+    }
+
+    Mesh m;
+    m.V.resize((int)V.size(), 3);
+    for (int i = 0; i < (int)V.size(); ++i) m.V.row(i) = V[i];
+    m.F.resize((int)F.size(), 3);
+    for (int i = 0; i < (int)F.size(); ++i) m.F.row(i) = F[i];
+    buildHalfEdges(m);
+    return m;
+}
+
 Mesh trisToMesh(const std::vector<Tri>& tris, double weldEps = 1e-6) {
-    // Hash-based weld.
-    std::unordered_map<long long, int> map;
+    // Proper 3D-coordinate weld via std::map<tuple,int>. The earlier
+    // 1D-hash version collapsed distinct points together (creating fake
+    // non-manifold vertices) AND failed to merge coincident ones
+    // (creating spurious boundaries) — tripling the singular-vertex
+    // count reported by the cover build.
+    std::map<std::tuple<long long, long long, long long>, int> uniq;
     std::vector<Eigen::Vector3d> V;
     std::vector<Eigen::Vector3i> F;
-    auto key = [&](double x, double y, double z) -> long long {
-        long long kx = (long long)std::llround(x / weldEps);
-        long long ky = (long long)std::llround(y / weldEps);
-        long long kz = (long long)std::llround(z / weldEps);
-        return ((kx * 73856093LL) ^ (ky * 19349663LL) ^ (kz * 83492791LL));
+    auto snap = [&](double x) -> long long {
+        return (long long)std::llround(x / weldEps);
     };
     auto insert = [&](const double p[3]) -> int {
-        long long k = key(p[0], p[1], p[2]);
-        auto it = map.find(k);
-        if (it != map.end()) return it->second;
+        auto k = std::make_tuple(snap(p[0]), snap(p[1]), snap(p[2]));
+        auto it = uniq.find(k);
+        if (it != uniq.end()) return it->second;
         int id = (int)V.size();
         V.emplace_back(p[0], p[1], p[2]);
-        map[k] = id;
+        uniq[k] = id;
         return id;
     };
     for (const auto& t : tris) {
@@ -168,15 +227,15 @@ Mesh trisToMesh(const std::vector<Tri>& tris, double weldEps = 1e-6) {
 } // anonymous
 
 int main() {
-    // Schwarz-P: cos x + cos y + cos z = 0 over [−π, π].
-    auto sp = [](double x, double y, double z) {
-        return std::cos(x) + std::cos(y) + std::cos(z);
-    };
-    std::vector<Tri> tris;
-    marchGrid(sp, -M_PI, M_PI, 28, tris);
-    Mesh m = trisToMesh(tris);
-    std::printf("[smoke] Schwarz-P mesh: V=%d  F=%d  E_int=%d\n",
-                m.nV(), m.nF(), m.nE());
+    // Icosphere — guaranteed manifold (genus 0, χ=2). 4 subdivisions
+    // → 2562 vertices / 5120 faces. Used as a clean baseline for
+    // validating the WGF pipeline; the earlier marching-tetrahedra
+    // test mesh was non-manifold due to tet-face coincident-point
+    // floating-point mismatches, which confused the cover build.
+    Mesh m = buildIcosphere(4);
+    std::printf("[smoke] icosphere mesh: V=%d  F=%d  E_int=%d  "
+                "(3F - 2E_int = %d boundary half-edges, expect 0)\n",
+                m.nV(), m.nF(), m.nE(), 3*m.nF() - 2*m.nE());
 
     auto frames = buildFaceFrames(m);
 

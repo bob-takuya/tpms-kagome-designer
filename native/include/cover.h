@@ -23,8 +23,10 @@
 
 #include "mesh.h"
 #include "rosy.h"
+#include "progress.h"
 #include <queue>
 #include <cstdint>
+#include <cstdio>
 
 namespace wgf {
 
@@ -62,76 +64,131 @@ inline CoverBuildResult buildBranchedCover(
     // σ_h = shift from face(h) to face(twin(h)).  We only touch each
     // interior edge once and set both h and twin(h) consistently:
     // σ_{twin(h)} = (6 − σ_h) mod 6.
+    reportProgress(STAGE_COVER_BUILD, 0, 4, "Cover: edge permutations");
     R.sigmaPerHE.assign(base.he.size(), 0);
+    int sigmaHist[6] = {0, 0, 0, 0, 0, 0};
+    double residualMaxRad = 0;
+    double residualSumSq  = 0;
     for (const auto& e : base.eInt) {
         int h = e.first;
         int t = e.second;
         int fi = base.he[h].face;
         int fj = base.he[t].face;
         double beta = parallelTransport(base, baseFrames, h);
-        int s = bestShift(phi[fi], phi[fj], beta);
+        // Raw angular difference (before rounding). Good diagnostic —
+        // if |raw − k·π/3| is consistently < π/6 at every edge then
+        // the cover build will be clean.
+        const double SIXTH = M_PI / 3.0;
+        double raw    = phi[fi] + beta - phi[fj];
+        int    sRound = (int)std::llround(raw / SIXTH);
+        double resid  = raw - sRound * SIXTH;
+        // Wrap residual into (−π/6, π/6].
+        while (resid >  M_PI / 6.0 + 1e-12) resid -= SIXTH;
+        while (resid < -M_PI / 6.0 - 1e-12) resid += SIXTH;
+        if (std::fabs(resid) > residualMaxRad) residualMaxRad = std::fabs(resid);
+        residualSumSq += resid * resid;
+
+        int s = ((sRound % 6) + 6) % 6;
         R.sigmaPerHE[h] = (int8_t)s;
         R.sigmaPerHE[t] = (int8_t)(((6 - s) % 6 + 6) % 6);
+        sigmaHist[s]++;
+    }
+    {
+        int nE = (int)base.eInt.size();
+        double rms = std::sqrt(residualSumSq / std::max(1, nE));
+        std::fprintf(stderr,
+            "[cover] sigma hist [%d %d %d %d %d %d] / %d edges | residual max=%.3g rad (%.1f deg) rms=%.3g\n",
+            sigmaHist[0], sigmaHist[1], sigmaHist[2],
+            sigmaHist[3], sigmaHist[4], sigmaHist[5],
+            nE, residualMaxRad, residualMaxRad * 180.0 / M_PI, rms);
     }
 
     // 2. Holonomy walk around each base vertex.
     //
-    // getVertexHalfEdges equivalent: starting at h0 = v2he[v] (outgoing
-    // from v), step via he[prev(h)].twin.next, accumulating σ of
-    // prev(h) each time (prev(h) ends at v, its σ shifts us into the
-    // next fan face).
+    // Given an outgoing half-edge h (h starts at v, ends at some u),
+    // the canonical CW-around-v rotation is
     //
-    // Offsets at each corner (v, f) are recorded for later use.
+    //     h_next = twin(prev(h))
+    //
+    // prev(h) is the half-edge ending at v in face(h); its twin starts
+    // at v in the adjacent face. That adjacent-face half-edge IS the
+    // next outgoing half-edge from v, so we just walk `h ← twin(prev(h))`
+    // until we cycle back to h0.
+    //
+    // An earlier version used `h ← next(twin(prev(h)))` which drifts
+    // off the fan of v entirely (next(twin) starts at twin's endpoint,
+    // not at v), causing the walk to wander the whole mesh for each
+    // vertex — O(|V|·|F|) in the worst case, effectively hanging on
+    // real TPMS meshes.
+    reportProgress(STAGE_COVER_BUILD, 1, 4, "Cover: vertex holonomy walk");
     R.isSingularBaseV.assign(nV, 0);
     R.numSingular = 0;
     std::unordered_map<long long, int> cornerOffset;
-    cornerOffset.reserve((size_t)6 * nF);
+    cornerOffset.reserve((size_t)3 * nF);   // ~3 corner entries per face
+
+    const int walkGuard = (int)base.he.size() + 16;  // defensive cap
+    const int reportEveryV = std::max(1, nV / 20);
+    int holHist[6] = {0, 0, 0, 0, 0, 0};
+    int nBdry = 0;
 
     for (int v = 0; v < nV; ++v) {
+        if ((v % reportEveryV) == 0) {
+            reportProgress(STAGE_COVER_BUILD, 1, 4, "Cover: vertex holonomy walk");
+        }
         int h0 = base.v2he[v];
         if (h0 < 0) continue;
 
         int acc = 0;  // offset of face(h0) is 0 by convention
         int h = h0;
         bool isBdry = false;
+        int steps = 0;
 
         // First pass: assign offsets around the fan.
         while (true) {
+            if (++steps > walkGuard) { isBdry = true; break; }  // should never fire
             int f = base.he[h].face;
             long long key = (long long)v * nF + f;
             cornerOffset[key] = ((acc % 6) + 6) % 6;
 
-            int prev = base.he[h].prev;           // ends at v
-            int s = R.sigmaPerHE[prev];            // shift into next fan face
-            int twin = base.he[prev].twin;
+            int prev = base.he[h].prev;            // ends at v
+            int twin = base.he[prev].twin;         // next outgoing from v
             if (twin < 0) { isBdry = true; break; }
+            int s = R.sigmaPerHE[prev];            // σ across the shared edge
             acc = (acc + s) % 6;
-            int next = base.he[twin].next;
-            if (next == h0) break;
-            h = next;
+            if (twin == h0) break;                 // closed the fan
+            h = twin;
         }
 
         // After the loop, acc is the total holonomy (mod 6).
         int holonomy = ((acc % 6) + 6) % 6;
+        holHist[holonomy]++;
+        if (isBdry) nBdry++;
         if (isBdry || holonomy != 0) {
             R.isSingularBaseV[v] = 1;
             R.numSingular++;
             // erase all offsets we stored for this singular vertex
             int hh = h0;
+            int g2 = 0;
             while (true) {
+                if (++g2 > walkGuard) break;
                 int f = base.he[hh].face;
                 cornerOffset.erase((long long)v * nF + f);
                 int pp = base.he[hh].prev;
                 int tt = base.he[pp].twin;
                 if (tt < 0) break;
-                int nn = base.he[tt].next;
-                if (nn == h0) break;
-                hh = nn;
+                if (tt == h0) break;
+                hh = tt;
             }
         }
     }
 
+    std::fprintf(stderr,
+        "[cover] holonomy hist [%d %d %d %d %d %d] / %d vertices (boundary=%d) singular=%d\n",
+        holHist[0], holHist[1], holHist[2], holHist[3], holHist[4], holHist[5],
+        nV, nBdry, R.numSingular);
+
     // 3. Compact cover-vertex indices: 6 per non-singular base vertex.
+    reportProgress(STAGE_COVER_BUILD, 2, 4, "Cover: compact vertices");
     std::vector<int> flat(6 * nV, -1);
     std::vector<int> cvBase, cvLayer;
     cvBase.reserve(6 * nV);
@@ -150,6 +207,7 @@ inline CoverBuildResult buildBranchedCover(
     for (int i = 0; i < nCV; ++i) CV.row(i) = base.V.row(cvBase[i]);
 
     // 4. Cover faces: 6 copies of every non-punctured face.
+    reportProgress(STAGE_COVER_BUILD, 3, 4, "Cover: emit faces + half-edges");
     std::vector<Eigen::Vector3i> CF;
     std::vector<int> fbase, flayer;
     CF.reserve(6 * nF);
