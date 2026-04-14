@@ -6,8 +6,9 @@ import { marchingCubes } from '../core/marchingCubes';
 import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
-import { computeKnoppelStripeFields, traceZeroCrossings } from '../core/connectionLaplacian';
+import { traceZeroCrossings } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
+import { computeGeodesicFoliationStripeFields } from '../core/foliationPipeline';
 import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
 import { buildAllStripMeshes } from '../core/stripMesh';
@@ -166,14 +167,19 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // Clear previous overlays
   clearGroup(ctx.stripMeshes);
 
-  // ── Stage 2 – Stripe fields via Knöppel 2015 "Stripe Patterns on Surfaces" ──
-  // Twisted eigenvalue problem per family: L_k ψ = λ M ψ where
-  //   L_k has edge phases ω·⟨e_ij, X_k⟩ encoded in the off-diagonals.
-  // Stripes = zero-crossings of Re(ψ) per triangle face (full coverage).
-  // U-turns at singularities are prevented by 45° stitching constraint in
-  // kagome.ts, not by filtering zero-crossings.
+  // ── Stage 2 – Vekhter 2019 "Weaving Geodesic Foliations" (Part 1) ──
+  //
+  // Direction field is refined to be as geodesic as possible by minimizing
+  // the discrete curl energy via Algorithm 1 (alternating δ-projection onto
+  // ker C + per-face unit normalization). The optimized field is then fed
+  // to the Knöppel 2015 stripe eigensolve for scalar integration per family.
+  // Stripes = zero-crossings of Re(ψ) per triangle face.
   const omega = Math.max(1, state.strip.numIsolines / 2);
-  const psi = computeKnoppelStripeFields(mesh, omega);
+  const { fields: psi } = computeGeodesicFoliationStripeFields(mesh, omega, {
+    maxIter: 30,
+    tol:     1e-5,
+    epsilon: 1e-6,
+  });
 
   const stripeFields: [Float64Array, Float64Array, Float64Array] = [
     psi[0].re, psi[1].re, psi[2].re,
