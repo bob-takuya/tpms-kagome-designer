@@ -16,8 +16,9 @@ dist-ssr
 native/third_party/eigen/
 native/build/
 native/build-wasm/
-public/wasm/wgf.wasm
-public/wasm/wgf.js
+# Generated single-file ES module (base64-inlined WASM); rebuilt by CI.
+src/wasm/wgf.js
+public/wasm/
 
 # Editor directories and files
 .vscode/*

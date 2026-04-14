@@ -31,4 +31,4 @@ emcmake cmake -DCMAKE_BUILD_TYPE=Release ..
 emmake make wgf_wasm -j2
 
 echo "[wgf] built:"
-ls -lh "$HERE/../public/wasm/" || true
+ls -lh "$HERE/../src/wasm/" || true

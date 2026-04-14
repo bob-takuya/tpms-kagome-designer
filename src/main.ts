@@ -8,6 +8,38 @@ import { createStatusBar } from './ui/statusbar';
 import { generateDXF, generateJunctionCSV } from './export/dxf';
 import { generateSVG } from './export/svg';
 
+// ─── Diagnostic overlay ───────────────────────────────────────────────────
+// Lightweight on-screen error/status banner that works even when remote
+// debugging is not available. Especially useful for iOS Safari where
+// unhandled rejections (e.g. WASM load failures) would otherwise be
+// invisible and present as "the viewport is blank".
+const banner = document.createElement('div');
+banner.id = 'wgf-diag';
+banner.style.cssText = [
+  'position:fixed', 'top:0', 'left:0', 'right:0',
+  'max-height:40vh', 'overflow:auto',
+  'background:rgba(150,0,0,0.92)', 'color:#fff',
+  'padding:6px 10px', 'font:11px/1.35 ui-monospace,monospace',
+  'z-index:99999', 'white-space:pre-wrap', 'display:none',
+  'box-shadow:0 2px 8px rgba(0,0,0,0.4)',
+].join(';');
+document.body.appendChild(banner);
+function diag(msg: string, isError = false) {
+  banner.style.display = 'block';
+  if (isError) banner.style.background = 'rgba(150,0,0,0.92)';
+  banner.textContent += msg + '\n';
+  banner.scrollTop = banner.scrollHeight;
+}
+window.addEventListener('error', (e) => {
+  diag('[error] ' + (e.error?.stack || e.error?.message || e.message || String(e)), true);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const r = e.reason;
+  diag('[rejection] ' + (r?.stack || r?.message || String(r)), true);
+});
+// Expose for other modules to push status lines without spamming console.
+(window as unknown as { wgfDiag: (m: string) => void }).wgfDiag = (m: string) => diag(m);
+
 // Create main layout
 const app = document.getElementById('app')!;
 app.innerHTML = `

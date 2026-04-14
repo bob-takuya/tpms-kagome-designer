@@ -25,6 +25,20 @@
 
 import type { HalfEdgeMesh } from './halfEdge';
 
+// Static import of the Emscripten-generated glue. With SINGLE_FILE=1
+// the .wasm is base64-embedded into this ES module, so there is NO
+// sibling .wasm file to fetch and no runtime URL resolution to worry
+// about — vite bundles the glue together with the rest of the app.
+// This is the fix for the "iOS Safari blank viewport" symptom: the
+// earlier `/* @vite-ignore */ dynamic-import-by-absolute-URL` path
+// was silently failing under the /tpms-kagome-designer/ GH Pages
+// sub-path on iOS.
+//
+// The ?url suffix is intentionally NOT used — we want the module
+// itself, not its URL.
+// @ts-expect-error — generated file, no .d.ts
+import createWgfModule from '../wasm/wgf.js';
+
 // The Emscripten module factory signature — hand-typed since we don't
 // import the generated declaration file.
 type EmModule = {
@@ -39,26 +53,10 @@ type EmModule = {
 
 let modulePromise: Promise<EmModule> | null = null;
 
-/**
- * Load and cache the WASM module. The .wasm file is fetched from
- * `import.meta.env.BASE_URL + 'wasm/wgf.wasm'` so it works both in
- * `vite dev` and on GitHub Pages.
- */
 export function loadWgfModule(): Promise<EmModule> {
-  if (modulePromise) return modulePromise;
-
-  // Dynamic import of the Emscripten-generated ES module.
-  const base = import.meta.env.BASE_URL || '/';
-  const jsUrl = new URL(base + 'wasm/wgf.js', window.location.origin).toString();
-
-  modulePromise = import(/* @vite-ignore */ jsUrl).then(async (mod: { default: (opts?: unknown) => Promise<EmModule> }) => {
-    const createWgfModule = mod.default;
-    const instance = await createWgfModule({
-      locateFile: (p: string) => base + 'wasm/' + p,
-    });
-    return instance;
-  });
-
+  if (!modulePromise) {
+    modulePromise = (createWgfModule as (opts?: unknown) => Promise<EmModule>)({});
+  }
   return modulePromise;
 }
 
