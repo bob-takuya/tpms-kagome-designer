@@ -445,10 +445,163 @@ export function buildKagomePattern(
     (pruned.length > 0 ? ` (${pruned.map(s => s.id).join(',')})` : ''),
   );
 
-  // ── Curvature continuity report ──────────────────────────────────────────
-  logCurvatureReport(finalStrips);
+  // ── 6. Merge strip fragments across families by smoothness ─────────────
+  // At cut-points and singularities, fragments from different families may
+  // be natural continuations of each other.  We pick the smoothest pairing
+  // regardless of family to build the longest possible smooth ribbons.
+  const mergedStrips = mergeStripsAcrossFamilies(finalStrips, junctions);
 
-  return { strips: finalStrips, junctions, families };
+  // ── Curvature continuity report ──────────────────────────────────────────
+  logCurvatureReport(mergedStrips);
+
+  return { strips: mergedStrips, junctions, families };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-family strip merging
+//
+// After the three families are extracted (each with sharp corners cut and
+// short fragments filtered), iterate over all strip endpoints and merge
+// pairs that form the smoothest possible continuation — regardless of which
+// family they belong to.
+//
+// Algorithm:
+//   1. Collect all strip endpoints (head and tail) with outward tangents
+//   2. Score every candidate pair by (tangent alignment − distance penalty)
+//   3. Greedy matching: apply merges in decreasing score order
+//   4. Smooth the join and remap junction stripId references
+// ─────────────────────────────────────────────────────────────────────────────
+
+function mergeStripsAcrossFamilies(
+  strips: Strip[],
+  junctions: Junction[],
+): Strip[] {
+  if (strips.length < 2) return strips;
+
+  const MAX_GAP = 0.8;                              // world units (~ 6 mesh edges)
+  const MIN_ALIGN = Math.cos(30 * Math.PI / 180);   // 30° anti-parallel tolerance
+
+  // Multi-pass greedy: each pass, collect fresh endpoints, find the best
+  // compatible pair, and merge.  Repeat until no more mergeable pairs exist.
+  // This avoids stale-endpoint bugs that plague single-pass approaches.
+  const working = strips.slice();
+  const idRemap = new Map<string, string>();
+  let mergeCount = 0;
+  const MAX_PASSES = 500;
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    interface Endpoint {
+      stripIdx: number;
+      end: 'head' | 'tail';
+      pos: THREE.Vector3;
+      outTan: THREE.Vector3;
+    }
+    const endpoints: Endpoint[] = [];
+    for (let si = 0; si < working.length; si++) {
+      const cl = working[si].centerline;
+      if (cl.length < 3) continue;
+      const hTan = new THREE.Vector3().subVectors(cl[0], cl[1]).normalize();
+      const tTan = new THREE.Vector3().subVectors(cl[cl.length - 1], cl[cl.length - 2]).normalize();
+      endpoints.push({ stripIdx: si, end: 'head', pos: cl[0].clone(),                 outTan: hTan });
+      endpoints.push({ stripIdx: si, end: 'tail', pos: cl[cl.length - 1].clone(),     outTan: tTan });
+    }
+
+    // Collect all candidate pairs with positive score
+    const cands: { i: number; j: number; score: number }[] = [];
+    for (let i = 0; i < endpoints.length; i++) {
+      for (let j = i + 1; j < endpoints.length; j++) {
+        if (endpoints[i].stripIdx === endpoints[j].stripIdx) continue;
+        const d = endpoints[i].pos.distanceTo(endpoints[j].pos);
+        if (d > MAX_GAP) continue;
+        const align = -endpoints[i].outTan.dot(endpoints[j].outTan);
+        if (align < MIN_ALIGN) continue;
+        const score = align - 0.4 * (d / MAX_GAP);
+        cands.push({ i, j, score });
+      }
+    }
+    cands.sort((a, b) => b.score - a.score);
+
+    // Try each candidate in order; accept the first one that passes the
+    // smoothness check at the join.
+    let picked: { aEp: typeof endpoints[0]; bEp: typeof endpoints[0]; combined: THREE.Vector3[] } | null = null;
+    for (const c of cands) {
+      const aEp = endpoints[c.i];
+      const bEp = endpoints[c.j];
+      const sA = working[aEp.stripIdx];
+      const sB = working[bEp.stripIdx];
+
+      let combined: THREE.Vector3[];
+      let joinIdx: number; // index in `combined` just BEFORE the first B point
+      if (aEp.end === 'tail' && bEp.end === 'head') {
+        combined = [...sA.centerline, ...sB.centerline];
+        joinIdx = sA.centerline.length - 1;
+      } else if (aEp.end === 'head' && bEp.end === 'tail') {
+        combined = [...sB.centerline, ...sA.centerline];
+        joinIdx = sB.centerline.length - 1;
+      } else if (aEp.end === 'tail' && bEp.end === 'tail') {
+        combined = [...sA.centerline, ...[...sB.centerline].reverse()];
+        joinIdx = sA.centerline.length - 1;
+      } else { // head-head
+        combined = [...[...sA.centerline].reverse(), ...sB.centerline];
+        joinIdx = sA.centerline.length - 1;
+      }
+
+      // Check corner angles in a small window around the ACTUAL join index
+      const lo = Math.max(1, joinIdx - 4);
+      const hi = Math.min(combined.length - 2, joinIdx + 5);
+      let joinMaxDeg = 0;
+      for (let i = lo; i <= hi; i++) {
+        const d1 = new THREE.Vector3().subVectors(combined[i],     combined[i - 1]);
+        const d2 = new THREE.Vector3().subVectors(combined[i + 1], combined[i]);
+        if (d1.lengthSq() < 1e-14 || d2.lengthSq() < 1e-14) continue;
+        d1.normalize(); d2.normalize();
+        const cos = Math.max(-1, Math.min(1, d1.dot(d2)));
+        const ang = Math.acos(cos) * 180 / Math.PI;
+        if (ang > joinMaxDeg) joinMaxDeg = ang;
+      }
+      if (joinMaxDeg > 20) continue;
+
+      picked = { aEp, bEp, combined };
+      break;
+    }
+
+    if (!picked) break;
+    const { aEp, bEp, combined } = picked;
+    const sA = working[aEp.stripIdx];
+    const sB = working[bEp.stripIdx];
+
+    // Replace sA with the merged strip in-place
+    const merged: Strip = {
+      ...sA,
+      centerline: combined,
+      widths: new Array(combined.length).fill(sA.width),
+      junctions: [...sA.junctions, ...sB.junctions],
+    };
+    working[aEp.stripIdx] = merged;
+    idRemap.set(sB.id, sA.id);
+
+    // Remove sB from the working array (splice changes indices, so we
+    // rely on a fresh endpoint collection next pass).
+    working.splice(bEp.stripIdx, 1);
+
+    mergeCount++;
+  }
+
+  // Remap junction.stripIds to the final strip IDs
+  function resolveId(id: string): string {
+    let cur = id;
+    while (idRemap.has(cur)) cur = idRemap.get(cur)!;
+    return cur;
+  }
+  for (const j of junctions) {
+    j.stripIds = j.stripIds.map(resolveId);
+  }
+
+  console.log(
+    `[Kagome] Cross-family merge: ${mergeCount} merges  ` +
+    `${strips.length} → ${working.length} strips`,
+  );
+  return working;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
