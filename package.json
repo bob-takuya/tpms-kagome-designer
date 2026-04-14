@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:wasm": "bash native/build_wasm.sh",
     "preview": "vite preview"
   },
   "devDependencies": {

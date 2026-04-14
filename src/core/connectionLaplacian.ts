@@ -473,16 +473,40 @@ export function computeKnoppelStripeFields(
     eigenDir[i] = Math.atan2(eig.im[i], eig.re[i]) / 3;
   }
 
-  // Step 2: For each family, build twisted Laplacian and solve smallest eigenvector
+  return computeKnoppelStripeFieldsFromDirection(mesh, omega, eigenDir);
+}
+
+/**
+ * Knöppel 2015 stripe pattern solve, but with an externally supplied
+ * per-vertex base direction angle (measured in the same vertex tangent
+ * frames that `buildVertexFrames` produces).
+ *
+ * This is the hook used by the Vekhter 2019 "Weaving Geodesic Foliations"
+ * pipeline: the direction field comes from the Algorithm-1 curl-minimizing
+ * face field, lifted back to vertex angles, instead of the raw 3-RoSy
+ * eigenvector. The three kagome families are then θ, θ+60°, θ+120°.
+ */
+export function computeKnoppelStripeFieldsFromDirection(
+  mesh: HalfEdgeMesh,
+  omega: number,
+  baseDir: Float64Array,    // per-vertex direction angle in vertex frame
+): { re: Float64Array; im: Float64Array; amplitude: Float64Array }[] {
+  const { frames, areas } = ensureCache(mesh);
+
+  const n = mesh.vertices.length;
+  if (baseDir.length !== n) {
+    throw new Error(`baseDir length ${baseDir.length} ≠ vertex count ${n}`);
+  }
+
   const results: { re: Float64Array; im: Float64Array; amplitude: Float64Array }[] = [];
   for (let k = 0; k < 3; k++) {
     const dirAngles = new Float64Array(n);
-    for (let i = 0; i < n; i++) dirAngles[i] = eigenDir[i] + k * Math.PI / 3;
+    for (let i = 0; i < n; i++) dirAngles[i] = baseDir[i] + k * Math.PI / 3;
 
-    console.time(`[Knoppel] family ${k} twisted eigensolve`);
+    console.time(`[Knoppel/geodesic] family ${k} twisted eigensolve`);
     const L_k = buildKnoppelMatrix(mesh, frames, dirAngles, omega);
     const psi = inversePowerIteration(L_k, areas);
-    console.timeEnd(`[Knoppel] family ${k} twisted eigensolve`);
+    console.timeEnd(`[Knoppel/geodesic] family ${k} twisted eigensolve`);
 
     const amp = new Float64Array(n);
     for (let i = 0; i < n; i++) {
@@ -493,6 +517,43 @@ export function computeKnoppelStripeFields(
   }
 
   return results;
+}
+
+/**
+ * Expose the 3-RoSy connection-Laplacian eigenvector used internally by
+ * computeKnoppelStripeFields, so that other modules (the geodesic-field
+ * optimizer) can use it as an initial guess without re-solving.
+ *
+ * Returns the raw complex entries w_v = exp(3 i θ_v) per vertex.
+ */
+export function computeVertex3RoSyEigenvector(
+  mesh: HalfEdgeMesh,
+): { re: Float64Array; im: Float64Array } {
+  const { frames, areas } = ensureCache(mesh);
+  const cplxL = buildComplexCotanL(mesh, frames);
+  return inversePowerIteration(cplxL, areas);
+}
+
+/**
+ * Knöppel 2015 stripe eigensolve for a SINGLE family, given a direction
+ * angle per vertex. Used by the branched-cover pipeline: each layer of
+ * the 6-fold cover produces its own per-vertex direction, fed here to
+ * obtain that layer's scalar stripe field ψ.
+ */
+export function computeKnoppelStripeFieldForFamily(
+  mesh: HalfEdgeMesh,
+  omega: number,
+  dirAngles: Float64Array,
+): { re: Float64Array; im: Float64Array; amplitude: Float64Array } {
+  const { frames, areas } = ensureCache(mesh);
+  const L_k = buildKnoppelMatrix(mesh, frames, dirAngles, omega);
+  const psi = inversePowerIteration(L_k, areas);
+  const n = mesh.vertices.length;
+  const amp = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    amp[i] = Math.sqrt(psi.re[i] * psi.re[i] + psi.im[i] * psi.im[i]);
+  }
+  return { re: psi.re, im: psi.im, amplitude: amp };
 }
 
 /**
