@@ -100,29 +100,71 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
 // Event handlers
 window.addEventListener('regenerate-mesh', () => {
-  // regenerateMesh kicks off an async regeneratePattern internally.
-  // Wait for it to settle before rendering the 2D unfold view.
+  // regenerateMesh only builds the surface mesh now. It does NOT
+  // trigger the heavy WGF pipeline automatically. The user must press
+  // "Generate Pattern" to start that computation.
   regenerateMesh(ctx3D);
-  queueMicrotask(async () => {
-    // Poll briefly for the async pattern build to finish.
-    // (regeneratePattern mutates ctx3D.kagomePattern on completion.)
-    for (let i = 0; i < 300; i++) {
-      await new Promise(r => setTimeout(r, 20));
-      if (ctx3D.kagomePattern) break;
-    }
-    if (store.getState().viewMode === '2d') {
-      regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
-    }
-  });
-});
-
-window.addEventListener('regenerate-pattern', async () => {
-  await regeneratePattern(ctx3D);
-  const pat = ctx3D.kagomePattern;
   if (store.getState().viewMode === '2d') {
-    regenerateUnfold(ctx2D, pat, ctx3D.halfEdgeMesh, pat ? pat.junctions : []);
+    regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
   }
 });
+
+// ── Pattern generation driver (progress UI + async WGF pipeline) ────────────
+let wgfGenerating = false;
+async function runPatternGeneration(): Promise<void> {
+  if (wgfGenerating) return;      // prevent re-entry
+  if (!ctx3D.halfEdgeMesh) {
+    diag('[wgf] no mesh yet — press "Rebuild Mesh" first', true);
+    return;
+  }
+  wgfGenerating = true;
+
+  const genBtn  = document.getElementById('generate-btn') as HTMLButtonElement | null;
+  const progBox = document.getElementById('wgf-progress') as HTMLElement | null;
+  const label   = progBox?.querySelector('.wgf-progress-label') as HTMLElement | null;
+  const fill    = progBox?.querySelector('.wgf-progress-fill')  as HTMLElement | null;
+  const count   = progBox?.querySelector('.wgf-progress-count') as HTMLElement | null;
+
+  if (genBtn) { genBtn.disabled = true; genBtn.textContent = '⏳ Generating…'; }
+  if (progBox) progBox.style.display = 'block';
+  if (label)   label.textContent = 'Starting…';
+  if (fill)    fill.style.width = '0%';
+  if (count)   count.textContent = '';
+
+  const stageCount = 7;
+  try {
+    await regeneratePattern(ctx3D, (p) => {
+      // Compose overall progress from (coarse stage index) + (intra-stage
+      // fraction for the heavy per-component phase). This gives a
+      // monotonic bar that advances smoothly through long stages.
+      const intra = p.total > 0 ? p.cur / p.total : 0;
+      const overall = Math.min(1, Math.max(0, (p.stage + intra) / stageCount));
+      if (label) label.textContent = `§${p.stage}. ${p.label}`;
+      if (fill)  fill.style.width = `${(overall * 100).toFixed(1)}%`;
+      if (count && p.total > 1) count.textContent = `${p.cur} / ${p.total}`;
+      else if (count) count.textContent = '';
+    });
+
+    const pat = ctx3D.kagomePattern;
+    if (store.getState().viewMode === '2d') {
+      regenerateUnfold(ctx2D, pat, ctx3D.halfEdgeMesh, pat ? pat.junctions : []);
+    }
+    if (label)   label.textContent = '✓ Done';
+    if (fill)    fill.style.width = '100%';
+    // Fade the overlay out after a short delay.
+    setTimeout(() => { if (progBox) progBox.style.display = 'none'; }, 1500);
+  } catch (err) {
+    if (label)   label.textContent = '✗ ' + (err as Error).message;
+    if (fill)    fill.style.width = '0%';
+  } finally {
+    if (genBtn) { genBtn.disabled = false; genBtn.textContent = '✦ Generate Pattern'; }
+    wgfGenerating = false;
+  }
+}
+
+window.addEventListener('generate-pattern', () => { void runPatternGeneration(); });
+// Legacy alias — some components still dispatch 'regenerate-pattern'.
+window.addEventListener('regenerate-pattern', () => { void runPatternGeneration(); });
 
 window.addEventListener('regenerate-unfold', () => {
   regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
@@ -211,6 +253,7 @@ declare global {
   interface WindowEventMap {
     'regenerate-mesh': CustomEvent;
     'regenerate-pattern': CustomEvent;
+    'generate-pattern': CustomEvent;
     'regenerate-unfold': CustomEvent;
     'update-colors': CustomEvent;
     'export-dxf': CustomEvent;

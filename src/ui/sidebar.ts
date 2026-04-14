@@ -21,12 +21,23 @@ export function createSidebar(container: HTMLElement): void {
     </div>
   `;
 
-  // Inject Calculate button before sidebar content
+  // Inject the two primary action buttons before the sidebar content.
+  // "Rebuild Mesh" runs marching cubes + half-edge construction only
+  // (cheap). "Generate Pattern" runs the heavy Vekhter 2019 WGF
+  // pipeline in a Web Worker and streams progress. Splitting them lets
+  // the user tweak TPMS parameters and preview the surface geometry
+  // without triggering a minutes-long ribbon computation each time.
   const calcSection = document.createElement('div');
   calcSection.className = 'calculate-section';
   calcSection.innerHTML = `
-    <button id="calculate-btn" class="calculate-btn">▶ Calculate</button>
+    <button id="calculate-btn" class="calculate-btn">▶ Rebuild Mesh</button>
+    <button id="generate-btn" class="calculate-btn generate-btn">✦ Generate Pattern</button>
     <span id="calc-status" class="calc-status"></span>
+    <div id="wgf-progress" class="wgf-progress" style="display:none">
+      <div class="wgf-progress-label"></div>
+      <div class="wgf-progress-bar"><div class="wgf-progress-fill"></div></div>
+      <div class="wgf-progress-count"></div>
+    </div>
   `;
   sidebar.insertBefore(calcSection, sidebar.querySelector('.sidebar-content')!);
 
@@ -205,25 +216,29 @@ function createExportControls(): string {
 }
 
 function setupEventListeners(): void {
-  // ── Calculate button ────────────────────────────────────────────────────────
-  // Heavy computation (Phase 1+2+3) is only triggered here, not on slider drag.
+  // ── Rebuild Mesh button (cheap: marching cubes + half-edge) ────────────────
   document.getElementById('calculate-btn')?.addEventListener('click', () => {
     const btn    = document.getElementById('calculate-btn') as HTMLButtonElement;
     const status = document.getElementById('calc-status')!;
     btn.disabled = true;
-    btn.textContent = '⏳ Calculating…';
+    btn.textContent = '⏳ Rebuilding…';
     status.textContent = '';
 
-    // Yield to the browser so the button UI updates before blocking work starts
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         window.dispatchEvent(new CustomEvent('regenerate-mesh'));
         btn.disabled = false;
-        btn.textContent = '▶ Calculate';
+        btn.textContent = '▶ Rebuild Mesh';
         status.textContent = '✓';
         setTimeout(() => { status.textContent = ''; }, 1500);
       });
     });
+  });
+
+  // ── Generate Pattern button (heavy: full WGF pipeline in a Worker) ─────────
+  // Dispatches `generate-pattern`. main.ts owns the progress-UI wiring.
+  document.getElementById('generate-btn')?.addEventListener('click', () => {
+    window.dispatchEvent(new CustomEvent('generate-pattern'));
   });
 
   // ── Accordion toggle ────────────────────────────────────────────────────────
