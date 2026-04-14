@@ -35,7 +35,7 @@
 
 #include "mesh.h"
 #include "curl.h"
-#include <Eigen/SparseLU>
+#include <Eigen/IterativeLinearSolvers>
 #include <Eigen/SparseCholesky>
 
 namespace wgf {
@@ -159,20 +159,25 @@ inline Vec initialScaling(const Mesh& m,
     };
     auto a2normalize = [&](Vec& x) { x /= a2norm(x); };
 
-    A.makeCompressed();
-    Eigen::SparseLU<SpMat> solverA;
-    solverA.analyzePattern(A);
-    solverA.factorize(A);
-    if (solverA.info() != Eigen::Success) {
-        // Regularize the block and retry.
-        SpMat I(N, N);
+    // Add a small uniform Tikhonov so A is strictly positive definite
+    // and ConjugateGradient converges reliably on all meshes.
+    {
         std::vector<Trip> tI;
+        tI.reserve(N);
         for (int i = 0; i < N; ++i) tI.emplace_back(i, i, 1e-8);
-        I.setFromTriplets(tI.begin(), tI.end());
-        A = A + I;
-        A.makeCompressed();
-        solverA.analyzePattern(A);
-        solverA.factorize(A);
+        SpMat R(N, N);
+        R.setFromTriplets(tI.begin(), tI.end());
+        A = A + R;
+    }
+    A.makeCompressed();
+    Eigen::ConjugateGradient<SpMat, Eigen::Lower | Eigen::Upper,
+                             Eigen::DiagonalPreconditioner<double>> solverA;
+    solverA.setMaxIterations(1000);
+    solverA.setTolerance(1e-8);
+    solverA.compute(A);
+    if (solverA.info() != Eigen::Success) {
+        // Couldn't even set up CG — leave s at zero.
+        return Vec::Zero(nS);
     }
 
     // BBᵀ factor (used for projection onto ker B).

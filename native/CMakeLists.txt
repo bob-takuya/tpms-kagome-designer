@@ -28,18 +28,25 @@ endif()
 if(EMSCRIPTEN)
     add_executable(wgf_wasm src/wgf_main.cpp)
     set_target_properties(wgf_wasm PROPERTIES OUTPUT_NAME "wgf")
+    # C++ exception support — Eigen's solvers can throw std::runtime_error
+    # on numerical-issue paths; without -fexceptions those throws trap the
+    # WASM instance instead of propagating to our try/catch in wgf_run.
+    target_compile_options(wgf_wasm PRIVATE "-fexceptions")
     target_link_options(wgf_wasm PRIVATE
+        "-fexceptions"
         "-sMODULARIZE=1"
         "-sEXPORT_ES6=1"
         "-sEXPORT_NAME=createWgfModule"
         "-sSINGLE_FILE=1"
         "-sALLOW_MEMORY_GROWTH=1"
-        "-sINITIAL_MEMORY=33554432"
-        "-sMAXIMUM_MEMORY=536870912"
+        "-sINITIAL_MEMORY=67108864"
+        "-sMAXIMUM_MEMORY=2147483648"
+        "-sSTACK_SIZE=8388608"
         "-sENVIRONMENT=web,worker"
         "-sFILESYSTEM=0"
-        "-sEXPORTED_FUNCTIONS=['_malloc','_free','_wgf_run','_wgf_result_num_families','_wgf_result_num_segments','_wgf_result_segment_family','_wgf_result_segment_face','_wgf_result_segment_points','_wgf_result_free','_wgf_result_free_all','_wgf_alg1_curl_initial','_wgf_alg1_curl_final','_wgf_alg1_iters','_wgf_num_singularities']"
-        "-sEXPORTED_RUNTIME_METHODS=['HEAPF64','HEAPF32','HEAP32','HEAPU8','ccall','cwrap']"
+        "-sASSERTIONS=1"
+        "-sEXPORTED_FUNCTIONS=['_malloc','_free','_wgf_run','_wgf_last_error','_wgf_result_num_families','_wgf_result_num_segments','_wgf_result_segment_family','_wgf_result_segment_face','_wgf_result_segment_points','_wgf_result_free','_wgf_result_free_all','_wgf_alg1_curl_initial','_wgf_alg1_curl_final','_wgf_alg1_iters','_wgf_num_singularities']"
+        "-sEXPORTED_RUNTIME_METHODS=['HEAPF64','HEAPF32','HEAP32','HEAPU8','UTF8ToString','ccall','cwrap']"
         "-O3"
     )
     set_target_properties(wgf_wasm PROPERTIES
