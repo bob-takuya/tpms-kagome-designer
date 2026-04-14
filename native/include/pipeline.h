@@ -69,11 +69,18 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     reportProgress(STAGE_INIT, 0, 1, "Building face frames");
     auto frames = buildFaceFrames(base);
 
-    // 1. 6-RoSy (Knoeppel 2013)
+    // 1. 6-RoSy (Knoeppel 2013). We spend 150 inverse-power-iteration
+    // steps here because the cover build (§3) is extremely sensitive
+    // to the smoothness of the resulting phi: σ rounding across
+    // interior edges introduces spurious holonomy whenever (φ_i − φ_j + β)
+    // is far from an integer multiple of π/3, which in turn flags
+    // almost every vertex as a branch point and produces a useless
+    // fragmented cover. A well-converged eigenvector keeps the
+    // residual small enough for rounding to give a clean σ field.
     reportProgress(STAGE_ROSY, 0, 1, "Knoeppel 2013 6-RoSy eigensolve");
     SpMat L6 = build6RoSyReal(base, frames);
     Vec   M6 = face6RoSyMass(frames);
-    Vec   z  = solve6RoSy(L6, M6, 30, 1e-4);
+    Vec   z  = solve6RoSy(L6, M6, 150, 1e-4);
     Vec   phi = faceBaseAngleFromZ(z);
     Vec   w0base = initFaceFieldFromRosy(phi);
 
@@ -106,8 +113,31 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     }
 
     // 3. 6-fold branched cover
+    //
+    // Build σ / holonomy from the ALGORITHM-1-OPTIMIZED face field
+    // rather than the raw 6-RoSy eigenvector. The paper's §5.1 uses
+    // the raw RoSy field because their reference mesh has a well-
+    // converged Knoeppel 2013 direction field. In WASM / browser-
+    // resolution meshes the raw eigenvector is still noisy enough
+    // that σ = round((φ_i − φ_j + β) / (π/3)) mod 6 picks up spurious
+    // shifts on most edges, flagging nearly every vertex as a branch
+    // point and collapsing the cover to a trivially-fragmented mesh.
+    //
+    // The Alg 1 refined field is curl-optimized by construction:
+    // (φ_i − φ_j + β) ≈ 0 on almost every edge, so the rounded σ is
+    // almost always 0 and the holonomy walks produce a clean sparse
+    // set of branch points at genuine topological singularities.
+    //
+    // Holonomy is invariant under per-face representative choice
+    // (telescoping sum of the shifts cancels around any closed cycle),
+    // so we can feed raw atan2 values here without wrapping into
+    // [-π/6, π/6].
     reportProgress(STAGE_COVER_BUILD, 0, 1, "Building 6-fold branched cover");
-    auto cov = buildBranchedCover(base, frames, phi);
+    Vec phiRefined(base.nF());
+    for (int f = 0; f < base.nF(); ++f) {
+        phiRefined[f] = std::atan2(R1.w[2*f + 1], R1.w[2*f]);
+    }
+    auto cov = buildBranchedCover(base, frames, phiRefined);
     R.coverV = cov.mesh.nV();
     R.coverF = cov.mesh.nF();
     R.numSingular = cov.numSingular;
