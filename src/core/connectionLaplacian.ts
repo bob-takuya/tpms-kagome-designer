@@ -535,6 +535,28 @@ export function computeVertex3RoSyEigenvector(
 }
 
 /**
+ * Knöppel 2015 stripe eigensolve for a SINGLE family, given a direction
+ * angle per vertex. Used by the branched-cover pipeline: each layer of
+ * the 6-fold cover produces its own per-vertex direction, fed here to
+ * obtain that layer's scalar stripe field ψ.
+ */
+export function computeKnoppelStripeFieldForFamily(
+  mesh: HalfEdgeMesh,
+  omega: number,
+  dirAngles: Float64Array,
+): { re: Float64Array; im: Float64Array; amplitude: Float64Array } {
+  const { frames, areas } = ensureCache(mesh);
+  const L_k = buildKnoppelMatrix(mesh, frames, dirAngles, omega);
+  const psi = inversePowerIteration(L_k, areas);
+  const n = mesh.vertices.length;
+  const amp = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    amp[i] = Math.sqrt(psi.re[i] * psi.re[i] + psi.im[i] * psi.im[i]);
+  }
+  return { re: psi.re, im: psi.im, amplitude: amp };
+}
+
+/**
  * Build the twisted Laplacian for Knöppel 2015 stripe energy.
  *
  * dirAngles[v] = angle of the desired stripe direction in the local frame at vertex v.

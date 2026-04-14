@@ -68,16 +68,27 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 
 // Event handlers
 window.addEventListener('regenerate-mesh', () => {
+  // regenerateMesh kicks off an async regeneratePattern internally.
+  // Wait for it to settle before rendering the 2D unfold view.
   regenerateMesh(ctx3D);
-  if (store.getState().viewMode === '2d') {
-    regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
-  }
+  queueMicrotask(async () => {
+    // Poll briefly for the async pattern build to finish.
+    // (regeneratePattern mutates ctx3D.kagomePattern on completion.)
+    for (let i = 0; i < 300; i++) {
+      await new Promise(r => setTimeout(r, 20));
+      if (ctx3D.kagomePattern) break;
+    }
+    if (store.getState().viewMode === '2d') {
+      regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
+    }
+  });
 });
 
-window.addEventListener('regenerate-pattern', () => {
-  regeneratePattern(ctx3D);
+window.addEventListener('regenerate-pattern', async () => {
+  await regeneratePattern(ctx3D);
+  const pat = ctx3D.kagomePattern;
   if (store.getState().viewMode === '2d') {
-    regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
+    regenerateUnfold(ctx2D, pat, ctx3D.halfEdgeMesh, pat ? pat.junctions : []);
   }
 });
 
