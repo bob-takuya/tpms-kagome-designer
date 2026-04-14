@@ -26,21 +26,26 @@ const mesh = buildHalfEdgeMesh(meshData);
 console.log(`[smoke] mesh: V=${mesh.vertices.length} F=${mesh.faces.length}`);
 
 const omega = 4;
-const { fields, field } = computeGeodesicFoliationStripeFields(mesh, omega, {
-  maxIter: 30,
-  tol:     1e-5,
-  epsilon: 1e-6,
-});
 
-console.log(
-  `[smoke] Algorithm 1: |Cŵ|: ${field.initialCurl.toExponential(3)} → ` +
-  `${field.finalCurl.toExponential(3)} ` +
-  `(${((1 - field.finalCurl / Math.max(field.initialCurl, 1e-30)) * 100).toFixed(1)}% reduction) ` +
-  `in ${field.iterations} iters`,
-);
+for (const useCover of [false, true]) {
+  console.log(`\n=== useCover=${useCover} ===`);
+  const { fields, field } = computeGeodesicFoliationStripeFields(mesh, omega, {
+    maxIter: 30,
+    tol:     1e-5,
+    epsilon: 1e-6,
+    useCover,
+  });
 
-for (let k = 0; k < 3; k++) {
-  const iso = traceZeroCrossings(mesh, fields[k].re, fields[k].amplitude, 0.1);
-  const totalSeg = iso.reduce((s, il) => s + il.faceIndices.length, 0);
-  console.log(`[smoke] family ${k}: ${iso.length} isoline components, ${totalSeg} segments`);
+  console.log(
+    `[smoke] Algorithm 1: |Cŵ|: ${field.initialCurl.toExponential(3)} → ` +
+    `${field.finalCurl.toExponential(3)} ` +
+    `(${((1 - field.finalCurl / Math.max(field.initialCurl, 1e-30)) * 100).toFixed(1)}% reduction) ` +
+    `in ${field.iterations} iters`,
+  );
+
+  for (let k = 0; k < 3; k++) {
+    const iso = traceZeroCrossings(mesh, fields[k].re, fields[k].amplitude, 0.1);
+    const totalSeg = iso.reduce((s, il) => s + il.faceIndices.length, 0);
+    console.log(`[smoke] family ${k}: ${iso.length} isoline components, ${totalSeg} segments`);
+  }
 }

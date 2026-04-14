@@ -269,6 +269,28 @@ export function initFieldFromVertex3RoSy(
   return w;
 }
 
+/**
+ * Same as initFieldFromVertex3RoSy but returns only the canonical angle
+ * per face, φ_f ∈ (−π/6, π/6]. Used by the branched-cover construction
+ * (branchedCover.ts) to initialize the 6 layer angles as φ_f + k·π/3.
+ */
+export function computeFaceBaseAngle(
+  mesh: HalfEdgeMesh,
+  frames: FaceFrame[],
+  vertexT1: THREE.Vector3[],
+  vertexT2: THREE.Vector3[],
+  re: Float64Array,
+  im: Float64Array,
+): Float64Array {
+  const w = initFieldFromVertex3RoSy(mesh, frames, vertexT1, vertexT2, re, im);
+  const F = mesh.faces.length;
+  const angles = new Float64Array(F);
+  for (let f = 0; f < F; f++) {
+    angles[f] = Math.atan2(w[2 * f + 1], w[2 * f]);
+  }
+  return angles;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Algorithm 1 — alternating minimization (δ-projection + face normalization)
 // ─────────────────────────────────────────────────────────────────────────────

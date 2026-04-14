@@ -1,91 +1,94 @@
 /**
  * foliationPipeline.ts
  *
- * End-to-end wrapper for the Vekhter et al. 2019 "Weaving Geodesic
- * Foliations" direction-field stage, plumbed into the existing Knöppel
- * 2015 stripe eigensolve for per-family scalar integration.
+ * Thin TypeScript façade over the Vekhter 2019 "Weaving Geodesic
+ * Foliations" WASM module (built from native/src/wgf_main.cpp via
+ * Emscripten). The WASM module implements the full paper pipeline:
  *
- * Pipeline:
- *   1. Solve the Knöppel 2013 3-RoSy connection-Laplacian eigenproblem
- *      on vertices to get an initial smooth direction field.
- *   2. Lift that field to face-based unit vectors (6-RoSy canonical
- *      representative per face).
- *   3. Run Algorithm 1 from the paper — alternating δ-projection onto
- *      the kernel of the discrete curl operator + per-face unit
- *      normalization — to make the field as geodesic as possible.
- *   4. Push the resulting ŵ back to per-vertex direction angles.
- *   5. Feed those angles into the Knöppel 2015 stripe eigensolve
- *      (three twisted-Laplacian eigenproblems, one per family).
+ *   1. Knöppel et al. 2013 globally-optimal 6-RoSy direction field
+ *      (connection-Laplacian smallest eigenvector).
+ *   2. Algorithm 1 (paper §3.3, eq. 5): λ-sharpened alternating
+ *      minimization with the full KKT system solved via Eigen's
+ *      SparseLU.
+ *   3. 6-fold branched cover construction (paper §5.1) with per-edge
+ *      cyclic-shift permutation σ ∈ ℤ/6ℤ, vertex-holonomy detection
+ *      and puncturing of branch-point vertices, and connected-component
+ *      decomposition.
+ *   4. Per-component Algorithm 2 (paper §4, eq. 7): initial scaling s
+ *      via generalized-eigenproblem inverse power iteration,
+ *      anti-aliasing rescale, and joint (s, θ) optimization (eq. 8).
+ *   5. θ zero-crossing extraction on the cover, projection back to the
+ *      base mesh with family labels derived from the layer index.
  *
- * The output is API-compatible with computeKnoppelStripeFields: three
- * complex scalar fields ψ_k whose Re-zero-crossings are the kagome
- * isolines traced downstream.
+ * This file packs the half-edge mesh vertices/faces into the WASM
+ * heap, invokes wgf_run, and repacks the returned segments into the
+ * Isoline[] form consumed downstream by kagome.ts.
  */
 
+import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
-import {
-  computeKnoppelStripeFieldsFromDirection,
-  computeVertex3RoSyEigenvector,
-} from './connectionLaplacian';
-import {
-  buildFaceFrames,
-  buildCurlOperator,
-  buildVertexTangentFrames,
-  initFieldFromVertex3RoSy,
-  optimizeGeodesicField,
-  faceFieldToVertexAngles,
-  type GeodesicFieldResult,
-} from './geodesicField';
+import type { Isoline } from './connectionLaplacian';
+import { runWgfPipeline, type WgfResult, type WgfOptions } from './wgfWasm';
 
-export interface GeodesicFoliationOptions {
-  maxIter?: number;      // Algorithm 1 outer iterations
-  tol?: number;          // convergence tol on per-face update magnitude
-  epsilon?: number;      // Tikhonov for CCᵀ solve
-  cgMaxIter?: number;    // CG inner iters
-  cgTol?: number;        // CG residual tolerance
-}
+export type { WgfOptions };
 
 export interface GeodesicFoliationResult {
-  fields: { re: Float64Array; im: Float64Array; amplitude: Float64Array }[];
-  field: GeodesicFieldResult;     // diagnostics for the geodesic step
+  isolinesByFamily: [Isoline[], Isoline[], Isoline[]];
+  initialCurl: number;
+  finalCurl:   number;
+  iterations:  number;
+  numSingular: number;
 }
 
-export function computeGeodesicFoliationStripeFields(
+/**
+ * Run the Vekhter 2019 WGF pipeline on a half-edge mesh and return
+ * per-family isolines in the same shape the downstream kagome builder
+ * expects.
+ */
+export async function computeGeodesicFoliationIsolines(
   mesh: HalfEdgeMesh,
-  omega: number,
-  opts: GeodesicFoliationOptions = {},
-): GeodesicFoliationResult {
-  // ── 1. Initial 3-RoSy direction field ─────────────────────────────────────
-  console.time('[Geodesic] 3-RoSy eigenvector');
-  const { re, im } = computeVertex3RoSyEigenvector(mesh);
-  console.timeEnd('[Geodesic] 3-RoSy eigenvector');
+  opts: WgfOptions = {},
+): Promise<GeodesicFoliationResult> {
 
-  // ── 2. Lift to face-based unit field ──────────────────────────────────────
-  const frames = buildFaceFrames(mesh);
-  const { t1, t2 } = buildVertexTangentFrames(mesh);
-  const w0 = initFieldFromVertex3RoSy(mesh, frames, t1, t2, re, im);
-
-  // ── 3. Algorithm 1 — curl-minimizing δ-projection ─────────────────────────
-  console.time('[Geodesic] curl operator build');
-  const C = buildCurlOperator(mesh, frames);
-  console.timeEnd('[Geodesic] curl operator build');
-
-  console.time('[Geodesic] Algorithm 1');
-  const field = optimizeGeodesicField(C, w0, opts);
-  console.timeEnd('[Geodesic] Algorithm 1');
+  const t0 = performance.now();
+  const res: WgfResult = await runWgfPipeline(mesh, opts);
+  const t1 = performance.now();
 
   console.log(
-    `[Geodesic] |Cŵ|: ${field.initialCurl.toExponential(3)} → ` +
-    `${field.finalCurl.toExponential(3)} ` +
-    `(${((1 - field.finalCurl / Math.max(field.initialCurl, 1e-30)) * 100).toFixed(1)}% ↓) ` +
-    `in ${field.iterations} iters`,
+    `[WGF] ${res.segments.length} segments in ${(t1 - t0).toFixed(0)} ms | ` +
+    `curl ${res.initialCurl.toExponential(3)} → ${res.finalCurl.toExponential(3)} ` +
+    `in ${res.iterations} iters | ${res.numSingular} singular base vertices`,
   );
 
-  // ── 4. Lift face field back to per-vertex direction angles ────────────────
-  const baseDir = faceFieldToVertexAngles(mesh, frames, t1, t2, field.w);
+  // Partition segments by family and repack into the Isoline[] layout.
+  // kagome.ts interprets iso.points as a flat list of segment endpoints
+  // (iso.points[2k], iso.points[2k + 1]) with iso.faceIndices[k] being
+  // the face index of the k-th segment. One Isoline per family is all
+  // we need — the downstream stitcher chains them into polylines.
+  const perFamPoints: [THREE.Vector3[], THREE.Vector3[], THREE.Vector3[]] = [[], [], []];
+  const perFamFaces:  [number[],        number[],        number[]]        = [[], [], []];
 
-  // ── 5. Knöppel 2015 stripe eigensolve per family ──────────────────────────
-  const fields = computeKnoppelStripeFieldsFromDirection(mesh, omega, baseDir);
+  for (const s of res.segments) {
+    const fam = s.family % 3;
+    perFamPoints[fam].push(new THREE.Vector3(s.ax, s.ay, s.az));
+    perFamPoints[fam].push(new THREE.Vector3(s.bx, s.by, s.bz));
+    perFamFaces[fam].push(s.faceIdx);
+  }
 
-  return { fields, field };
+  const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
+  for (let k = 0; k < 3; k++) {
+    if (perFamPoints[k].length === 0) continue;
+    isolinesByFamily[k].push({
+      points: perFamPoints[k],
+      faceIndices: perFamFaces[k],
+    });
+  }
+
+  return {
+    isolinesByFamily,
+    initialCurl: res.initialCurl,
+    finalCurl:   res.finalCurl,
+    iterations:  res.iterations,
+    numSingular: res.numSingular,
+  };
 }
