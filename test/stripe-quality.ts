@@ -47,7 +47,7 @@ const DEFAULT_PARAMS: TestParams = {
   baseT:       0,
   bboxMin:     -Math.PI,
   bboxMax:     Math.PI,
-  gridRes:     40,
+  gridRes:     50,
   numIsolines: 8,
   density:     4.0,
   holeRadius:  0.04,
@@ -286,7 +286,7 @@ function runPipeline(params: TestParams, mode: StripeMode = 'guided'): {
     const psi = computeKnoppelStripeFields(mesh, omega);
     stripeFields = [psi[0].re, psi[1].re, psi[2].re];
     for (let k = 0; k < 3; k++) {
-      isolines[k] = traceZeroCrossings(mesh, psi[k].re);
+      isolines[k] = traceZeroCrossings(mesh, psi[k].re, psi[k].amplitude, 0.05);
     }
   } else if (mode === 'guided') {
     const guided = computeGuidedStripeFields(mesh, params.density);

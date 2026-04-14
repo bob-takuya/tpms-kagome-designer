@@ -233,6 +233,12 @@ export function buildKagomePattern(
   }
   console.groupEnd();
 
+  // ── 1b. Reconnect compatible fragments within each family ───────────────
+  // When the zero-crossing extraction skips singular faces, long strips get
+  // cut into fragments.  Merge fragments whose endpoints are close in 3D AND
+  // whose exit/entry tangents align tightly.
+  reconnectFragments(families, allStrips);
+
   // ── 2. Estimate world-space strip widths: per-isoline, inter-isoline spacing only ──
   //
   // Strip IDs: single-chain = "A3"; multi-chain = "A3_1", "A3_2", ...
@@ -808,6 +814,137 @@ export function generateJunctionHoles(
 // either).  This prevents topologically bad stitches from contaminating
 // otherwise good strips.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reconnect compatible strip fragments within each family.
+//
+// The Knöppel singularity filter cuts strips at |ψ| ≈ 0 points, producing
+// fragments.  This function merges two fragments X and Y if:
+//   (a) an endpoint of X is close (in 3D) to an endpoint of Y
+//   (b) the two tangent directions at those endpoints align (< 40°)
+//   (c) X and Y belong to the same family
+//
+// Merging replaces X and Y with a single strip containing the points of X
+// followed by the points of Y (reversed if needed).  The junction point is
+// a straight-line bridge; subsequent smoothing makes it C¹-continuous.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function reconnectFragments(
+  families: [Strip[], Strip[], Strip[]],
+  allStrips: Strip[],
+): void {
+  const MAX_GAP = 0.5;        // world units (grid=50 edge ≈ 0.13)
+  const MAX_TANGENT_DEV = 20; // degrees
+  const cosMin = Math.cos(MAX_TANGENT_DEV * Math.PI / 180);
+
+  let totalMerges = 0;
+  for (let k = 0; k < 3; k++) {
+    const fam = families[k];
+    let famMerges = 0;
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+
+      // Build endpoint table for this family
+      type EP = { stripIdx: number; end: 'head' | 'tail' };
+      const eps: Array<EP & { pos: THREE.Vector3; tan: THREE.Vector3 }> = [];
+      for (let si = 0; si < fam.length; si++) {
+        const cl = fam[si].centerline;
+        if (cl.length < 3) continue;
+        // head: tangent from point[1] to point[0] (outward)
+        const hTan = new THREE.Vector3().subVectors(cl[0], cl[1]).normalize();
+        // tail: tangent from point[n-2] to point[n-1] (outward)
+        const tTan = new THREE.Vector3().subVectors(cl[cl.length - 1], cl[cl.length - 2]).normalize();
+        eps.push({ stripIdx: si, end: 'head', pos: cl[0].clone(),                 tan: hTan });
+        eps.push({ stripIdx: si, end: 'tail', pos: cl[cl.length - 1].clone(),     tan: tTan });
+      }
+
+      // Try to find a mergeable pair
+      let bestPair: { a: number; b: number; score: number } | null = null;
+      for (let i = 0; i < eps.length; i++) {
+        for (let j = i + 1; j < eps.length; j++) {
+          if (eps[i].stripIdx === eps[j].stripIdx) continue;
+          const d = eps[i].pos.distanceTo(eps[j].pos);
+          if (d > MAX_GAP) continue;
+          // Tangents should be anti-parallel (they both point outward)
+          const tDot = -eps[i].tan.dot(eps[j].tan);
+          if (tDot < cosMin) continue;
+          const score = tDot - d / MAX_GAP; // higher = better
+          if (!bestPair || score > bestPair.score) {
+            bestPair = { a: i, b: j, score };
+          }
+        }
+      }
+
+      if (!bestPair) break;
+
+      // Merge strips (a and b)
+      const aEp = eps[bestPair.a];
+      const bEp = eps[bestPair.b];
+      const aStrip = fam[aEp.stripIdx];
+      const bStrip = fam[bEp.stripIdx];
+
+      // Build combined polyline depending on end configurations:
+      //   tail→head: [aPoints ..., bPoints ...]
+      //   head→tail: reverse a, append b reversed
+      //   tail→tail: [aPoints, reverse(bPoints)]
+      //   head→head: [reverse(aPoints), bPoints]
+      let combined: THREE.Vector3[];
+      if (aEp.end === 'tail' && bEp.end === 'head') {
+        combined = [...aStrip.centerline, ...bStrip.centerline];
+      } else if (aEp.end === 'head' && bEp.end === 'tail') {
+        combined = [...bStrip.centerline, ...aStrip.centerline];
+      } else if (aEp.end === 'tail' && bEp.end === 'tail') {
+        combined = [...aStrip.centerline, ...[...bStrip.centerline].reverse()];
+      } else { // head-head
+        combined = [...[...aStrip.centerline].reverse(), ...bStrip.centerline];
+      }
+
+      // Reject merges that produce a sharp bend at the join
+      const nA = aStrip.centerline.length;
+      const joinIdx = (aEp.end === 'head' || (aEp.end === 'tail' && bEp.end === 'tail'))
+        ? nA - 1 : nA - 1; // approximate; we just check near the join
+      const ji = Math.min(Math.max(joinIdx, 1), combined.length - 2);
+      const d1 = new THREE.Vector3().subVectors(combined[ji], combined[ji - 1]);
+      const d2 = new THREE.Vector3().subVectors(combined[ji + 1], combined[ji]);
+      if (d1.lengthSq() > 1e-14 && d2.lengthSq() > 1e-14) {
+        d1.normalize(); d2.normalize();
+        const cosJoin = d1.dot(d2);
+        if (cosJoin < Math.cos(30 * Math.PI / 180)) {
+          // Sharp join — skip this merge and try again without this pair
+          continue;
+        }
+      }
+
+      // Smooth 5 points around the join to remove the discontinuity
+      const jLo = Math.max(1, ji - 2);
+      const jHi = Math.min(combined.length - 2, ji + 2);
+      for (let pass = 0; pass < 3; pass++) {
+        for (let q = jLo; q <= jHi; q++) {
+          combined[q] = new THREE.Vector3()
+            .addScaledVector(combined[q - 1], 0.25)
+            .addScaledVector(combined[q],     0.50)
+            .addScaledVector(combined[q + 1], 0.25);
+        }
+      }
+
+      aStrip.centerline = combined;
+      aStrip.widths = new Array(combined.length).fill(aStrip.width);
+
+      // Remove bStrip from the family and allStrips
+      const bIdxInFam = fam.indexOf(bStrip);
+      if (bIdxInFam >= 0) fam.splice(bIdxInFam, 1);
+      const bIdxInAll = allStrips.indexOf(bStrip);
+      if (bIdxInAll >= 0) allStrips.splice(bIdxInAll, 1);
+
+      famMerges++;
+      changed = true;
+    }
+    totalMerges += famMerges;
+  }
+  console.log(`[Kagome] Reconnected ${totalMerges} fragment pair(s)`);
+}
 
 /**
  * Return the longest contiguous sub-polyline free of sharp corners.

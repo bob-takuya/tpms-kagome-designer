@@ -447,8 +447,10 @@ function ensureCache(mesh: HalfEdgeMesh): { frames: VertexFrames; areas: Float64
 /**
  * Knöppel 2015 stripe pattern computation.
  *
- * Returns THREE complex fields (Re, Im per vertex) — one per kagome family.
- * Stripes are extracted from Re(ψ) zero-crossings by traceZeroCrossings.
+ * Returns THREE complex fields (Re, Im, amplitude per vertex) — one per
+ * kagome family.  Stripes are extracted from Re(ψ) zero-crossings by
+ * traceZeroCrossings; low-amplitude faces (|ψ| ≈ 0) are singularities
+ * and should be skipped.
  *
  * @param omega  Stripe frequency (radians per world unit along X).
  *               Higher = more stripes.  Typical: 3-6 for TPMS at grid=40.
@@ -456,7 +458,7 @@ function ensureCache(mesh: HalfEdgeMesh): { frames: VertexFrames; areas: Float64
 export function computeKnoppelStripeFields(
   mesh: HalfEdgeMesh,
   omega: number = 4.0,
-): { re: Float64Array; im: Float64Array }[] {
+): { re: Float64Array; im: Float64Array; amplitude: Float64Array }[] {
   const { frames, areas } = ensureCache(mesh);
 
   // Step 1: 3-RoSy eigenvector to get direction field
@@ -472,7 +474,7 @@ export function computeKnoppelStripeFields(
   }
 
   // Step 2: For each family, build twisted Laplacian and solve smallest eigenvector
-  const results: { re: Float64Array; im: Float64Array }[] = [];
+  const results: { re: Float64Array; im: Float64Array; amplitude: Float64Array }[] = [];
   for (let k = 0; k < 3; k++) {
     const dirAngles = new Float64Array(n);
     for (let i = 0; i < n; i++) dirAngles[i] = eigenDir[i] + k * Math.PI / 3;
@@ -482,7 +484,12 @@ export function computeKnoppelStripeFields(
     const psi = inversePowerIteration(L_k, areas);
     console.timeEnd(`[Knoppel] family ${k} twisted eigensolve`);
 
-    results.push({ re: psi.re, im: psi.im });
+    const amp = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      amp[i] = Math.sqrt(psi.re[i] * psi.re[i] + psi.im[i] * psi.im[i]);
+    }
+
+    results.push({ re: psi.re, im: psi.im, amplitude: amp });
   }
 
   return results;
@@ -567,19 +574,40 @@ function buildKnoppelMatrix(
  * For each face where sign(f) changes across edges, emit a line segment
  * connecting the two zero-crossing points.  This is marching triangles
  * at level = 0, used for extracting stripes from Re(ψ) in the Knöppel pipeline.
+ *
+ * If `amplitude` is provided, faces where min(|ψ|) < ampRatio * max(|ψ|)
+ * are skipped — these are singularities where the stripe direction is
+ * undefined and zero-crossings produce spurious U-turns.
  */
 export function traceZeroCrossings(
   mesh: HalfEdgeMesh,
   f: Float64Array,
+  amplitude?: Float64Array,
+  ampRatio: number = 0.10,
 ): Isoline[] {
   const pts: THREE.Vector3[] = [];
   const faceIds: number[] = [];
 
+  let ampThresh = -Infinity;
+  if (amplitude) {
+    let maxAmp = 0;
+    for (let i = 0; i < amplitude.length; i++) {
+      if (amplitude[i] > maxAmp) maxAmp = amplitude[i];
+    }
+    ampThresh = ampRatio * maxAmp;
+  }
+
   for (let fi = 0; fi < mesh.faces.length; fi++) {
     const face = mesh.faces[fi];
     const v = [face[0], face[1], face[2]];
-    const fv = [f[v[0]], f[v[1]], f[v[2]]];
 
+    // Skip singular faces (|ψ| ≈ 0 at any vertex)
+    if (amplitude) {
+      const minAmp = Math.min(amplitude[v[0]], amplitude[v[1]], amplitude[v[2]]);
+      if (minAmp < ampThresh) continue;
+    }
+
+    const fv = [f[v[0]], f[v[1]], f[v[2]]];
     const crossPts: THREE.Vector3[] = [];
     for (let e = 0; e < 3; e++) {
       const a = e, b = (e + 1) % 3;
