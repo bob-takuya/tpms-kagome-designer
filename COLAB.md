@@ -32,10 +32,11 @@ flow is:
 #   2. Fetches Eigen 3.4.0 into native/third_party/eigen.
 #   3. Builds the wgf_cli native binary with -O3 -ffast-math.
 #   4. Prompts you to upload wgf-input.txt (exported from the browser).
-#   5. Runs the pipeline: ./wgf_cli < input > output
+#   5. Runs the pipeline: ./wgf_cli < input > output (streaming stderr
+#      live to the Colab output so you can watch the stages advance).
 #   6. Auto-downloads wgf-output.txt to your machine.
 
-import os, subprocess, sys
+import os, subprocess
 
 REPO = "https://github.com/bob-takuya/tpms-kagome-designer.git"
 ROOT = "/content/tpms-kagome-designer"
@@ -55,16 +56,27 @@ print("\nUpload your wgf-input.txt (exported from the browser sidebar)")
 uploaded = files.upload()
 input_name = next(iter(uploaded))
 
-# 5. Run the pipeline.
+# 5. Run the pipeline. We use Popen + PIPE for stderr instead of
+#    stderr=sys.stderr, because Colab's IPython replaces sys.stderr with
+#    an IOStream object that lacks a real fileno() — which causes
+#    subprocess.run(..., stderr=sys.stderr) to raise UnsupportedOperation.
 out_path = "/content/wgf-output.txt"
 print(f"\nRunning wgf_cli on {input_name} ...\n")
 with open(input_name, "rb") as fin, open(out_path, "wb") as fout:
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [f"{ROOT}/native/build/wgf_cli"],
-        stdin=fin, stdout=fout, stderr=sys.stderr,
+        stdin=fin,
+        stdout=fout,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
     )
-if proc.returncode != 0:
-    raise RuntimeError(f"wgf_cli exited with {proc.returncode}")
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        print(line, end="", flush=True)
+    rc = proc.wait()
+if rc != 0:
+    raise RuntimeError(f"wgf_cli exited with {rc}")
 
 # 6. Auto-download the result.
 print("\nDone. Downloading wgf-output.txt ...")
