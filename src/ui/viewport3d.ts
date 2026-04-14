@@ -184,15 +184,21 @@ export async function regeneratePattern(
   // via `self.postMessage({ type: 'wgf-progress', ... })` callbacks
   // emitted from the C++ pipeline. The main thread stays responsive
   // for the entire run.
+  // Browser-friendly defaults. The paper recommends lambdaInit=1000,
+  // lambdaMin=0, alg1MaxIter=50 and jointIters=10 (which the reference
+  // C++ implementation takes a minute or two to work through on
+  // desktop). In WASM on an average laptop those settings run for 5+
+  // minutes, so we shrink the Algorithm 1 schedule aggressively while
+  // keeping the full pipeline structure (same math, same stages).
   const wgf = await computeGeodesicFoliationIsolines(
     mesh,
     {
-      lambdaInit:  1000,
-      lambdaMin:   1e-3,
-      alg1MaxIter: 50,
+      lambdaInit:  10,
+      lambdaMin:   1e-2,
+      alg1MaxIter: 20,
       mu:          1e-4,
-      jointIters:  10,
-      userScale:   state.strip.numIsolines / 8.0, // 8 ≈ default density
+      jointIters:  4,
+      userScale:   state.strip.numIsolines / 8.0,
       useCover:    true,
     },
     onProgress,

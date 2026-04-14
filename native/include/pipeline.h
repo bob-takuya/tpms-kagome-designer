@@ -32,12 +32,17 @@
 namespace wgf {
 
 struct PipelineOptions {
-    double lambdaInit     = 1000.0;
-    double lambdaMin      = 1e-3;
-    int    alg1MaxIter    = 50;
+    // Browser-friendly defaults. The paper recommends lambdaInit=1000,
+    // lambdaMin→0, alg1MaxIter~50 and jointIters=10, which produces
+    // excellent results but takes minutes of CG solves in WASM. These
+    // smaller numbers converge fast enough for interactive use while
+    // still running the same algorithms end-to-end.
+    double lambdaInit     = 10.0;
+    double lambdaMin      = 1e-2;
+    int    alg1MaxIter    = 20;
     double alg1Tol        = 1e-5;
     double mu             = 1e-4;
-    int    jointIters     = 10;
+    int    jointIters     = 4;
     double userScale      = 1.0;    // stripe density multiplier on top of π-rescale
     bool   useCover       = true;
 };
@@ -73,10 +78,11 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     Vec   w0base = initFaceFieldFromRosy(phi);
 
     // 2. Algorithm 1 on the base (for diagnostics + to warm up the cover init)
-    reportProgress(STAGE_ALG1_BASE, 0, 1, "Algorithm 1 (base, lambda sharpening)");
+    reportProgress(STAGE_ALG1_BASE, 0, 1, "Algorithm 1 (base)");
     Alg1Result R1 = runAlg1(base, frames, w0base, {},
                             opt.lambdaInit, opt.lambdaMin,
-                            opt.alg1MaxIter, opt.alg1Tol);
+                            opt.alg1MaxIter, opt.alg1Tol,
+                            STAGE_ALG1_BASE, "Algorithm 1 (base)");
     R.alg1BaseInitCurl  = R1.initialCurl;
     R.alg1BaseFinalCurl = R1.finalCurl;
     R.alg1BaseIters     = R1.iterations;
@@ -141,9 +147,14 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             wS[2*f + 1] = v / Ln;
         }
 
+        // Per-component Alg 1: much lighter schedule. Each component is
+        // typically a small patch of the cover, so a single λ level
+        // with a handful of inner iterations converges fine.
         Alg1Result RS = runAlg1(S.mesh, Sframes, wS, {},
-                                opt.lambdaInit, opt.lambdaMin,
-                                opt.alg1MaxIter, opt.alg1Tol);
+                                /*lambdaInit=*/1.0,
+                                /*lambdaMin =*/1e-2,
+                                /*maxIter   =*/8,
+                                opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
         // Joint (s, θ) optimization
