@@ -6,8 +6,8 @@ import { marchingCubes } from '../core/marchingCubes';
 import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
-import { computeKnoppelStripeFields, traceZeroCrossings } from '../core/connectionLaplacian';
 import type { Isoline } from '../core/connectionLaplacian';
+import { computeGeodesicFoliationIsolines } from '../core/foliationPipeline';
 import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
 import { buildAllStripMeshes } from '../core/stripMesh';
@@ -154,10 +154,10 @@ export function regenerateMesh(ctx: Viewport3DContext): void {
     faces: meshData.indices.length / 3,
   });
 
-  regeneratePattern(ctx);
+  void regeneratePattern(ctx);
 }
 
-export function regeneratePattern(ctx: Viewport3DContext): void {
+export async function regeneratePattern(ctx: Viewport3DContext): Promise<void> {
   if (!ctx.halfEdgeMesh) return;
 
   const state = store.getState();
@@ -166,24 +166,35 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // Clear previous overlays
   clearGroup(ctx.stripMeshes);
 
-  // ── Stage 2 – Stripe fields via Knöppel 2015 "Stripe Patterns on Surfaces" ──
-  // Twisted eigenvalue problem per family: L_k ψ = λ M ψ where
-  //   L_k has edge phases ω·⟨e_ij, X_k⟩ encoded in the off-diagonals.
-  // Stripes = zero-crossings of Re(ψ) per triangle face (full coverage).
-  // U-turns at singularities are prevented by 45° stitching constraint in
-  // kagome.ts, not by filtering zero-crossings.
-  const omega = Math.max(1, state.strip.numIsolines / 2);
-  const psi = computeKnoppelStripeFields(mesh, omega);
+  // ── Stage 2 – Vekhter et al. 2019 "Weaving Geodesic Foliations" ──────
+  //
+  // Full paper pipeline in C++/Eigen compiled to WebAssembly:
+  //   1. Knöppel 2013 globally-optimal 6-RoSy direction field
+  //   2. Algorithm 1 (λ-sharpened KKT + SparseLU)
+  //   3. 6-fold branched cover with σ permutation + puncturing
+  //   4. Per-component Algorithm 2 (initial s via gen. eigenproblem)
+  //   5. Eq. 8 joint (s, θ) optimization
+  //   6. θ isoline extraction + projection to base families
+  const wgf = await computeGeodesicFoliationIsolines(mesh, {
+    lambdaInit:  1000,
+    lambdaMin:   1e-3,
+    alg1MaxIter: 50,
+    mu:          1e-4,
+    jointIters:  10,
+    userScale:   state.strip.numIsolines / 8.0, // 8 ≈ default density
+    useCover:    true,
+  });
 
+  // Downstream code expects a (Re,Im,amplitude) triple per family and an
+  // isoline-per-family list. We only populate the isolines — the stripe
+  // fields go unused by kagome.ts when fed pre-traced isolines.
+  const isolinesByFamily = wgf.isolinesByFamily;
   const stripeFields: [Float64Array, Float64Array, Float64Array] = [
-    psi[0].re, psi[1].re, psi[2].re,
+    new Float64Array(mesh.vertices.length),
+    new Float64Array(mesh.vertices.length),
+    new Float64Array(mesh.vertices.length),
   ];
   ctx.stripeFields = stripeFields;
-
-  const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
-  for (let k = 0; k < 3; k++) {
-    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re);
-  }
   ctx.isolinesByFamily = isolinesByFamily;
 
   // ── Stage 3 – Kagome strip extraction ─────────────────────────────────────

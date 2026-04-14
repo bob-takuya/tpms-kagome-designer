@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# Native / WASM build artefacts
+native/third_party/eigen/
+native/build/
+native/build-wasm/
+public/wasm/wgf.wasm
+public/wasm/wgf.js
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
