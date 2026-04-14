@@ -1,36 +1,33 @@
 /**
  * foliationPipeline.ts
  *
- * Thin TypeScript façade over the Vekhter 2019 "Weaving Geodesic
- * Foliations" WASM module (built from native/src/wgf_main.cpp via
- * Emscripten). The WASM module implements the full paper pipeline:
+ * Thin façade that runs the Vekhter et al. 2019 WGF WASM pipeline
+ * inside a dedicated Web Worker (see `wgfClient.ts`) and repacks its
+ * output segments into the Isoline[] layout consumed by kagome.ts.
  *
- *   1. Knöppel et al. 2013 globally-optimal 6-RoSy direction field
- *      (connection-Laplacian smallest eigenvector).
- *   2. Algorithm 1 (paper §3.3, eq. 5): λ-sharpened alternating
- *      minimization with the full KKT system solved via Eigen's
- *      SparseLU.
- *   3. 6-fold branched cover construction (paper §5.1) with per-edge
- *      cyclic-shift permutation σ ∈ ℤ/6ℤ, vertex-holonomy detection
- *      and puncturing of branch-point vertices, and connected-component
- *      decomposition.
- *   4. Per-component Algorithm 2 (paper §4, eq. 7): initial scaling s
- *      via generalized-eigenproblem inverse power iteration,
- *      anti-aliasing rescale, and joint (s, θ) optimization (eq. 8).
- *   5. θ zero-crossing extraction on the cover, projection back to the
- *      base mesh with family labels derived from the layer index.
+ * Pipeline overview (all phases emit `wgf-progress` callbacks to the
+ * UI so the user can see where time is going):
  *
- * This file packs the half-edge mesh vertices/faces into the WASM
- * heap, invokes wgf_run, and repacks the returned segments into the
- * Isoline[] form consumed downstream by kagome.ts.
+ *   stage 1  Knöppel 2013 6-RoSy direction field eigensolve
+ *   stage 2  Algorithm 1 (λ-sharpened) on the base mesh
+ *   stage 3  6-fold branched cover construction + σ permutations
+ *   stage 4  Connected component labelling of the cover
+ *   stage 5  Per-component Algorithm 1 + Algorithm 2 + Eq. 8
+ *   stage 6  Segment assembly
+ *   stage 7  Done
  */
 
 import * as THREE from 'three';
 import type { HalfEdgeMesh } from './halfEdge';
 import type { Isoline } from './connectionLaplacian';
-import { runWgfPipeline, type WgfResult, type WgfOptions } from './wgfWasm';
+import {
+  runWgfPipeline,
+  type WgfOptions,
+  type WgfProgressEvent,
+  type WgfResult,
+} from './wgfClient';
 
-export type { WgfOptions };
+export type { WgfOptions, WgfProgressEvent };
 
 export interface GeodesicFoliationResult {
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]];
@@ -40,18 +37,14 @@ export interface GeodesicFoliationResult {
   numSingular: number;
 }
 
-/**
- * Run the Vekhter 2019 WGF pipeline on a half-edge mesh and return
- * per-family isolines in the same shape the downstream kagome builder
- * expects.
- */
 export async function computeGeodesicFoliationIsolines(
   mesh: HalfEdgeMesh,
   opts: WgfOptions = {},
+  onProgress?: (p: WgfProgressEvent) => void,
 ): Promise<GeodesicFoliationResult> {
 
   const t0 = performance.now();
-  const res: WgfResult = await runWgfPipeline(mesh, opts);
+  const res: WgfResult = await runWgfPipeline(mesh, opts, onProgress);
   const t1 = performance.now();
 
   console.log(
@@ -60,11 +53,8 @@ export async function computeGeodesicFoliationIsolines(
     `in ${res.iterations} iters | ${res.numSingular} singular base vertices`,
   );
 
-  // Partition segments by family and repack into the Isoline[] layout.
-  // kagome.ts interprets iso.points as a flat list of segment endpoints
-  // (iso.points[2k], iso.points[2k + 1]) with iso.faceIndices[k] being
-  // the face index of the k-th segment. One Isoline per family is all
-  // we need — the downstream stitcher chains them into polylines.
+  // Partition segments by family and repack into Isoline[] (one entry
+  // per family, with flat points[] and parallel faceIndices[]).
   const perFamPoints: [THREE.Vector3[], THREE.Vector3[], THREE.Vector3[]] = [[], [], []];
   const perFamFaces:  [number[],        number[],        number[]]        = [[], [], []];
 

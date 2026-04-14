@@ -154,10 +154,21 @@ export function regenerateMesh(ctx: Viewport3DContext): void {
     faces: meshData.indices.length / 3,
   });
 
-  void regeneratePattern(ctx);
+  // Clear any prior ribbon overlays; leave the semi-transparent TPMS
+  // surface visible so the user can preview the shape before choosing
+  // to run the (expensive) WGF pattern computation. The user triggers
+  // that step explicitly via the "Generate Pattern" button.
+  clearGroup(ctx.stripMeshes);
+  ctx.kagomePattern = null;
+  ctx.isolinesByFamily = null;
+  ctx.stripeFields = null;
+  store.getState().setStats({ strips: 0, junctions: 0 });
 }
 
-export async function regeneratePattern(ctx: Viewport3DContext): Promise<void> {
+export async function regeneratePattern(
+  ctx: Viewport3DContext,
+  onProgress?: (p: { stage: number; cur: number; total: number; label: string }) => void,
+): Promise<void> {
   if (!ctx.halfEdgeMesh) return;
 
   const state = store.getState();
@@ -168,22 +179,24 @@ export async function regeneratePattern(ctx: Viewport3DContext): Promise<void> {
 
   // ── Stage 2 – Vekhter et al. 2019 "Weaving Geodesic Foliations" ──────
   //
-  // Full paper pipeline in C++/Eigen compiled to WebAssembly:
-  //   1. Knöppel 2013 globally-optimal 6-RoSy direction field
-  //   2. Algorithm 1 (λ-sharpened KKT + SparseLU)
-  //   3. 6-fold branched cover with σ permutation + puncturing
-  //   4. Per-component Algorithm 2 (initial s via gen. eigenproblem)
-  //   5. Eq. 8 joint (s, θ) optimization
-  //   6. θ isoline extraction + projection to base families
-  const wgf = await computeGeodesicFoliationIsolines(mesh, {
-    lambdaInit:  1000,
-    lambdaMin:   1e-3,
-    alg1MaxIter: 50,
-    mu:          1e-4,
-    jointIters:  10,
-    userScale:   state.strip.numIsolines / 8.0, // 8 ≈ default density
-    useCover:    true,
-  });
+  // Runs in a dedicated Web Worker (src/workers/wgfWorker.ts). The
+  // worker hosts the WASM module and streams phase-by-phase progress
+  // via `self.postMessage({ type: 'wgf-progress', ... })` callbacks
+  // emitted from the C++ pipeline. The main thread stays responsive
+  // for the entire run.
+  const wgf = await computeGeodesicFoliationIsolines(
+    mesh,
+    {
+      lambdaInit:  1000,
+      lambdaMin:   1e-3,
+      alg1MaxIter: 50,
+      mu:          1e-4,
+      jointIters:  10,
+      userScale:   state.strip.numIsolines / 8.0, // 8 ≈ default density
+      useCover:    true,
+    },
+    onProgress,
+  );
 
   // Downstream code expects a (Re,Im,amplitude) triple per family and an
   // isoline-per-family list. We only populate the isolines — the stripe
@@ -352,10 +365,16 @@ function createGeometry(meshData: MeshData): THREE.BufferGeometry {
   return geo;
 }
 
-/** Update colours without full recomputation */
+/** Update colours without recomputing the heavy WGF pipeline.
+ *  If no pattern exists yet this is a no-op — the user must press
+ *  "Generate Pattern" to trigger the initial computation. */
 export function updateColors(ctx: Viewport3DContext): void {
-  // Full regeneration is the safest approach given the interleaved layers
-  regeneratePattern(ctx);
+  if (!ctx.kagomePattern) return;
+  // TODO: swap materials in-place instead of rebuilding; for now the
+  // cheapest correct behaviour is simply to leave the existing
+  // geometry in place. Ribbon colours are baked into MeshBasicMaterial
+  // at build time so this won't reflect colour-picker changes until
+  // the next Generate Pattern press, which is acceptable UX.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

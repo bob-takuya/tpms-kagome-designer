@@ -27,6 +27,7 @@
 #include "alg2.h"
 #include "cover.h"
 #include "isolines.h"
+#include "progress.h"
 
 namespace wgf {
 
@@ -60,9 +61,11 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     R.baseF = base.nF();
     R.baseE = base.nE();
 
+    reportProgress(STAGE_INIT, 0, 1, "Building face frames");
     auto frames = buildFaceFrames(base);
 
-    // 1. 6-RoSy
+    // 1. 6-RoSy (Knoeppel 2013)
+    reportProgress(STAGE_ROSY, 0, 1, "Knoeppel 2013 6-RoSy eigensolve");
     SpMat L6 = build6RoSyReal(base, frames);
     Vec   M6 = face6RoSyMass(frames);
     Vec   z  = solve6RoSy(L6, M6, 30, 1e-4);
@@ -70,6 +73,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     Vec   w0base = initFaceFieldFromRosy(phi);
 
     // 2. Algorithm 1 on the base (for diagnostics + to warm up the cover init)
+    reportProgress(STAGE_ALG1_BASE, 0, 1, "Algorithm 1 (base, lambda sharpening)");
     Alg1Result R1 = runAlg1(base, frames, w0base, {},
                             opt.lambdaInit, opt.lambdaMin,
                             opt.alg1MaxIter, opt.alg1Tol);
@@ -79,7 +83,9 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
 
     if (!opt.useCover) {
         // Single-family pipeline: run Alg 2 + eq 8 on the base.
+        reportProgress(STAGE_COMPONENT, 0, 1, "Algorithm 2 + Eq. 8 (base mesh)");
         JointResult J = solveJointScalar(base, frames, R1.w, opt.mu, opt.jointIters);
+        reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
         auto segs = extractIsolines(base, J.theta);
         for (auto& s : segs) {
             ProjectedSegment p;
@@ -89,22 +95,26 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             R.segments.push_back(p);
             R.numSegmentsFam[0]++;
         }
+        reportProgress(STAGE_DONE, 1, 1, "Done");
         return R;
     }
 
     // 3. 6-fold branched cover
+    reportProgress(STAGE_COVER_BUILD, 0, 1, "Building 6-fold branched cover");
     auto cov = buildBranchedCover(base, frames, phi);
     R.coverV = cov.mesh.nV();
     R.coverF = cov.mesh.nF();
     R.numSingular = cov.numSingular;
 
     // 4. Connected components
+    reportProgress(STAGE_COVER_SPLIT, 0, 1, "Labeling cover components");
     std::vector<int> comp;
     int nComp = labelComponents(cov.mesh, comp);
     R.numComponents = nComp;
 
     // 5. Per-component pipeline
     for (int c = 0; c < nComp; ++c) {
+        reportProgress(STAGE_COMPONENT, c, nComp, "Cover components: Alg 1 + Alg 2 + Eq. 8");
         SubMesh S = extractComponent(cov.mesh, comp, c);
         if (S.mesh.nV() < 3 || S.mesh.nF() < 1) continue;
 
@@ -157,6 +167,8 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             R.numSegmentsFam[p.family]++;
         }
     }
+    reportProgress(STAGE_ASSEMBLE, 0, 1, "Assembling segments");
+    reportProgress(STAGE_DONE, 1, 1, "Done");
     return R;
 }
 
