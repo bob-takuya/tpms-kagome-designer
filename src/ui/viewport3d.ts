@@ -170,7 +170,8 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // Twisted eigenvalue problem per family: L_k ψ = λ M ψ where
   //   L_k has edge phases ω·⟨e_ij, X_k⟩ encoded in the off-diagonals.
   // Stripes = zero-crossings of Re(ψ) per triangle face.
-  // numIsolines controls the target stripe density via ω ≈ numIsolines / 2.
+  // Faces where |ψ| is near zero (singularities) are skipped to prevent
+  // spurious U-turns in the stripe direction.
   const omega = Math.max(1, state.strip.numIsolines / 2);
   const psi = computeKnoppelStripeFields(mesh, omega);
 
@@ -181,7 +182,7 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
 
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
   for (let k = 0; k < 3; k++) {
-    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re);
+    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re, psi[k].amplitude, 0.05);
   }
   ctx.isolinesByFamily = isolinesByFamily;
 
