@@ -11,9 +11,15 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_compile_options(-O3 -Wall -Wno-sign-compare -DEIGEN_NO_DEBUG)
 
-# Native (host) build — used for development / smoke tests.
+# Native (host) build — used for development / smoke tests and for
+# running the full pipeline on Colab (or any native environment) with
+# aggressive SIMD + full Eigen optimizations.
 if(NOT EMSCRIPTEN)
     add_executable(smoke_native src/smoke_native.cpp)
+    add_executable(wgf_cli      src/wgf_cli.cpp)
+    # Aggressive native optimization for the CLI — the WASM build uses
+    # plain -O3 only because WASM SIMD is not enabled there.
+    target_compile_options(wgf_cli PRIVATE -O3 -ffast-math)
 endif()
 
 # Emscripten build — single-file ES module with the wasm base64-inlined.

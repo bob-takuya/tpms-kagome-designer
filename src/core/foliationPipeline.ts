@@ -26,6 +26,7 @@ import {
   type WgfProgressEvent,
   type WgfResult,
 } from './wgfClient';
+import type { ParsedWgfResult } from './wgfIO';
 
 export type { WgfOptions, WgfProgressEvent };
 
@@ -80,5 +81,42 @@ export async function computeGeodesicFoliationIsolines(
     finalCurl:   res.finalCurl,
     iterations:  res.iterations,
     numSingular: res.numSingular,
+  };
+}
+
+/**
+ * Convert a parsed Colab-CLI result into the same per-family Isoline[]
+ * layout produced by the in-browser pipeline. This is what lets the
+ * rest of the app (kagome.ts, stripMesh.ts, unfold.ts) stay completely
+ * unaware of where the segments came from.
+ */
+export function applyParsedWgfResult(
+  parsed: ParsedWgfResult,
+): GeodesicFoliationResult {
+  const perFamPoints: [THREE.Vector3[], THREE.Vector3[], THREE.Vector3[]] = [[], [], []];
+  const perFamFaces:  [number[],        number[],        number[]]        = [[], [], []];
+
+  for (const s of parsed.segments) {
+    const fam = s.family % 3;
+    perFamPoints[fam].push(new THREE.Vector3(s.ax, s.ay, s.az));
+    perFamPoints[fam].push(new THREE.Vector3(s.bx, s.by, s.bz));
+    perFamFaces[fam].push(s.faceIdx);
+  }
+
+  const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
+  for (let k = 0; k < 3; k++) {
+    if (perFamPoints[k].length === 0) continue;
+    isolinesByFamily[k].push({
+      points: perFamPoints[k],
+      faceIndices: perFamFaces[k],
+    });
+  }
+
+  return {
+    isolinesByFamily,
+    initialCurl: parsed.initialCurl,
+    finalCurl:   parsed.finalCurl,
+    iterations:  parsed.iterations,
+    numSingular: parsed.numSingular,
   };
 }

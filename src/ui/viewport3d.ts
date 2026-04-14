@@ -7,7 +7,11 @@ import type { MeshData } from '../core/marchingCubes';
 import { buildHalfEdgeMesh } from '../core/halfEdge';
 import type { HalfEdgeMesh } from '../core/halfEdge';
 import type { Isoline } from '../core/connectionLaplacian';
-import { computeGeodesicFoliationIsolines } from '../core/foliationPipeline';
+import {
+  computeGeodesicFoliationIsolines,
+  applyParsedWgfResult,
+} from '../core/foliationPipeline';
+import type { ParsedWgfResult } from '../core/wgfIO';
 import { buildKagomePattern } from '../core/kagome';
 import type { KagomePattern } from '../core/kagome';
 import { buildAllStripMeshes } from '../core/stripMesh';
@@ -204,10 +208,28 @@ export async function regeneratePattern(
     onProgress,
   );
 
+  applyIsolinesToScene(ctx, wgf.isolinesByFamily);
+}
+
+/**
+ * Apply a set of per-family isolines (from either the in-browser WASM
+ * pipeline or a Colab-CLI import) to the current mesh. Builds the
+ * kagome pattern, ribbon meshes, junctions, and the isoline underlay.
+ *
+ * Factored out of regeneratePattern so the Colab import path can reuse
+ * exactly the same rendering code without touching the WGF stages.
+ */
+function applyIsolinesToScene(
+  ctx: Viewport3DContext,
+  isolinesByFamily: [Isoline[], Isoline[], Isoline[]],
+): void {
+  if (!ctx.halfEdgeMesh) return;
+  const state = store.getState();
+  const mesh = ctx.halfEdgeMesh;
+
   // Downstream code expects a (Re,Im,amplitude) triple per family and an
   // isoline-per-family list. We only populate the isolines — the stripe
   // fields go unused by kagome.ts when fed pre-traced isolines.
-  const isolinesByFamily = wgf.isolinesByFamily;
   const stripeFields: [Float64Array, Float64Array, Float64Array] = [
     new Float64Array(mesh.vertices.length),
     new Float64Array(mesh.vertices.length),
@@ -287,6 +309,31 @@ export async function regeneratePattern(
       ctx.stripMeshes.add(new THREE.LineSegments(geo, mat));
     }
   }
+}
+
+/**
+ * Apply a Colab-CLI result (parsed from wgf-output.txt) to the scene.
+ * Skips the WASM pipeline entirely — the segments have already been
+ * computed natively. The current half-edge mesh must match the one
+ * that was exported, otherwise the baseFaceIdx values will be wrong.
+ */
+export function applyImportedPattern(
+  ctx: Viewport3DContext,
+  parsed: ParsedWgfResult,
+): void {
+  if (!ctx.halfEdgeMesh) {
+    console.warn('[WGF import] no mesh — press "Rebuild Mesh" first');
+    return;
+  }
+  console.log(
+    `[WGF import] ${parsed.segments.length} segments (fam ${parsed.familyCounts.join('/')}) | ` +
+    `curl ${parsed.initialCurl.toExponential(3)} → ${parsed.finalCurl.toExponential(3)} ` +
+    `in ${parsed.iterations} iters | ${parsed.numSingular} singular | ` +
+    `${parsed.numComponents} cover components`,
+  );
+  clearGroup(ctx.stripMeshes);
+  const geo = applyParsedWgfResult(parsed);
+  applyIsolinesToScene(ctx, geo.isolinesByFamily);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

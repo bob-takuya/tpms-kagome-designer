@@ -16,6 +16,9 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#else
+#include <cstdio>
+#include <cstdlib>
 #endif
 
 namespace wgf {
@@ -53,7 +56,28 @@ inline void reportProgress(int stage, int cur, int total, const char* label) {
         } catch (e) { /* ignore */ }
     }, stage, cur, total, label);
 #else
-    (void)stage; (void)cur; (void)total; (void)label;
+    // Native build (including the Colab CLI): emit a new line each
+    // time the stage label changes, and a tight in-place update
+    // otherwise, so the user sees live motion on stderr.
+    static int         s_lastStage = -999;
+    static const char* s_lastLabel = nullptr;
+    static bool        s_needNewline = false;
+
+    const bool newStage = (stage != s_lastStage) || (s_lastLabel != label);
+    if (newStage) {
+        if (s_needNewline) { std::fprintf(stderr, "\n"); s_needNewline = false; }
+        std::fprintf(stderr, "[wgf §%d] %s", stage, label);
+        s_lastStage = stage;
+        s_lastLabel = label;
+    }
+    if (total > 1) {
+        std::fprintf(stderr, "\r[wgf §%d] %s  %d/%d   ", stage, label, cur, total);
+        s_needNewline = true;
+    } else {
+        std::fprintf(stderr, "\n");
+        s_needNewline = false;
+    }
+    std::fflush(stderr);
 #endif
 }
 

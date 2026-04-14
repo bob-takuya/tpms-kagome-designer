@@ -1,12 +1,16 @@
 import './style.css';
 import { store } from './store';
 import { createSidebar, downloadFile } from './ui/sidebar';
-import { createViewport3D, regenerateMesh, regeneratePattern, updateColors, highlightStrip } from './ui/viewport3d';
+import {
+  createViewport3D, regenerateMesh, regeneratePattern,
+  updateColors, highlightStrip, applyImportedPattern,
+} from './ui/viewport3d';
 import { createViewport2D, regenerateUnfold, getUnfoldedStrips } from './ui/viewport2d';
 import { showStripDetail, hideStripDetail } from './ui/stripDetail';
 import { createStatusBar } from './ui/statusbar';
 import { generateDXF, generateJunctionCSV } from './export/dxf';
 import { generateSVG } from './export/svg';
+import { exportMeshText, parseResultText, downloadText } from './core/wgfIO';
 
 // ─── Diagnostic overlay ───────────────────────────────────────────────────
 // Lightweight on-screen error/status banner that works even when remote
@@ -166,6 +170,44 @@ window.addEventListener('generate-pattern', () => { void runPatternGeneration();
 // Legacy alias — some components still dispatch 'regenerate-pattern'.
 window.addEventListener('regenerate-pattern', () => { void runPatternGeneration(); });
 
+// ── Export for Colab ────────────────────────────────────────────────────────
+window.addEventListener('export-for-colab', () => {
+  const mesh = ctx3D.halfEdgeMesh;
+  if (!mesh) {
+    diag('[wgf] no mesh yet — press "Rebuild Mesh" first', true);
+    return;
+  }
+  // Paper-strict defaults for the Colab run (native is fast enough).
+  const text = exportMeshText(mesh, {
+    lambdaInit:  1000,
+    lambdaMin:   1e-3,
+    alg1MaxIter: 50,
+    mu:          1e-4,
+    jointIters:  10,
+    userScale:   store.getState().strip.numIsolines / 8.0,
+    useCover:    true,
+  });
+  downloadText('wgf-input.txt', text);
+});
+
+// ── Import Colab result ─────────────────────────────────────────────────────
+window.addEventListener('import-colab-result', ((e: CustomEvent<{ text: string }>) => {
+  if (!ctx3D.halfEdgeMesh) {
+    diag('[wgf] no mesh — press "Rebuild Mesh" first', true);
+    return;
+  }
+  try {
+    const parsed = parseResultText(e.detail.text);
+    applyImportedPattern(ctx3D, parsed);
+    const pat = ctx3D.kagomePattern;
+    if (store.getState().viewMode === '2d') {
+      regenerateUnfold(ctx2D, pat, ctx3D.halfEdgeMesh, pat ? pat.junctions : []);
+    }
+  } catch (err) {
+    diag('[wgf import] ' + (err as Error).message, true);
+  }
+}) as EventListener);
+
 window.addEventListener('regenerate-unfold', () => {
   regenerateUnfold(ctx2D, ctx3D.kagomePattern, ctx3D.halfEdgeMesh, ctx3D.kagomePattern?.junctions || []);
 });
@@ -254,6 +296,8 @@ declare global {
     'regenerate-mesh': CustomEvent;
     'regenerate-pattern': CustomEvent;
     'generate-pattern': CustomEvent;
+    'export-for-colab': CustomEvent;
+    'import-colab-result': CustomEvent<{ text: string }>;
     'regenerate-unfold': CustomEvent;
     'update-colors': CustomEvent;
     'export-dxf': CustomEvent;
