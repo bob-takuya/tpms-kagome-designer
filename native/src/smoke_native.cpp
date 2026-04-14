@@ -299,12 +299,13 @@ int main() {
     // End-to-end pipeline run.
     {
         PipelineOptions opt;
-        opt.useCover = false;   // single-family base-mode smoke test
+        opt.useCover = true;    // now exercises the 3-family rotated-Knoeppel path
         opt.alg1MaxIter = 30;
         PipelineResult R2 = runPipeline(m, opt);
-        std::printf("[smoke/base-only] segments=%zu  curl %.3e -> %.3e  in %d iters\n",
-                    R2.segments.size(), R2.alg1BaseInitCurl,
-                    R2.alg1BaseFinalCurl, R2.alg1BaseIters);
+        std::printf("[smoke/3-family] segments=%zu (fam %d/%d/%d) curl %.3e -> %.3e  in %d iters\n",
+                    R2.segments.size(),
+                    R2.numSegmentsFam[0], R2.numSegmentsFam[1], R2.numSegmentsFam[2],
+                    R2.alg1BaseInitCurl, R2.alg1BaseFinalCurl, R2.alg1BaseIters);
     }
 
     // Run Alg1 on each component.
