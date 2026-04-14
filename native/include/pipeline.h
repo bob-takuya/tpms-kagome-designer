@@ -27,6 +27,7 @@
 #include "alg2.h"
 #include "cover.h"
 #include "isolines.h"
+#include "paired_rounding.h"
 #include "progress.h"
 
 namespace wgf {
@@ -95,7 +96,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     R.alg1BaseIters     = R1.iterations;
 
     if (!opt.useCover) {
-        // Single-family pipeline: run Alg 2 + eq 8 on the base.
+        // Single-family pipeline (debug path).
         reportProgress(STAGE_COMPONENT, 0, 1, "Algorithm 2 + Eq. 8 (base mesh)");
         JointResult J = solveJointScalar(base, frames, R1.w, opt.mu, opt.jointIters);
         reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
@@ -103,7 +104,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         for (auto& s : segs) {
             ProjectedSegment p;
             p.a = s.a; p.b = s.b;
-            p.baseFaceIdx = s.coverFaceIdx;
+            p.baseFaceIdx = s.faceIdx;
             p.family = 0;
             R.segments.push_back(p);
             R.numSegmentsFam[0]++;
@@ -112,26 +113,18 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         return R;
     }
 
-    // 3. 6-fold branched cover
+    // 3. 6-fold branched cover construction (Vekhter §5.1).
     //
-    // Build σ / holonomy from the ALGORITHM-1-OPTIMIZED face field
-    // rather than the raw 6-RoSy eigenvector. The paper's §5.1 uses
-    // the raw RoSy field because their reference mesh has a well-
-    // converged Knoeppel 2013 direction field. In WASM / browser-
-    // resolution meshes the raw eigenvector is still noisy enough
-    // that σ = round((φ_i − φ_j + β) / (π/3)) mod 6 picks up spurious
-    // shifts on most edges, flagging nearly every vertex as a branch
-    // point and collapsing the cover to a trivially-fragmented mesh.
-    //
-    // The Alg 1 refined field is curl-optimized by construction:
-    // (φ_i − φ_j + β) ≈ 0 on almost every edge, so the rounded σ is
-    // almost always 0 and the holonomy walks produce a clean sparse
-    // set of branch points at genuine topological singularities.
+    // The cover is built from the ALGORITHM-1-OPTIMIZED direction field
+    // (rather than the raw 6-RoSy eigenvector) so that the per-edge σ
+    // rounding is stable: on a well-converged Alg1 output, the angular
+    // residual (phi_i − phi_j + β) is far from the π/6 decision boundary
+    // almost everywhere, and σ rounds to 0 on all non-singular edges.
     //
     // Holonomy is invariant under per-face representative choice
-    // (telescoping sum of the shifts cancels around any closed cycle),
-    // so we can feed raw atan2 values here without wrapping into
-    // [-π/6, π/6].
+    // (telescoping cancellation around any closed cycle), so atan2 of
+    // the Alg1 vector field can be used directly without wrapping into
+    // (−π/6, π/6].
     reportProgress(STAGE_COVER_BUILD, 0, 1, "Building 6-fold branched cover");
     Vec phiRefined(base.nF());
     for (int f = 0; f < base.nF(); ++f) {
@@ -142,30 +135,36 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     R.coverF = cov.mesh.nF();
     R.numSingular = cov.numSingular;
 
-    // 4. Connected components
+    // 4. Connected components of the cover.
     reportProgress(STAGE_COVER_SPLIT, 0, 1, "Labeling cover components");
     std::vector<int> comp;
     int nComp = labelComponents(cov.mesh, comp);
     R.numComponents = nComp;
 
-    // 5. Per-component pipeline
+    // 5. Per-component pipeline: Alg 1 + Alg 2 + Eq 8 (single θ per cover component).
+    //
+    // We accumulate per-vertex theta values into a global `thetaCover`
+    // vector on the cover mesh, so that paired rounding can operate on
+    // it as one continuous (real) angular scalar field.
+    Vec thetaCover = Vec::Zero(cov.mesh.nV());
+    std::vector<char> thetaSet(cov.mesh.nV(), 0);
+
     for (int c = 0; c < nComp; ++c) {
-        reportProgress(STAGE_COMPONENT, c, nComp, "Cover components: Alg 1 + Alg 2 + Eq. 8");
+        reportProgress(STAGE_COMPONENT, c, nComp, "Cover: Alg 1 + Alg 2 + Eq. 8");
         SubMesh S = extractComponent(cov.mesh, comp, c);
         if (S.mesh.nV() < 3 || S.mesh.nF() < 1) continue;
 
         auto Sframes = buildFaceFrames(S.mesh);
 
-        // Initialize w on this component from the base φ via the layer.
-        // For each face in the sub-mesh, look up the original cover face,
-        // its base face, and layer; compute the 3D direction; project
-        // into this sub-face's frame.
+        // Initialize w on this component from the base-face layer angles.
+        // Each cover sub-face inherits its direction from the corresponding
+        // base face's 6-RoSy representative rotated by layer·π/3.
         Vec wS(2 * S.mesh.nF());
         for (int f = 0; f < S.mesh.nF(); ++f) {
             int covFace = S.oldFaceIdx[f];
             int bf  = cov.coverFaceBaseF[covFace];
             int lay = cov.coverFaceLayer[covFace];
-            double ang = phi[bf] + lay * M_PI / 3.0;
+            double ang = phiRefined[bf] + lay * M_PI / 3.0;
             Eigen::Vector3d d3 =
                 std::cos(ang) * frames[bf].e1 +
                 std::sin(ang) * frames[bf].e2;
@@ -177,9 +176,8 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             wS[2*f + 1] = v / Ln;
         }
 
-        // Per-component Alg 1: much lighter schedule. Each component is
-        // typically a small patch of the cover, so a single λ level
-        // with a handful of inner iterations converges fine.
+        // Per-component Alg 1 (one λ level, few inner iterations —
+        // each component is small).
         Alg1Result RS = runAlg1(S.mesh, Sframes, wS, {},
                                 /*lambdaInit=*/1.0,
                                 /*lambdaMin =*/1e-2,
@@ -187,16 +185,47 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
                                 opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
-        // Joint (s, θ) optimization
+        // Joint (s, θ) optimization (Vekhter §4, Eq 8).
         JointResult J = solveJointScalar(S.mesh, Sframes, RS.w,
                                          opt.mu, opt.jointIters);
 
-        // 6. Extract isolines on this sub-component
-        auto localSegs = extractIsolines(S.mesh, J.theta);
+        // Write this component's theta back into the global cover theta
+        // (converting the complex per-vertex ψ = (re, im) into a real
+        // angular value θ_real = atan2(im, re), which is what paired
+        // rounding + angular isoline extraction expect).
+        for (int sv = 0; sv < S.mesh.nV(); ++sv) {
+            int cv = S.oldVertexIdx[sv];
+            double re = J.theta[2*sv];
+            double im = J.theta[2*sv + 1];
+            thetaCover[cv] = std::atan2(im, re);
+            thetaSet[cv] = 1;
+        }
+    }
 
-        // Project each segment to base via the cover mapping
-        for (const auto& s : localSegs) {
-            int covFace = S.oldFaceIdx[s.coverFaceIdx];
+    // 6. Paired cover rounding (Vekhter §5.2 step 3).
+    //
+    // Enforces that antipodal layer pairs (k, k+3) have theta values
+    // satisfying  theta(v1) + theta(v2) = -offset (mod phase) so that
+    // projected stripes from the two halves of each kagome line
+    // interleave cleanly at the half-period offset.
+    {
+        // The number of stripes per 2π determines the half-period
+        // offset used in the rounding constraint. Use a density based
+        // on userScale (1 = paper default ≈ 8 stripes per unit cell).
+        int numISOLines = std::max(4, (int)std::round(8.0 * opt.userScale));
+        pairedRoundTheta(cov.mesh, cov, thetaCover, numISOLines);
+
+        // 7. Extract angular isolines on the cover.
+        reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
+        auto segs = extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
+
+        // 8. Project each cover segment back to its base face; the
+        // family is layer k mod 3. After paired rounding, segments
+        // from layers k and k+3 belong to the same kagome family
+        // (they share the same base face/direction) and sit at
+        // interleaved half-period offsets along the same stripe line.
+        for (const auto& s : segs) {
+            int covFace = s.faceIdx;
             int bf  = cov.coverFaceBaseF[covFace];
             int lay = cov.coverFaceLayer[covFace];
             ProjectedSegment p;
@@ -208,7 +237,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             R.numSegmentsFam[p.family]++;
         }
     }
-    reportProgress(STAGE_ASSEMBLE, 0, 1, "Assembling segments");
+
     reportProgress(STAGE_DONE, 1, 1, "Done");
     return R;
 }

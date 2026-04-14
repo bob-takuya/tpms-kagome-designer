@@ -38,6 +38,10 @@ struct CoverBuildResult {
     std::vector<int>   coverVertexLayer; // per cover vertex: layer 0..5
     std::vector<char>  isSingularBaseV;  // 1 if base vertex is a branch pt
     std::vector<int8_t> sigmaPerHE;      // σ ∈ 0..5 from base.he[h].face → twin face
+    // Direct lookup: flatBaseIdx[6*v_base + k] = cover vertex index, or -1
+    // if base vertex v_base is singular. Used by paired_rounding.h to find
+    // antipodal layer pairs (v, k) ↔ (v, k+3).
+    std::vector<int>   flatBaseIdx;
     int numSingular;
 };
 
@@ -253,6 +257,7 @@ inline CoverBuildResult buildBranchedCover(
     R.coverFaceLayer   = std::move(flayer);
     R.coverVertexBaseV = std::move(cvBase);
     R.coverVertexLayer = std::move(cvLayer);
+    R.flatBaseIdx      = std::move(flat);
     return R;
 }
 

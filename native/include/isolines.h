@@ -18,7 +18,7 @@ namespace wgf {
 
 struct Segment {
     Eigen::Vector3d a, b;   // 3D endpoints (on the cover = on the base)
-    int coverFaceIdx;       // face in the cover mesh
+    int faceIdx;            // face in the mesh passed to extractIsolines
 };
 
 inline std::vector<Segment> extractIsolines(const Mesh& m, const Vec& theta) {
@@ -48,7 +48,7 @@ inline std::vector<Segment> extractIsolines(const Mesh& m, const Vec& theta) {
             Segment s;
             s.a = cp[0];
             s.b = cp[1];
-            s.coverFaceIdx = f;
+            s.faceIdx = f;
             out.push_back(s);
         }
     }
@@ -69,7 +69,7 @@ inline std::vector<ProjectedSegment> projectToBase(
     std::vector<ProjectedSegment> out;
     out.reserve(segs.size());
     for (const auto& s : segs) {
-        int cf = s.coverFaceIdx;
+        int cf = s.faceIdx;
         int bf = cov.coverFaceBaseF[cf];
         int lay = cov.coverFaceLayer[cf];
         ProjectedSegment p;
