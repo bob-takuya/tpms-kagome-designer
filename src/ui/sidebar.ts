@@ -38,6 +38,11 @@ export function createSidebar(container: HTMLElement): void {
       <div class="wgf-progress-bar"><div class="wgf-progress-fill"></div></div>
       <div class="wgf-progress-count"></div>
     </div>
+    <div class="colab-row">
+      <button id="export-colab-btn" class="secondary-btn" title="Export the current mesh to wgf-input.txt for running on Google Colab — see COLAB.md">⇩ Export for Colab</button>
+      <button id="import-colab-btn" class="secondary-btn" title="Import a wgf-output.txt produced by the Colab CLI">⇪ Import Colab result</button>
+      <input type="file" id="import-colab-file" accept=".txt,text/plain" style="display:none">
+    </div>
   `;
   sidebar.insertBefore(calcSection, sidebar.querySelector('.sidebar-content')!);
 
@@ -239,6 +244,23 @@ function setupEventListeners(): void {
   // Dispatches `generate-pattern`. main.ts owns the progress-UI wiring.
   document.getElementById('generate-btn')?.addEventListener('click', () => {
     window.dispatchEvent(new CustomEvent('generate-pattern'));
+  });
+
+  // ── Export for Colab / Import Colab result ─────────────────────────────────
+  // See COLAB.md at the repo root for the full round-trip instructions.
+  document.getElementById('export-colab-btn')?.addEventListener('click', () => {
+    window.dispatchEvent(new CustomEvent('export-for-colab'));
+  });
+  const importInput = document.getElementById('import-colab-file') as HTMLInputElement | null;
+  document.getElementById('import-colab-btn')?.addEventListener('click', () => {
+    importInput?.click();
+  });
+  importInput?.addEventListener('change', async () => {
+    const file = importInput.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    importInput.value = '';   // allow re-picking the same file
+    window.dispatchEvent(new CustomEvent('import-colab-result', { detail: { text } }));
   });
 
   // ── Accordion toggle ────────────────────────────────────────────────────────
