@@ -233,11 +233,8 @@ export function buildKagomePattern(
   }
   console.groupEnd();
 
-  // ── 1b. Reconnect compatible fragments within each family ───────────────
-  // When the zero-crossing extraction skips singular faces, long strips get
-  // cut into fragments.  Merge fragments whose endpoints are close in 3D AND
-  // whose exit/entry tangents align tightly.
-  reconnectFragments(families, allStrips);
+  // ── 1b. Reconnect fragments (disabled — creates kinks in practice) ──────
+  // reconnectFragments(families, allStrips);
 
   // ── 2. Estimate world-space strip widths: per-isoline, inter-isoline spacing only ──
   //
@@ -579,20 +576,28 @@ function stitchSegments(rawPts: THREE.Vector3[]): StitchedChain[] {
   const used = new Uint8Array(n);
   const chains: StitchedChain[] = [];
 
+  // Require the continuation direction to be within 45° of the previous
+  // direction (cos > 0.707).  Prevents U-turns at singularities while
+  // allowing normal strip curvature through the stitching process.
+  const MIN_FORWARD_COS = 0.707;
+
   function pickNext(
     curPt: THREE.Vector3,
     inDir: THREE.Vector3 | null,
   ): { segIdx: number; end: 0 | 1 } | null {
     const candidates = (endpointMap.get(hash(curPt)) ?? []).filter(c => !used[c.segIdx]);
     if (candidates.length === 0) return null;
-    if (candidates.length === 1 || inDir === null) return candidates[0];
-    let best = candidates[0], bestDot = -Infinity;
+    if (inDir === null) return candidates[0];
+
+    let best: { segIdx: number; end: 0 | 1 } | null = null;
+    let bestDot = -Infinity;
     for (const c of candidates) {
       const dir = new THREE.Vector3()
         .subVectors(rawPts[2 * c.segIdx + (1 - c.end)], curPt).normalize();
       const d = inDir.dot(dir);
       if (d > bestDot) { bestDot = d; best = c; }
     }
+    if (bestDot < MIN_FORWARD_COS) return null; // no smooth continuation
     return best;
   }
 
@@ -829,6 +834,7 @@ export function generateJunctionHoles(
 // a straight-line bridge; subsequent smoothing makes it C¹-continuous.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// @ts-ignore — kept for future use, currently unused
 function reconnectFragments(
   families: [Strip[], Strip[], Strip[]],
   allStrips: Strip[],
