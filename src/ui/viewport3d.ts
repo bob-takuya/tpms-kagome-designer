@@ -169,9 +169,9 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
   // ── Stage 2 – Stripe fields via Knöppel 2015 "Stripe Patterns on Surfaces" ──
   // Twisted eigenvalue problem per family: L_k ψ = λ M ψ where
   //   L_k has edge phases ω·⟨e_ij, X_k⟩ encoded in the off-diagonals.
-  // Stripes = zero-crossings of Re(ψ) per triangle face.
-  // Faces where |ψ| is near zero (singularities) are skipped to prevent
-  // spurious U-turns in the stripe direction.
+  // Stripes = zero-crossings of Re(ψ) per triangle face (full coverage).
+  // U-turns at singularities are prevented by 45° stitching constraint in
+  // kagome.ts, not by filtering zero-crossings.
   const omega = Math.max(1, state.strip.numIsolines / 2);
   const psi = computeKnoppelStripeFields(mesh, omega);
 
@@ -182,7 +182,7 @@ export function regeneratePattern(ctx: Viewport3DContext): void {
 
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
   for (let k = 0; k < 3; k++) {
-    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re, psi[k].amplitude, 0.05);
+    isolinesByFamily[k] = traceZeroCrossings(mesh, psi[k].re);
   }
   ctx.isolinesByFamily = isolinesByFamily;
 

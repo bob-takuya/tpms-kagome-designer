@@ -286,7 +286,7 @@ function runPipeline(params: TestParams, mode: StripeMode = 'guided'): {
     const psi = computeKnoppelStripeFields(mesh, omega);
     stripeFields = [psi[0].re, psi[1].re, psi[2].re];
     for (let k = 0; k < 3; k++) {
-      isolines[k] = traceZeroCrossings(mesh, psi[k].re, psi[k].amplitude, 0.05);
+      isolines[k] = traceZeroCrossings(mesh, psi[k].re);  // no amplitude filter
     }
   } else if (mode === 'guided') {
     const guided = computeGuidedStripeFields(mesh, params.density);
