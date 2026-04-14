@@ -9,8 +9,15 @@
 #include <memory>
 #include <vector>
 #include <cstring>
+#include <string>
+#include <exception>
 
 using namespace wgf;
+
+// Last error message from wgf_run (when it returns null). Accessed
+// from JS via wgf_last_error() so the diagnostic banner can show
+// something more useful than a bare wasm-function stack trace.
+static std::string g_lastError;
 
 struct WgfHandle {
     PipelineResult result;
@@ -48,7 +55,11 @@ void* wgf_run(const double* V, int nV,
               int    jointIters,
               double userScale,
               int    useCover) {
-    if (!V || !F || nV < 3 || nF < 1) return nullptr;
+    g_lastError.clear();
+    if (!V || !F || nV < 3 || nF < 1) {
+        g_lastError = "wgf_run: invalid input mesh (null or too small)";
+        return nullptr;
+    }
 
     Mesh base;
     base.V.resize(nV, 3);
@@ -77,7 +88,12 @@ void* wgf_run(const double* V, int nV,
     auto* h = new WgfHandle();
     try {
         h->result = runPipeline(base, opt);
+    } catch (const std::exception& e) {
+        g_lastError = std::string("wgf_run: ") + e.what();
+        delete h;
+        return nullptr;
     } catch (...) {
+        g_lastError = "wgf_run: unknown C++ exception";
         delete h;
         return nullptr;
     }
@@ -155,6 +171,12 @@ void   wgf_result_free(void* hPtr) {
 void   wgf_result_free_all(void* hPtr) {
     // Alias kept for symmetry with the exported-function list.
     delete (WgfHandle*)hPtr;
+}
+
+// Returns a C string with the last wgf_run() failure reason, or "" if
+// none. The pointer is valid until the next wgf_run call.
+const char* wgf_last_error() {
+    return g_lastError.c_str();
 }
 
 } // extern "C"

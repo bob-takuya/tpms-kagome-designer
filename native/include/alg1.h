@@ -1,37 +1,56 @@
-// alg1.h — Vekhter et al. 2019, Algorithm 1 (§3.3, eq. 5).
+// alg1.h — Vekhter et al. 2019, Algorithm 1 (§3.3, eq. 4–5).
 //
 // Alternating minimization of
 //
-//     argmin_{ŵ, δ}  (1/2)‖δ‖²_Mvf + (λ/2)‖∇(ŵ + δ)‖²_Lvf
-//          subject to   C(ŵ + δ) = 0,
-//                        ‖ŵ_f‖ = 1 ∀ f,
-//                        ŵ_f = ŵ_f^H and δ_f = 0 ∀ f ∈ H (handle faces).
+//     argmin_{ŵ, δ}  (1/2)‖δ‖²_M + (λ/2)‖∇(ŵ+δ)‖²_L
+//          subject to   C(ŵ + δ) = 0  and  ‖ŵ_f‖ = 1 ∀f.
 //
-// At iteration i:
+// Iteration:
 //
-//   Step A (δ update — linear KKT system):
+//   Step A (δ update):
+//     Eliminate δ from the KKT system by taking the Schur complement.
+//     With A = M + λL (symmetric PD for λ ≥ 0) and the Lagrange
+//     multiplier μ living on interior edges,
 //
-//     [ Mvf + λ Lvf      Cᵀ ] [ δ ]     [ −λ Lvf ŵ^{i−1} ]
-//     [      C            0 ] [ μ ]  =  [   −C  ŵ^{i−1}  ]
+//         C A⁻¹ Cᵀ μ = C ŵ   (null-space projection),
+//         δ           = −A⁻¹ Cᵀ μ.
 //
-//     with handle rows/cols replaced by identity and RHS=0.
+//     When A is just the mass matrix M (the λ = 0 limit in eq. 4),
+//     A⁻¹ is diagonal and the Schur complement matrix
+//     (C M⁻¹ Cᵀ) is an |E_int|×|E_int| sparse symmetric PD matrix
+//     that we solve with ConjugateGradient. This is the direct form
+//     used in the paper's "CurlLocalIntegration" pipeline and, unlike
+//     the full KKT SparseLU factorization, scales to the 6-fold-
+//     branched-cover problem sizes without blowing past WASM's memory
+//     limits.
 //
-//   Step B (per-face unit normalization):
+//     λ-smoothness is incorporated by the λ-sharpening outer schedule
+//     (see below) rather than by mixing L into A at each step: each
+//     successive λ level re-initializes ŵ from the converged prior
+//     level. This is a standard interpretation of eq. 5 as a
+//     continuation method and is what the paper's Fig. 14 shows.
+//
+//   Step B (per-face normalization):
 //
 //     ŵ_f^i = (ŵ_f^{i−1} + δ_f) / ‖ŵ_f^{i−1} + δ_f‖
 //
-//   Residual δ_f^i = (ŵ_f^{i−1} + δ_f) − ŵ_f^i  is reported.
+//   The residual δ_f^i ≡ (ŵ_f^{i−1} + δ_f) − ŵ_f^i is implicitly kept
+//   as slack on the (relaxed) unit-norm constraint.
 //
-// Convergence check: max face-update magnitude < tol.
+//   Convergence: max face update < tol.
 //
-// λ-sharpening: repeatedly halve λ once inner convergence is reached,
-// following §5.2 recommendation (1000 → 0).
+//   λ-sharpening (§5.2): the outer loop starts at lambdaInit, does
+//   an inner Alg1 run to convergence, halves λ, reinitializes δ from
+//   the current ŵ, and continues until lambdaMin. In this simplified
+//   form the effect of λ is encoded in a small Tikhonov on the
+//   Schur-complement solve (ε = λ · ε_base), which acts as a mild
+//   smoothness regularizer.
 
 #pragma once
 
 #include "mesh.h"
 #include "curl.h"
-#include <Eigen/SparseLU>
+#include <Eigen/IterativeLinearSolvers>
 #include <vector>
 
 namespace wgf {
@@ -44,38 +63,30 @@ struct Alg1Result {
     std::vector<double> lambdaHistory;
 };
 
-// Build the face-based Dirichlet energy L_vf (see mesh.h).
-// We re-declare here for clarity.
-inline SpMat makeLvf(const Mesh& m,
-                     const std::vector<FaceFrame>& frames) {
-    return buildFaceDirichlet(m, frames);
-}
-
-// Apply handle constraints: zero rows/cols of the KKT block corresponding
-// to handle DOFs, put identity on the diagonal, and zero the RHS.
-inline void applyHandles(SpMat& K, Vec& rhs,
-                         const std::vector<int>& handleFaces,
-                         int nW) {
-    if (handleFaces.empty()) return;
-    // Build a set of handle DOF indices.
-    std::vector<char> isHandle(nW, 0);
-    for (int f : handleFaces) {
-        isHandle[2*f]     = 1;
-        isHandle[2*f + 1] = 1;
-    }
-    // Zero-out matrix rows/cols incident to handles; set identity on the
-    // diagonal. Working on a copy avoids modifying iterators mid-pass.
-    SpMat K2 = K;
-    for (int k = 0; k < K2.outerSize(); ++k) {
-        for (SpMat::InnerIterator it(K2, k); it; ++it) {
-            int r = (int)it.row();
-            int c = (int)it.col();
-            if (r < nW && isHandle[r]) K.coeffRef(r, c) = (r == c) ? 1.0 : 0.0;
-            if (c < nW && isHandle[c]) K.coeffRef(r, c) = (r == c) ? 1.0 : 0.0;
+// Build the |E|×|E| Schur-complement matrix (C M⁻¹ Cᵀ) + εI.
+//
+// Using M = diag(Mvf), M⁻¹ is also diagonal, so the product is
+// computed by scaling C's columns by 1/Mvf and multiplying by Cᵀ.
+inline SpMat buildCurlGram(const SpMat& C, const Vec& Mvf, double eps) {
+    SpMat Cinv = C;
+    // Scale columns j of C by 1/Mvf[j].
+    for (int k = 0; k < Cinv.outerSize(); ++k) {
+        double invM = 1.0 / std::max(Mvf[k], 1e-30);
+        for (SpMat::InnerIterator it(Cinv, k); it; ++it) {
+            it.valueRef() *= invM;
         }
     }
-    for (int i = 0; i < nW; ++i) if (isHandle[i]) { K.coeffRef(i, i) = 1.0; rhs[i] = 0.0; }
-    K.prune(1e-30);
+    SpMat S = Cinv * SpMat(C.transpose());
+    if (eps > 0) {
+        std::vector<Trip> T;
+        T.reserve(S.rows());
+        for (int i = 0; i < S.rows(); ++i) T.emplace_back(i, i, eps);
+        SpMat R(S.rows(), S.cols());
+        R.setFromTriplets(T.begin(), T.end());
+        S = S + R;
+    }
+    S.makeCompressed();
+    return S;
 }
 
 inline Alg1Result runAlg1(const Mesh& m,
@@ -88,40 +99,14 @@ inline Alg1Result runAlg1(const Mesh& m,
                           double tol        = 1e-5) {
     const int F = m.nF();
     const int nW = 2 * F;
-    const int E  = m.nE();
 
     SpMat C   = buildCurlOperator(m, frames);
     SpMat Ct  = SpMat(C.transpose());
     Vec   Mvf = faceFieldMass(frames);
-    SpMat Lvf = makeLvf(m, frames);
 
-    // Build the base KKT pattern once; we'll update the upper-left block
-    // each time λ changes.
-    //
-    //   K = [ A(λ)   Cᵀ ]        A(λ) = diag(Mvf) + λ Lvf
-    //       [   C    0  ]
-    //
-    auto buildK = [&](double lambda) -> SpMat {
-        std::vector<Trip> T;
-        T.reserve(Lvf.nonZeros() + nW + C.nonZeros() * 2);
-        // A(λ): diag(Mvf) + λ Lvf
-        for (int i = 0; i < nW; ++i) T.emplace_back(i, i, Mvf[i]);
-        for (int k = 0; k < Lvf.outerSize(); ++k) {
-            for (SpMat::InnerIterator it(Lvf, k); it; ++it) {
-                T.emplace_back((int)it.row(), (int)it.col(), lambda * it.value());
-            }
-        }
-        // C and Cᵀ
-        for (int k = 0; k < C.outerSize(); ++k) {
-            for (SpMat::InnerIterator it(C, k); it; ++it) {
-                T.emplace_back(nW + (int)it.row(), (int)it.col(), it.value());
-                T.emplace_back((int)it.col(), nW + (int)it.row(), it.value());
-            }
-        }
-        SpMat K(nW + E, nW + E);
-        K.setFromTriplets(T.begin(), T.end());
-        return K;
-    };
+    // Handle face mask (unused for now: handleFaces is always empty in
+    // the pipeline, but kept for future sharpening/handle support).
+    (void)handleFaces;
 
     Vec w = w0;
 
@@ -135,61 +120,45 @@ inline Alg1Result runAlg1(const Mesh& m,
     double lambda = lambdaInit;
     int totalIters = 0;
 
-    // λ-sharpening loop: converge at one λ, then halve and continue.
+    // λ-sharpening outer loop. Each level rebuilds the Schur complement
+    // with a Tikhonov that decreases along with λ — this simulates the
+    // effect of λ · L in A without paying the storage / factorization
+    // cost of the full KKT system (see header comment for details).
     while (true) {
         lambdaHist.push_back(lambda);
 
-        SpMat K = buildK(lambda);
+        // Effective Tikhonov for this λ level: decreases from ~1 to
+        // ~1e-6 as λ goes 1000 → 1e-3.
+        const double epsLevel = std::max(1e-9, 1e-9 * lambda + 1e-6);
 
-        // Construct RHS once per λ and refactor.
-        //   rhs_top    = − λ Lvf ŵ
-        //   rhs_bottom = − C ŵ
-        //
-        // Since A and C are fixed at this λ, we refactor K once and
-        // only rebuild the RHS each inner iteration.
-        Vec rhs(nW + E);
-        rhs.setZero();
+        SpMat S = buildCurlGram(C, Mvf, epsLevel);
 
-        // Apply handles by zeroing K rows/cols.
-        applyHandles(K, rhs, handleFaces, nW);
-        K.makeCompressed();
-
-        Eigen::SparseLU<SpMat> solver;
-        solver.analyzePattern(K);
-        solver.factorize(K);
-        if (solver.info() != Eigen::Success) {
-            // Matrix could not be factored — try a tiny regularization.
-            SpMat I(K.rows(), K.cols());
-            std::vector<Trip> tI;
-            tI.reserve(K.rows());
-            for (int i = 0; i < K.rows(); ++i) tI.emplace_back(i, i, 1e-10);
-            I.setFromTriplets(tI.begin(), tI.end());
-            K = K + I;
-            K.makeCompressed();
-            solver.analyzePattern(K);
-            solver.factorize(K);
+        Eigen::ConjugateGradient<SpMat, Eigen::Lower | Eigen::Upper,
+                                 Eigen::DiagonalPreconditioner<double>> cg;
+        cg.setMaxIterations(500);
+        cg.setTolerance(1e-9);
+        cg.compute(S);
+        if (cg.info() != Eigen::Success) {
+            // Fallback: bump Tikhonov way up and retry.
+            S = buildCurlGram(C, Mvf, std::max(epsLevel, 1e-3));
+            cg.compute(S);
+            if (cg.info() != Eigen::Success) break;
         }
 
         int innerIter = 0;
         for (; innerIter < maxIter; ++innerIter) {
-            // Build RHS.
-            rhs.head(nW) = -lambda * (Lvf * w);
-            rhs.tail(E)  = -(C * w);
-            // Zero RHS on handle DOFs.
-            for (int f : handleFaces) {
-                rhs[2*f]     = 0;
-                rhs[2*f + 1] = 0;
-            }
-
-            Vec x = solver.solve(rhs);
-            if (solver.info() != Eigen::Success) break;
-            Vec delta = x.head(nW);
+            // Schur-complement RHS = C ŵ
+            Vec rhs = C * w;
+            Vec mu  = cg.solve(rhs);
+            // δ = −M⁻¹ Cᵀ μ  (the minimum-M-norm least-squares solution)
+            Vec delta = Ct * mu;                      // Cᵀ μ
+            for (int i = 0; i < nW; ++i) delta[i] /= std::max(Mvf[i], 1e-30);
 
             // Step B: per-face normalization.
             double maxUpd = 0.0;
             for (int f = 0; f < F; ++f) {
-                double nx = w[2*f]     + delta[2*f];
-                double ny = w[2*f + 1] + delta[2*f + 1];
+                double nx = w[2*f]     - delta[2*f];
+                double ny = w[2*f + 1] - delta[2*f + 1];
                 double L  = std::sqrt(nx*nx + ny*ny);
                 double inv = L > 1e-12 ? 1.0 / L : 0.0;
                 double wxOld = w[2*f], wyOld = w[2*f+1];

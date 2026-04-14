@@ -49,6 +49,7 @@ type EmModule = {
   _free:   (p: number) => void;
   ccall:   (name: string, ret: string | null, argTypes: string[], args: unknown[]) => unknown;
   cwrap:   (name: string, ret: string | null, argTypes: string[]) => (...args: unknown[]) => unknown;
+  UTF8ToString: (p: number, maxBytes?: number) => string;
 };
 
 let modulePromise: Promise<EmModule> | null = null;
@@ -138,7 +139,9 @@ export async function runWgfPipeline(
     ) as number;
 
     if (handle === 0) {
-      throw new Error('wgf_run failed (returned null handle)');
+      const errPtr = mod.ccall('wgf_last_error', 'number', [], []) as number;
+      const errMsg = errPtr ? mod.UTF8ToString(errPtr) : '';
+      throw new Error('wgf_run failed: ' + (errMsg || '(no message)'));
     }
 
     const nSeg = mod.ccall('wgf_result_num_segments', 'number', ['number'], [handle]) as number;
