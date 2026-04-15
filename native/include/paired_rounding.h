@@ -242,30 +242,32 @@ inline void pairedRoundTheta(
     const double phase  = 2.0 * M_PI / numISOLines;
     const double offset = M_PI / numISOLines;
 
-    // Gauss-Seidel rounding (Bommes 2009 §4.3): round one batch of
-    // integer variables per iteration and re-solve. To keep the total
-    // work bounded, we round in batches of ~5% of ncorrs so we make
-    // 20 passes total rather than ncorrs.
+    // Gauss-Seidel rounding with a small batch per iteration.
+    //
+    // Strict Bommes 2009 §4.3 / CoMISo rounds ONE variable per solve,
+    // which requires ncorrs solves total. For ncorrs ~ 6000 that is
+    // ~10 minutes of CG even on native, and the output is
+    // indistinguishable from batching the top-~1% confident variables
+    // per iteration. We cap the batch at max(1, ncorrs/100) so the
+    // total solve count stays in the ~100-200 range while still
+    // iteratively re-solving after each rounding decision.
     std::vector<char>   fixedMask(ncorrs, 0);
     std::vector<double> nFixed(ncorrs, 0.0);
     int numRounded = 0;
-    const int batchSize = std::max(1, ncorrs / 20);
-    int passes = 0;
+    const int batchSize = std::max(1, ncorrs / 100);
 
     Vec delta, nCont;
     while (numRounded < ncorrs) {
-        ++passes;
         reportProgress(STAGE_ASSEMBLE, numRounded, ncorrs,
                        "Paired rounding (Gauss-Seidel)");
         if (!solveContinuousRelaxation(L, LepsFactor, pairs, fixedMask, nFixed,
                                        theta, phase, offset, delta, nCont)) {
-            std::fprintf(stderr, "[paired-rounding] CG failed at pass %d\n", passes);
+            std::fprintf(stderr, "[paired-rounding] CG failed at iter %d\n", numRounded);
             break;
         }
 
-        // Collect rounding errors for non-fixed pairs and pick the
-        // `batchSize` smallest ones.
-        std::vector<std::pair<double,int>> errs;   // (|err|, pairIndex)
+        // Collect all non-fixed rounding errors, sort, round the top N.
+        std::vector<std::pair<double,int>> errs;
         errs.reserve(ncorrs - numRounded);
         for (int i = 0; i < ncorrs; ++i) {
             if (fixedMask[i]) continue;
@@ -295,25 +297,51 @@ inline void pairedRoundTheta(
         theta[i] = std::remainder(theta[i], 2.0 * M_PI);
     }
 
-    std::fprintf(stderr, "[paired-rounding] finished in %d passes\n", passes);
+    std::fprintf(stderr, "[paired-rounding] %d variables rounded\n", numRounded);
 }
 
-// Extract isolines from a CIRCULAR (periodic) angular scalar field.
+// Chain-based isoline tracing on a CIRCULAR (periodic) angular scalar.
 //
-// For a real-valued theta in (-pi, pi], level sets at
-//     val = -pi + k * (2pi / numISOLines),  k = 0 .. numISOLines - 1
-// are extracted. Each triangle edge whose two endpoints straddle the
-// target val (accounting for the 2pi wrap) contributes one crossing,
-// and triangles with exactly two crossings emit one segment.
+// This is a faithful port of CoverMesh::extractIsoline from
+// the13fools/weaving-geodesic-foliations. For each target isoline value,
+// it starts at any unvisited face with a level-set crossing, then walks
+// face-to-face following the level set until it either closes the loop
+// or hits a boundary / already-visited face. Each unvisited start face
+// produces up to 2 traces (one in each direction along the level set),
+// which are stitched through the start face's connecting segment.
 //
-// The "straddle" predicate handles the periodic case: if the two endpoint
-// values differ by more than pi, we unwrap one of them by adding 2pi
-// and re-test. This matches the reference CoverMesh::crosses().
+// The `crosses` helper handles the periodic wrap: if the two endpoint
+// theta values differ by more than pi, we unwrap one of them by adding
+// 2pi and re-test. Matches CoverMesh::crosses() exactly.
+//
+// Output format: a flat list of AngularSegment, where consecutive
+// segments with the same `chainId` form a continuous polyline. Each
+// segment shares its end-point with the next segment's start-point by
+// construction, so downstream chaining/stitching in kagome.ts works
+// without any coordinate-matching fuzziness.
 struct AngularSegment {
     Eigen::Vector3d a, b;
-    int faceIdx;
-    int iso;  // which level index 0..numISOLines-1
+    int faceIdx;     // cover face this segment lives on
+    int iso;         // level index 0..numISOLines-1
+    int chainId;     // consecutive segments with the same chainId are one polyline
 };
+
+// Helper: given a face f and the "side" index j (0..2) as the reference
+// uses (= the edge opposite vertex j in the face's F-row), return the
+// index of the neighbor face across that edge, or -1 if none.
+inline int faceSideNeighbor(const Mesh& m, int f, int j) {
+    // Reference side j = edge between F(f, (j+1)%3) and F(f, (j+2)%3).
+    // My half-edge positions in face f are:
+    //   pos 0: F(f,0) -> F(f,1)    (edge opposite F(f,2), reference side 2)
+    //   pos 1: F(f,1) -> F(f,2)    (edge opposite F(f,0), reference side 0)
+    //   pos 2: F(f,2) -> F(f,0)    (edge opposite F(f,1), reference side 1)
+    // So pos = (j + 2) % 3.
+    int hePos = (j + 2) % 3;
+    int h = m.f2he[f] + hePos;
+    int twin = m.he[h].twin;
+    if (twin < 0) return -1;
+    return m.he[twin].face;
+}
 
 inline std::vector<AngularSegment>
 extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
@@ -346,34 +374,137 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         return false;
     };
 
-    for (int k = 0; k < numISOLines; ++k) {
-        const double isoval = minval + (maxval - minval) * double(k) / double(numISOLines);
+    // Given a face f, side j in reference numbering, return the 3D point
+    // at barycentric bary along that edge. Side j's edge connects
+    // F(f, (j+1)%3) and F(f, (j+2)%3); bary=0 is at (j+1)%3, bary=1 is
+    // at (j+2)%3.
+    auto sidePoint = [&](int f, int side, double bary) -> Eigen::Vector3d {
+        int vp1 = m.F(f, (side + 1) % 3);
+        int vp2 = m.F(f, (side + 2) % 3);
+        Eigen::Vector3d p1 = m.V.row(vp1);
+        Eigen::Vector3d p2 = m.V.row(vp2);
+        return (1.0 - bary) * p1 + bary * p2;
+    };
 
-        for (int f = 0; f < nF; ++f) {
-            int v[3] = { m.F(f, 0), m.F(f, 1), m.F(f, 2) };
-            double r[3] = { theta[v[0]], theta[v[1]], theta[v[2]] };
-            Eigen::Vector3d p[3] = {
-                m.V.row(v[0]), m.V.row(v[1]), m.V.row(v[2])
-            };
+    int nextChainId = 0;
 
-            Eigen::Vector3d cp[3];
+    for (int isoIdx = 0; isoIdx < numISOLines; ++isoIdx) {
+        const double isoval = minval + (maxval - minval) * double(isoIdx) / double(numISOLines);
+
+        std::vector<char> visited(nF, 0);
+
+        for (int seed = 0; seed < nF; ++seed) {
+            if (visited[seed]) continue;
+            visited[seed] = 1;
+
+            // Find which of the 3 sides of `seed` cross this isoline.
+            int crossings[2]  = {-1, -1};
+            double barys[2]   = {0, 0};
             int nCross = 0;
-            for (int e = 0; e < 3; ++e) {
-                int a = e, b = (e + 1) % 3;
+            for (int j = 0; j < 3 && nCross < 2; ++j) {
+                int vp1 = m.F(seed, (j + 1) % 3);
+                int vp2 = m.F(seed, (j + 2) % 3);
                 double bary;
-                if (crosses(isoval, r[a], r[b], bary)) {
-                    if (nCross < 3)
-                        cp[nCross] = p[a] + bary * (p[b] - p[a]);
+                if (crosses(isoval, theta[vp1], theta[vp2], bary)) {
+                    crossings[nCross] = j;
+                    barys[nCross] = bary;
                     nCross++;
                 }
             }
-            if (nCross == 2) {
-                AngularSegment s;
-                s.a = cp[0];
-                s.b = cp[1];
-                s.faceIdx = f;
-                s.iso = k;
-                out.push_back(s);
+            if (nCross < 2) continue;
+
+            // For each of the 2 crossing sides, walk outward tracing the
+            // level set until we hit a boundary or a visited face.
+            // tracePieces[0] is the trace leaving through `crossings[0]`,
+            // tracePieces[1] is the trace leaving through `crossings[1]`.
+            //
+            // Each trace is a list of {face, entry_side, entry_bary,
+            // exit_side, exit_bary}. The seed face is added at the end
+            // as the "connecting segment" between the two pieces.
+            struct TraceSeg {
+                int face;
+                int side0, side1;
+                double bary0, bary1;
+            };
+            std::vector<TraceSeg> traces[2];
+
+            for (int piece = 0; piece < 2; ++piece) {
+                int prevface = seed;
+                double bary = barys[piece];
+                int curface = faceSideNeighbor(m, seed, crossings[piece]);
+                while (curface != -1 && !visited[curface]) {
+                    visited[curface] = 1;
+                    TraceSeg seg;
+                    seg.face = curface;
+
+                    // Find which side of curface faces prevface (entry).
+                    seg.side0 = -1;
+                    for (int k = 0; k < 3; ++k) {
+                        if (faceSideNeighbor(m, curface, k) == prevface) {
+                            seg.side0 = k;
+                            seg.bary0 = 1.0 - bary;
+                            break;
+                        }
+                    }
+                    if (seg.side0 < 0) break;
+
+                    // Find the other crossing on curface (exit).
+                    bool extended = false;
+                    for (int k = 0; k < 3; ++k) {
+                        if (k == seg.side0) continue;
+                        int vp1 = m.F(curface, (k + 1) % 3);
+                        int vp2 = m.F(curface, (k + 2) % 3);
+                        double newbary;
+                        if (crosses(isoval, theta[vp1], theta[vp2], newbary)) {
+                            seg.side1 = k;
+                            seg.bary1 = newbary;
+                            bary = newbary;
+                            traces[piece].push_back(seg);
+                            prevface = curface;
+                            curface = faceSideNeighbor(m, curface, k);
+                            extended = true;
+                            break;
+                        }
+                    }
+                    if (!extended) break;
+                }
+            }
+
+            // Build the final polyline, chain id, and emit segments.
+            int cid = nextChainId++;
+
+            // Part 1: traces[0] reversed + connecting segment on `seed`
+            // + traces[1] forward. For the reversed piece, swap entry/exit.
+            for (auto it = traces[0].rbegin(); it != traces[0].rend(); ++it) {
+                TraceSeg rev = *it;
+                std::swap(rev.side0, rev.side1);
+                std::swap(rev.bary0, rev.bary1);
+                AngularSegment seg;
+                seg.a = sidePoint(rev.face, rev.side0, rev.bary0);
+                seg.b = sidePoint(rev.face, rev.side1, rev.bary1);
+                seg.faceIdx = rev.face;
+                seg.iso = isoIdx;
+                seg.chainId = cid;
+                out.push_back(seg);
+            }
+            // Connecting segment across the seed face.
+            {
+                AngularSegment seg;
+                seg.a = sidePoint(seed, crossings[0], barys[0]);
+                seg.b = sidePoint(seed, crossings[1], barys[1]);
+                seg.faceIdx = seed;
+                seg.iso = isoIdx;
+                seg.chainId = cid;
+                out.push_back(seg);
+            }
+            for (const auto& tseg : traces[1]) {
+                AngularSegment seg;
+                seg.a = sidePoint(tseg.face, tseg.side0, tseg.bary0);
+                seg.b = sidePoint(tseg.face, tseg.side1, tseg.bary1);
+                seg.faceIdx = tseg.face;
+                seg.iso = isoIdx;
+                seg.chainId = cid;
+                out.push_back(seg);
             }
         }
     }
