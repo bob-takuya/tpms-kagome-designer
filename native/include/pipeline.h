@@ -33,11 +33,7 @@
 namespace wgf {
 
 struct PipelineOptions {
-    // Browser-friendly defaults. The paper recommends lambdaInit=1000,
-    // lambdaMin→0, alg1MaxIter~50 and jointIters=10, which produces
-    // excellent results but takes minutes of CG solves in WASM. These
-    // smaller numbers converge fast enough for interactive use while
-    // still running the same algorithms end-to-end.
+    // Defaults aligned with the implementation spec (Vekhter et al. 2019).
     double lambdaInit     = 1000.0;
     double lambdaMin      = 1e-3;
     int    alg1MaxIter    = 50;
