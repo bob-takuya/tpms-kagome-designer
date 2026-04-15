@@ -27,6 +27,8 @@
 #include "alg2.h"
 #include "cover.h"
 #include "isolines.h"
+#include "curl_local_integration.h"
+#include "gn_global_integration.h"
 #include "paired_rounding.h"
 #include "progress.h"
 
@@ -141,24 +143,50 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     int nComp = labelComponents(cov.mesh, comp);
     R.numComponents = nComp;
 
-    // 5. Per-component pipeline: Alg 1 + Alg 2 + Eq 8 (single θ per cover component).
+    // 5. Per-component scalar field integration (Vekhter §4).
     //
-    // We accumulate per-vertex theta values into a global `thetaCover`
-    // vector on the cover mesh, so that paired rounding can operate on
-    // it as one continuous (real) angular scalar field.
+    // For each connected component of the cover:
+    //   (a) Initialize the per-face direction field w from the base-face
+    //       layer angle (atan2(w_base) + layer * π/3, parallel-transported
+    //       into the sub-mesh's frame).
+    //   (b) Run per-component Algorithm 1 (curl-free projection with a
+    //       single λ level) to refine w on this component.
+    //   (c) Call CurlLocalIntegration to obtain the initial scale s per
+    //       face (generalized eigenproblem with face Laplacian regulariser).
+    //   (d) Rescale s anti-aliasing: s *= π / avgEdgeLen / maxS * userScale
+    //       (matches the reference's `s_scale` step in integrateField).
+    //   (e) Call GNGlobalIntegration to obtain theta per cover vertex
+    //       (alternating Gauss-Newton inverse power iteration + 1x1 scale
+    //       update, matching the reference's `globallyIntegrateOneComponent`
+    //       verbatim).
+    //   (f) Write theta and s back into global cover arrays.
     Vec thetaCover = Vec::Zero(cov.mesh.nV());
-    std::vector<char> thetaSet(cov.mesh.nV(), 0);
+    Vec scalesCover = Vec::Zero(cov.mesh.nF());
+
+    // Average base-mesh edge length, used by the anti-aliasing rescale.
+    double avgEdgeLen = 0;
+    {
+        int cnt = 0;
+        for (const auto& e : base.eInt) {
+            int h = e.first;
+            int va = base.heStart(h);
+            int vb = base.he[h].vertex;
+            avgEdgeLen += (base.V.row(vb) - base.V.row(va)).norm();
+            cnt++;
+        }
+        if (cnt > 0) avgEdgeLen /= cnt;
+        if (avgEdgeLen < 1e-30) avgEdgeLen = 1.0;
+    }
 
     for (int c = 0; c < nComp; ++c) {
-        reportProgress(STAGE_COMPONENT, c, nComp, "Cover: Alg 1 + Alg 2 + Eq. 8");
+        reportProgress(STAGE_COMPONENT, c, nComp, "Cover: Curl-local + GN-global");
         SubMesh S = extractComponent(cov.mesh, comp, c);
         if (S.mesh.nV() < 3 || S.mesh.nF() < 1) continue;
 
         auto Sframes = buildFaceFrames(S.mesh);
 
-        // Initialize w on this component from the base-face layer angles.
-        // Each cover sub-face inherits its direction from the corresponding
-        // base face's 6-RoSy representative rotated by layer·π/3.
+        // (a) Initial direction field on this component, inherited from
+        //     the base-face layer angle.
         Vec wS(2 * S.mesh.nF());
         for (int f = 0; f < S.mesh.nF(); ++f) {
             int covFace = S.oldFaceIdx[f];
@@ -176,8 +204,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             wS[2*f + 1] = v / Ln;
         }
 
-        // Per-component Alg 1 (one λ level, few inner iterations —
-        // each component is small).
+        // (b) Per-component Alg 1 to sharpen the direction field.
         Alg1Result RS = runAlg1(S.mesh, Sframes, wS, {},
                                 /*lambdaInit=*/1.0,
                                 /*lambdaMin =*/1e-2,
@@ -185,20 +212,37 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
                                 opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
-        // Joint (s, θ) optimization (Vekhter §4, Eq 8).
-        JointResult J = solveJointScalar(S.mesh, Sframes, RS.w,
-                                         opt.mu, opt.jointIters);
+        // (c) Curl local integration → initial s.
+        Vec sCompRaw;
+        curlLocalIntegration(S.mesh, Sframes, RS.w,
+                             /*sreg=*/1e-4, sCompRaw);
 
-        // Write this component's theta back into the global cover theta
-        // (converting the complex per-vertex ψ = (re, im) into a real
-        // angular value θ_real = atan2(im, re), which is what paired
-        // rounding + angular isoline extraction expect).
+        // (d) Anti-aliasing rescale (matches CoverMesh::integrateField).
+        double maxS = 0;
+        for (int i = 0; i < sCompRaw.size(); ++i) {
+            double a = std::fabs(sCompRaw[i]);
+            if (a > maxS) maxS = a;
+        }
+        if (maxS < 1e-30) maxS = 1.0;
+        double sScale = M_PI / avgEdgeLen / maxS;
+        sCompRaw *= opt.userScale * sScale;
+
+        // (e) GN global integration → theta.
+        Vec thetaComp;
+        gnGlobalIntegration(S.mesh, Sframes, RS.w, sCompRaw, thetaComp,
+                            /*outerIters=*/6,
+                            /*powerIters=*/20,
+                            STAGE_COMPONENT,
+                            "Cover: GN global integration");
+
+        // (f) Scatter back into global cover vectors.
         for (int sv = 0; sv < S.mesh.nV(); ++sv) {
             int cv = S.oldVertexIdx[sv];
-            double re = J.theta[2*sv];
-            double im = J.theta[2*sv + 1];
-            thetaCover[cv] = std::atan2(im, re);
-            thetaSet[cv] = 1;
+            thetaCover[cv] = thetaComp[sv];
+        }
+        for (int f = 0; f < S.mesh.nF(); ++f) {
+            int cf = S.oldFaceIdx[f];
+            scalesCover[cf] = sCompRaw[f];
         }
     }
 
@@ -209,9 +253,6 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     // projected stripes from the two halves of each kagome line
     // interleave cleanly at the half-period offset.
     {
-        // The number of stripes per 2π determines the half-period
-        // offset used in the rounding constraint. Use a density based
-        // on userScale (1 = paper default ≈ 8 stripes per unit cell).
         int numISOLines = std::max(4, (int)std::round(8.0 * opt.userScale));
         pairedRoundTheta(cov.mesh, cov, thetaCover, numISOLines);
 
