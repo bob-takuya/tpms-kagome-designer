@@ -37,6 +37,7 @@
 #include "curl.h"
 #include <Eigen/IterativeLinearSolvers>
 #include <Eigen/SparseCholesky>
+#include <limits>
 
 namespace wgf {
 
@@ -86,8 +87,8 @@ inline SpMat buildIntegrabilityB(const Mesh& m,
     return B;
 }
 
-// Face adjacency Laplacian on the scalar field s (|F|×|F|).
-// Uniform weights — entries:  L[i,i] = deg(i),  L[i,j] = −1.
+// Face adjacency Laplacian on the scalar field s (|F|×|F|), weighted by
+// inverse cotangent edge metric as in the reference formulation.
 inline SpMat buildFaceLaplacian(const Mesh& m) {
     const int F = m.nF();
     std::vector<Trip> T;
@@ -96,10 +97,11 @@ inline SpMat buildFaceLaplacian(const Mesh& m) {
         int h = e.first;
         int fi = m.he[h].face;
         int fj = m.he[m.he[h].twin].face;
-        T.emplace_back(fi, fi,  1.0);
-        T.emplace_back(fj, fj,  1.0);
-        T.emplace_back(fi, fj, -1.0);
-        T.emplace_back(fj, fi, -1.0);
+        double w = 1.0 / std::max(1e-30, cotWeight(m, h));
+        T.emplace_back(fi, fi,  w);
+        T.emplace_back(fj, fj,  w);
+        T.emplace_back(fi, fj, -w);
+        T.emplace_back(fj, fi, -w);
     }
     SpMat L(F, F);
     L.setFromTriplets(T.begin(), T.end());
@@ -120,7 +122,7 @@ inline Vec initialScaling(const Mesh& m,
                           const std::vector<FaceFrame>& frames,
                           const Vec& w,
                           double mu = 1e-4,
-                          int maxIter = 25) {
+                          int maxIter = 100) {
     const int F  = m.nF();
     const int nD = 2 * F;
     const int nS = F;
@@ -201,6 +203,7 @@ inline Vec initialScaling(const Mesh& m,
     Vec x = Vec::Random(N);
     a2normalize(x);
 
+    double prevRq = std::numeric_limits<double>::infinity();
     for (int it = 0; it < maxIter; ++it) {
         // Inverse iteration: rhs = A2 * x
         Vec rhs(N);
@@ -215,6 +218,14 @@ inline Vec initialScaling(const Mesh& m,
 
         a2normalize(y);
         x = y;
+
+        const Vec Ax = A * x;
+        const double num = x.dot(Ax);
+        double den = 0;
+        for (int i = 0; i < N; ++i) den += A2diag[i] * x[i] * x[i];
+        const double rq = num / std::max(den, 1e-30);
+        if (std::isfinite(prevRq) && std::abs(prevRq - rq) < 1e-8) break;
+        prevRq = rq;
     }
 
     // Extract s (second block of x).
@@ -377,12 +388,13 @@ inline JointResult solveJointScalar(const Mesh& m,
                                     const std::vector<FaceFrame>& frames,
                                     const Vec& w,
                                     double mu = 1e-4,
-                                    int nAltern = 10) {
+                                    int nAltern = 10,
+                                    double userScale = 1.0) {
     // 1. Initial s via Algorithm 2.
-    Vec s = initialScaling(m, frames, w, mu, 25);
+    Vec s = initialScaling(m, frames, w, mu, 100);
 
     // 2. Anti-aliasing rescale.
-    rescaleAliasFree(s, m, frames, w, 1.0);
+    rescaleAliasFree(s, m, frames, w, userScale);
 
     // 3. Alternating (θ, s) updates.
     Vec theta;
@@ -447,7 +459,7 @@ inline JointResult solveJointScalar(const Mesh& m,
             Vec ds = solver.solve(rhs);
             s += ds;
         }
-        rescaleAliasFree(s, m, frames, w, 1.0);
+        rescaleAliasFree(s, m, frames, w, userScale);
     }
 
     JointResult R;

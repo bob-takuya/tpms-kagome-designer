@@ -51,7 +51,7 @@
 #include "mesh.h"
 #include "curl.h"
 #include "progress.h"
-#include <Eigen/IterativeLinearSolvers>
+#include <Eigen/SparseLU>
 #include <vector>
 #include <string>
 
@@ -64,32 +64,6 @@ struct Alg1Result {
     int iterations;
     std::vector<double> lambdaHistory;
 };
-
-// Build the |E|×|E| Schur-complement matrix (C M⁻¹ Cᵀ) + εI.
-//
-// Using M = diag(Mvf), M⁻¹ is also diagonal, so the product is
-// computed by scaling C's columns by 1/Mvf and multiplying by Cᵀ.
-inline SpMat buildCurlGram(const SpMat& C, const Vec& Mvf, double eps) {
-    SpMat Cinv = C;
-    // Scale columns j of C by 1/Mvf[j].
-    for (int k = 0; k < Cinv.outerSize(); ++k) {
-        double invM = 1.0 / std::max(Mvf[k], 1e-30);
-        for (SpMat::InnerIterator it(Cinv, k); it; ++it) {
-            it.valueRef() *= invM;
-        }
-    }
-    SpMat S = Cinv * SpMat(C.transpose());
-    if (eps > 0) {
-        std::vector<Trip> T;
-        T.reserve(S.rows());
-        for (int i = 0; i < S.rows(); ++i) T.emplace_back(i, i, eps);
-        SpMat R(S.rows(), S.cols());
-        R.setFromTriplets(T.begin(), T.end());
-        S = S + R;
-    }
-    S.makeCompressed();
-    return S;
-}
 
 // Run Algorithm 1. The `progressStage` argument, when non-negative,
 // triggers reportProgress() calls from inside the inner loop so the
@@ -108,9 +82,10 @@ inline Alg1Result runAlg1(const Mesh& m,
     const int F = m.nF();
     const int nW = 2 * F;
 
-    SpMat C   = buildCurlOperator(m, frames);
-    SpMat Ct  = SpMat(C.transpose());
-    Vec   Mvf = faceFieldMass(frames);
+    SpMat C    = buildCurlOperator(m, frames);
+    Vec   Mvf  = faceFieldMass(frames);
+    SpMat Lvf  = buildFaceDirichlet(m, frames);
+    const int E = C.rows();
 
     // Handle face mask (unused for now: handleFaces is always empty in
     // the pipeline, but kept for future sharpening/handle support).
@@ -126,20 +101,15 @@ inline Alg1Result runAlg1(const Mesh& m,
 
     std::vector<double> lambdaHist;
 
-    // Build the λ schedule up front: coarse geometric sequence from
-    // lambdaInit down to lambdaMin, stepping by 1/3 per level. This is
-    // the simplified browser-friendly version of the paper's §5.2
-    // recommendation (which halves 1000 → 0 over 21 levels). Halving
-    // would run a full CG-driven inner loop 21 times per pipeline
-    // execution, which in WASM takes minutes. A 3-step schedule is
-    // both fast enough for interactive use and, in practice, produces
-    // near-identical curl-free fields.
+    // Build the λ schedule up front (paper §5.2): progressively reduce
+    // λ by 1/2 to sharpen the field while preserving a robust smooth
+    // warm-start from the previous level.
     std::vector<double> lambdaSchedule;
     {
         double l = lambdaInit;
         while (l > lambdaMin) {
             lambdaSchedule.push_back(l);
-            l /= 3.0;
+            l *= 0.5;
         }
         lambdaSchedule.push_back(lambdaMin);
     }
@@ -151,22 +121,37 @@ inline Alg1Result runAlg1(const Mesh& m,
         const double lambda = lambdaSchedule[lvl];
         lambdaHist.push_back(lambda);
 
-        // Per-level Tikhonov, scaled with λ. Acts as the smoothness
-        // regularizer (larger λ → flatter field → easier CG).
-        const double epsLevel = std::max(1e-7, 1e-6 * lambda + 1e-6);
-
-        SpMat S = buildCurlGram(C, Mvf, epsLevel);
-
-        Eigen::ConjugateGradient<SpMat, Eigen::Lower | Eigen::Upper,
-                                 Eigen::DiagonalPreconditioner<double>> cg;
-        cg.setMaxIterations(300);
-        cg.setTolerance(1e-6);
-        cg.compute(S);
-        if (cg.info() != Eigen::Success) {
-            S = buildCurlGram(C, Mvf, std::max(epsLevel, 1e-3));
-            cg.compute(S);
-            if (cg.info() != Eigen::Success) break;
+        // Factor the KKT matrix once per λ-level:
+        // [M + λL, C^T;
+        //  C,      0  ] [δ; μ] = [-λL u; -C u]
+        std::vector<Trip> KK;
+        KK.reserve((size_t)nW + Lvf.nonZeros() + C.nonZeros() * 2 + E);
+        for (int i = 0; i < nW; ++i) KK.emplace_back(i, i, Mvf[i]);
+        for (int k = 0; k < Lvf.outerSize(); ++k) {
+            for (SpMat::InnerIterator it(Lvf, k); it; ++it) {
+                KK.emplace_back((int)it.row(), (int)it.col(), lambda * it.value());
+            }
         }
+        for (int k = 0; k < C.outerSize(); ++k) {
+            for (SpMat::InnerIterator it(C, k); it; ++it) {
+                const int r = (int)it.row();
+                const int c = (int)it.col();
+                const double v = it.value();
+                KK.emplace_back(nW + r, c, v);
+                KK.emplace_back(c, nW + r, v);
+            }
+        }
+        // tiny regularization on μ block for numerical robustness
+        for (int i = 0; i < E; ++i) KK.emplace_back(nW + i, nW + i, 1e-12);
+
+        SpMat KKT(nW + E, nW + E);
+        KKT.setFromTriplets(KK.begin(), KK.end());
+        KKT.makeCompressed();
+
+        Eigen::SparseLU<SpMat> lu;
+        lu.analyzePattern(KKT);
+        lu.factorize(KKT);
+        if (lu.info() != Eigen::Success) break;
 
         int innerIter = 0;
         for (; innerIter < maxIter; ++innerIter) {
@@ -179,15 +164,18 @@ inline Alg1Result runAlg1(const Mesh& m,
                 reportProgress(progressStage, totalIters, totalOuterEstimate, lbl.c_str());
             }
 
-            Vec rhs = C * w;
-            Vec mu  = cg.solve(rhs);
-            Vec delta = Ct * mu;
-            for (int i = 0; i < nW; ++i) delta[i] /= std::max(Mvf[i], 1e-30);
+            Vec rhs(nW + E);
+            rhs.setZero();
+            rhs.head(nW) = -lambda * (Lvf * w);
+            rhs.tail(E)  = -(C * w);
+            Vec sol = lu.solve(rhs);
+            if (lu.info() != Eigen::Success) break;
+            Vec delta = sol.head(nW);
 
             double maxUpd = 0.0;
             for (int f = 0; f < F; ++f) {
-                double nx = w[2*f]     - delta[2*f];
-                double ny = w[2*f + 1] - delta[2*f + 1];
+                double nx = w[2*f]     + delta[2*f];
+                double ny = w[2*f + 1] + delta[2*f + 1];
                 double L  = std::sqrt(nx*nx + ny*ny);
                 double inv = L > 1e-12 ? 1.0 / L : 0.0;
                 double wxOld = w[2*f], wyOld = w[2*f+1];
