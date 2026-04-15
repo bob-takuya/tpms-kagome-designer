@@ -27,25 +27,19 @@
 #include "alg2.h"
 #include "cover.h"
 #include "isolines.h"
-#include "curl_local_integration.h"
-#include "gn_global_integration.h"
 #include "paired_rounding.h"
 #include "progress.h"
 
 namespace wgf {
 
 struct PipelineOptions {
-    // Browser-friendly defaults. The paper recommends lambdaInit=1000,
-    // lambdaMin→0, alg1MaxIter~50 and jointIters=10, which produces
-    // excellent results but takes minutes of CG solves in WASM. These
-    // smaller numbers converge fast enough for interactive use while
-    // still running the same algorithms end-to-end.
-    double lambdaInit     = 10.0;
-    double lambdaMin      = 1e-2;
-    int    alg1MaxIter    = 20;
+    // Defaults aligned with the implementation spec (Vekhter et al. 2019).
+    double lambdaInit     = 1000.0;
+    double lambdaMin      = 1e-3;
+    int    alg1MaxIter    = 50;
     double alg1Tol        = 1e-5;
     double mu             = 1e-4;
-    int    jointIters     = 4;
+    int    jointIters     = 10;
     double userScale      = 1.0;    // stripe density multiplier on top of π-rescale
     bool   useCover       = true;
 };
@@ -100,7 +94,7 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     if (!opt.useCover) {
         // Single-family pipeline (debug path).
         reportProgress(STAGE_COMPONENT, 0, 1, "Algorithm 2 + Eq. 8 (base mesh)");
-        JointResult J = solveJointScalar(base, frames, R1.w, opt.mu, opt.jointIters);
+        JointResult J = solveJointScalar(base, frames, R1.w, opt.mu, opt.jointIters, opt.userScale);
         reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
         auto segs = extractIsolines(base, J.theta);
         for (auto& s : segs) {
@@ -151,35 +145,15 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     //       into the sub-mesh's frame).
     //   (b) Run per-component Algorithm 1 (curl-free projection with a
     //       single λ level) to refine w on this component.
-    //   (c) Call CurlLocalIntegration to obtain the initial scale s per
-    //       face (generalized eigenproblem with face Laplacian regulariser).
-    //   (d) Rescale s anti-aliasing: s *= π / avgEdgeLen / maxS * userScale
-    //       (matches the reference's `s_scale` step in integrateField).
-    //   (e) Call GNGlobalIntegration to obtain theta per cover vertex
-    //       (alternating Gauss-Newton inverse power iteration + 1x1 scale
-    //       update, matching the reference's `globallyIntegrateOneComponent`
-    //       verbatim).
+    //   (c) Run Algorithm 2 (eq. 7) for initial s.
+    //   (d) Apply anti-aliasing rescale (π/ρ) and userScale.
+    //   (e) Run Eq. 8 alternating optimization for (θ, s).
     //   (f) Write theta and s back into global cover arrays.
     Vec thetaCover = Vec::Zero(cov.mesh.nV());
     Vec scalesCover = Vec::Zero(cov.mesh.nF());
 
-    // Average base-mesh edge length, used by the anti-aliasing rescale.
-    double avgEdgeLen = 0;
-    {
-        int cnt = 0;
-        for (const auto& e : base.eInt) {
-            int h = e.first;
-            int va = base.heStart(h);
-            int vb = base.he[h].vertex;
-            avgEdgeLen += (base.V.row(vb) - base.V.row(va)).norm();
-            cnt++;
-        }
-        if (cnt > 0) avgEdgeLen /= cnt;
-        if (avgEdgeLen < 1e-30) avgEdgeLen = 1.0;
-    }
-
     for (int c = 0; c < nComp; ++c) {
-        reportProgress(STAGE_COMPONENT, c, nComp, "Cover: Curl-local + GN-global");
+        reportProgress(STAGE_COMPONENT, c, nComp, "Cover: Algorithm 2 + Eq. 8");
         SubMesh S = extractComponent(cov.mesh, comp, c);
         if (S.mesh.nV() < 3 || S.mesh.nF() < 1) continue;
 
@@ -212,28 +186,14 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
                                 opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
-        // (c) Curl local integration → initial s.
-        Vec sCompRaw;
-        curlLocalIntegration(S.mesh, Sframes, RS.w,
-                             /*sreg=*/1e-4, sCompRaw);
-
-        // (d) Anti-aliasing rescale (matches CoverMesh::integrateField).
-        double maxS = 0;
-        for (int i = 0; i < sCompRaw.size(); ++i) {
-            double a = std::fabs(sCompRaw[i]);
-            if (a > maxS) maxS = a;
+        // (c,d,e) Algorithm 2 + Eq. 8 alternating optimization.
+        JointResult J = solveJointScalar(
+            S.mesh, Sframes, RS.w, opt.mu, opt.jointIters, opt.userScale);
+        Vec sCompRaw = J.s;
+        Vec thetaComp = Vec::Zero(S.mesh.nV());
+        for (int sv = 0; sv < S.mesh.nV(); ++sv) {
+            thetaComp[sv] = std::atan2(J.theta[2*sv + 1], J.theta[2*sv]);
         }
-        if (maxS < 1e-30) maxS = 1.0;
-        double sScale = M_PI / avgEdgeLen / maxS;
-        sCompRaw *= opt.userScale * sScale;
-
-        // (e) GN global integration → theta.
-        Vec thetaComp;
-        gnGlobalIntegration(S.mesh, Sframes, RS.w, sCompRaw, thetaComp,
-                            /*outerIters=*/6,
-                            /*powerIters=*/20,
-                            STAGE_COMPONENT,
-                            "Cover: GN global integration");
 
         // (f) Scatter back into global cover vectors.
         for (int sv = 0; sv < S.mesh.nV(); ++sv) {
