@@ -32,6 +32,8 @@
 #include "gn_global_integration.h"
 #include "paired_rounding.h"
 #include "progress.h"
+#include <unordered_map>
+#include <climits>
 
 namespace wgf {
 
@@ -62,6 +64,15 @@ struct PipelineResult {
     int    alg1BaseIters     = 0;
     double alg1CoverFinalCurl = 0;  // averaged or total over components
     int    numSegmentsFam[3] = {0, 0, 0};
+    // Number of distinct traced chains (= ribbons before per-family
+    // splitting and kagome.ts stitching). Each chain is a single
+    // continuous level-set polyline on the cover.
+    int    numChains = 0;
+    int    numChainsFam[3] = {0, 0, 0};
+    // Ribbon length stats (in segments per chain).
+    int    chainLenMin = 0;
+    int    chainLenMax = 0;
+    double chainLenMean = 0;
 };
 
 inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) {
@@ -312,13 +323,38 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
     // interleave cleanly at the half-period offset.
     {
         int numISOLines = std::max(4, (int)std::round(8.0 * opt.userScale));
+        // Diagnostic: theta range on the cover before and after paired
+        // rounding. A smooth angular theta should span roughly [−π, π].
+        auto thetaStats = [&](const char* tag) {
+            double tmn = 1e300, tmx = -1e300, tabssum = 0;
+            int nV = (int)thetaCover.size();
+            for (int i = 0; i < nV; ++i) {
+                double v = thetaCover[i];
+                if (v < tmn) tmn = v;
+                if (v > tmx) tmx = v;
+                tabssum += std::fabs(v);
+            }
+            std::fprintf(stderr,
+                "[cover] theta %s paired-rounding: [%.3f, %.3f]  |theta|mean=%.3f  nV=%d\n",
+                tag, tmn, tmx, tabssum / std::max(1, nV), nV);
+        };
+        thetaStats("before");
         pairedRoundTheta(cov.mesh, cov, thetaCover, numISOLines);
+        thetaStats("after ");
 
         // 7. Extract angular isolines on the cover. The tracer produces
         // chains (groups of segments with shared chainId) that follow a
         // level set from face to face across the cover.
         reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
         auto segs = extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
+        {
+            int perLevel[32] = {0};
+            for (const auto& s : segs) if (s.iso < 32) perLevel[s.iso]++;
+            int lim = std::min(numISOLines, 32);
+            std::fprintf(stderr, "[cover] segs per isoline level:");
+            for (int i = 0; i < lim; ++i) std::fprintf(stderr, " %d", perLevel[i]);
+            std::fprintf(stderr, "  (total %d)\n", (int)segs.size());
+        }
 
         // 8. Project each cover segment back to the base.
         //
@@ -332,6 +368,14 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         // constant almost everywhere, yielding continuous ribbons.
         //
         // Per-segment family is just (cover layer) mod 3.
+        //
+        // We also track the chain (= ribbon) statistics: count of
+        // distinct chainIds overall and per family, plus
+        // min/max/mean chain length in segments. These numbers are
+        // what "how many ribbons?" really means — the raw segment
+        // count is ~O(#cover-faces × numISOLines) and is much larger.
+        std::unordered_map<int, int>  chainLen;
+        std::unordered_map<int, int>  chainFam;  // fam of first-seen segment
         for (const auto& s : segs) {
             int cf = s.faceIdx;
             int bf = cov.coverFaceBaseF[cf];
@@ -344,6 +388,56 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             p.family = fam;
             R.segments.push_back(p);
             R.numSegmentsFam[fam]++;
+
+            auto it = chainLen.find(s.chainId);
+            if (it == chainLen.end()) {
+                chainLen[s.chainId] = 1;
+                chainFam[s.chainId] = fam;
+            } else {
+                it->second++;
+            }
+        }
+        R.numChains = (int)chainLen.size();
+        if (R.numChains > 0) {
+            int minL = INT_MAX, maxL = 0;
+            long long sum = 0;
+            for (const auto& kv : chainLen) {
+                int len = kv.second;
+                sum += len;
+                if (len < minL) minL = len;
+                if (len > maxL) maxL = len;
+            }
+            R.chainLenMin = minL;
+            R.chainLenMax = maxL;
+            R.chainLenMean = (double)sum / R.numChains;
+        }
+        for (const auto& kv : chainFam) {
+            R.numChainsFam[kv.second]++;
+        }
+
+        // Chain length histogram (log-bucketed): 1, 2, 3-4, 5-8, 9-16,
+        // 17-32, 33-64, 65+. Useful to diagnose whether ribbons are
+        // genuinely long or just single-face fragments.
+        {
+            int bins[8] = {0};
+            for (const auto& kv : chainLen) {
+                int L = kv.second;
+                int b = 0;
+                if      (L <= 1)  b = 0;
+                else if (L == 2)  b = 1;
+                else if (L <= 4)  b = 2;
+                else if (L <= 8)  b = 3;
+                else if (L <= 16) b = 4;
+                else if (L <= 32) b = 5;
+                else if (L <= 64) b = 6;
+                else              b = 7;
+                bins[b]++;
+            }
+            std::fprintf(stderr,
+                "[cover] chain length hist: 1=%d 2=%d 3-4=%d 5-8=%d "
+                "9-16=%d 17-32=%d 33-64=%d 65+=%d   total=%d\n",
+                bins[0], bins[1], bins[2], bins[3],
+                bins[4], bins[5], bins[6], bins[7], R.numChains);
         }
     }
 

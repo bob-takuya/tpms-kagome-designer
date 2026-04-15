@@ -16,6 +16,9 @@
 #include "permutations.h"
 #include "alg2.h"
 #include "pipeline.h"
+#include "paired_rounding.h"
+#include "curl_local_integration.h"
+#include "gn_global_integration.h"
 
 #include <map>
 #include <tuple>
@@ -318,6 +321,10 @@ int main() {
                     R2.segments.size(),
                     R2.numSegmentsFam[0], R2.numSegmentsFam[1], R2.numSegmentsFam[2],
                     R2.alg1BaseInitCurl, R2.alg1BaseFinalCurl, R2.alg1BaseIters);
+        std::printf("[smoke/3-family] ribbons=%d (fam %d/%d/%d)  chain length min=%d max=%d mean=%.1f segs\n",
+                    R2.numChains,
+                    R2.numChainsFam[0], R2.numChainsFam[1], R2.numChainsFam[2],
+                    R2.chainLenMin, R2.chainLenMax, R2.chainLenMean);
     }
 
     // Run Alg1 on each component.
