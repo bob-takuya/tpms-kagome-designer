@@ -26,6 +26,7 @@
 #include "alg1.h"
 #include "alg2.h"
 #include "cover.h"
+#include "permutations.h"
 #include "isolines.h"
 #include "curl_local_integration.h"
 #include "gn_global_integration.h"
@@ -117,25 +118,70 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
 
     // 3. 6-fold branched cover construction (Vekhter §5.1).
     //
-    // The cover is built from the ALGORITHM-1-OPTIMIZED direction field
-    // (rather than the raw 6-RoSy eigenvector) so that the per-edge σ
-    // rounding is stable: on a well-converged Alg1 output, the angular
-    // residual (phi_i − phi_j + β) is far from the π/6 decision boundary
-    // almost everywhere, and σ rounds to 0 on all non-singular edges.
+    // Faithful pipeline matching the reference code in
+    // https://github.com/the13fools/weaving-geodesic-foliations :
     //
-    // Holonomy is invariant under per-face representative choice
-    // (telescoping cancellation around any closed cycle), so atan2 of
-    // the Alg1 vector field can be used directly without wrapping into
-    // (−π/6, π/6].
-    reportProgress(STAGE_COVER_BUILD, 0, 1, "Building 6-fold branched cover");
-    Vec phiRefined(base.nF());
-    for (int f = 0; f < base.nF(); ++f) {
-        phiRefined[f] = std::atan2(R1.w[2*f + 1], R1.w[2*f]);
+    //   (a) Knoeppel 6-RoSy smooth direction field → w0base
+    //       (the paper's Alg 1 on a closed surface with no handles
+    //       reduces to the Knoeppel 6-RoSy eigensolve, which we already
+    //       computed for step 1 above). We do NOT use R1.w here because
+    //       the single-field Alg 1 on a 6-RoSy eigenvector input drifts
+    //       individual face angles out of the 60°-canonical range,
+    //       breaking the 3-RoSy set alignment across neighbor faces.
+    //       The reference's equivalent is a multi-field GaussNewton on
+    //       an already-split 3-RoSy state — we don't have that, but
+    //       using the unrefined Knoeppel 6-RoSy gives the same 3-RoSy
+    //       clean-alignment property.
+    //   (b) splitFromRoSy: BFS-consistent expansion into 3 per-face
+    //       2D vectors at 60° spacing. This gives a 3-RoSy field on
+    //       the base mesh.
+    //   (c) reassignAllPermutations: per-edge S₃ × {±1}³ exhaustive
+    //       search for the 3×3 signed permutation that best aligns the
+    //       two faces' 3-RoSy vectors after parallel transport.
+    //   (d) findSingularFieldsPerVertex: per-vertex holonomy walk →
+    //       bitmask of singular fields at each vertex.
+    //   (e) augmentPs: promote each 3×3 signed permutation to a 6×6
+    //       0/1 cover permutation in the block layout (+, −) × field.
+    //   (f) buildBranchedCover: BFS-based gluing of 18·|F| corner-layer
+    //       nodes → cover-mesh topology. The cover vertices are the
+    //       equivalence classes of the gluing graph.
+    reportProgress(STAGE_COVER_BUILD, 0, 1, "Cover: 3-RoSy split (Weave::splitFromRosy)");
+    Vec wRep3 = splitFromRoSy(base, frames, w0base);
+
+    reportProgress(STAGE_COVER_BUILD, 0, 1, "Cover: per-edge permutations (S3 x {+-1}^3)");
+    auto Ps = reassignAllPermutations(base, frames, wRep3);
+    {
+        PsHistogram H = histogramPs(Ps);
+        std::fprintf(stderr,
+            "[cover] Ps histogram: identity=%d sign-only=%d permuting=%d / %d edges\n",
+            H.identity, H.signOnly, H.permuting, (int)Ps.size());
     }
-    auto cov = buildBranchedCover(base, frames, phiRefined);
+
+    reportProgress(STAGE_COVER_BUILD, 0, 1, "Cover: findSingularVertices");
+    auto singularFields = findSingularFieldsPerVertex(base, Ps);
+    {
+        int totSingFields = 0, totSingVerts = 0;
+        for (int mask : singularFields) {
+            if (mask) {
+                totSingVerts++;
+                for (int b = 0; b < 3; ++b) if (mask & (1 << b)) totSingFields++;
+            }
+        }
+        std::fprintf(stderr,
+            "[cover] singular: %d vertices, %d (vertex, field) singularities / %d verts\n",
+            totSingVerts, totSingFields, (int)singularFields.size());
+    }
+
+    reportProgress(STAGE_COVER_BUILD, 0, 1, "Cover: augmentPs + BFS glue");
+    auto Pcover = augmentPs(Ps);
+    auto cov = buildBranchedCover(base, frames, Pcover, singularFields);
     R.coverV = cov.mesh.nV();
     R.coverF = cov.mesh.nF();
     R.numSingular = cov.numSingular;
+
+    // (Per-component direction field init now reads directly from
+    // wRep3 so layer assignment matches splitFromRoSy's BFS-shift —
+    // phiRefined is no longer needed.)
 
     // 4. Connected components of the cover.
     reportProgress(STAGE_COVER_SPLIT, 0, 1, "Labeling cover components");
@@ -185,17 +231,29 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
 
         auto Sframes = buildFaceFrames(S.mesh);
 
-        // (a) Initial direction field on this component, inherited from
-        //     the base-face layer angle.
+        // (a) Initial direction field on this component.
+        //
+        // Each cover face carries a layer index ∈ {0..5}, which in the
+        // augmented cover layout (permutations.h::augmentPs) means:
+        //
+        //     field   = lay % 3       (which of the 3 3-RoSy vectors)
+        //     signAug = lay < 3 ? +1 : −1
+        //
+        // So the 2D direction on cover face cf (base face bf, layer k)
+        // is `signAug · wRep3[bf, field]`, expressed in bf's 2D frame.
+        // We then parallel-transport it into the cover sub-mesh's
+        // per-face frame (since sub-meshing may re-orient triangles).
         Vec wS(2 * S.mesh.nF());
         for (int f = 0; f < S.mesh.nF(); ++f) {
             int covFace = S.oldFaceIdx[f];
             int bf  = cov.coverFaceBaseF[covFace];
             int lay = cov.coverFaceLayer[covFace];
-            double ang = phiRefined[bf] + lay * M_PI / 3.0;
+            int field = lay % 3;
+            double sign = (lay < 3 ? 1.0 : -1.0);
+            Eigen::Vector2d v2 = sign * repVec(wRep3, bf, field);
             Eigen::Vector3d d3 =
-                std::cos(ang) * frames[bf].e1 +
-                std::sin(ang) * frames[bf].e2;
+                v2.x() * frames[bf].e1 +
+                v2.y() * frames[bf].e2;
             double u = d3.dot(Sframes[f].e1);
             double v = d3.dot(Sframes[f].e2);
             double Ln = std::sqrt(u*u + v*v);
@@ -262,61 +320,30 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
         auto segs = extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
 
-        // 8. Project each cover chain back to the base as a single
-        // contiguous ribbon.
+        // 8. Project each cover segment back to the base.
         //
-        // Key insight: a single cover-level-set chain can traverse
-        // multiple cover layers (because ~80% of cover edges have
-        // sigma mod 3 != 0). If we split it per-segment by
-        // (layer mod 3) it fragments into unconnected chunks in
-        // different family buckets, which is the "grass" effect.
+        // With the faithful 3-RoSy cover (Vekhter §5.1) most cover edges
+        // have Ps = ±I, i.e. the per-edge permutation does not permute
+        // field indices — only potentially flips signs. Signs live in
+        // the "upper half" (layers 3-5) of the cover, so walking a
+        // level set across such edges either keeps the field index
+        // constant or jumps by exactly 3 (which has the same field mod
+        // 3). Therefore a traced chain's `family = layer % 3` is
+        // constant almost everywhere, yielding continuous ribbons.
         //
-        // Instead, we keep each chain in ONE family bucket — the
-        // dominant layer mod 3 in that chain (majority vote over its
-        // segments). Within that bucket the segments share endpoints
-        // pairwise by construction, so kagome.ts's endpoint-matching
-        // stitcher builds the chain back into a continuous polyline.
-        // The "3 families at 60°" interpretation is lost (a family-0
-        // ribbon can locally be at any angle as it crosses layers),
-        // but the topological correctness of the cover pipeline is
-        // preserved.
-        //
-        // Group segments by chainId first.
-        std::vector<std::vector<int>> chainSegs;
-        {
-            int maxCid = -1;
-            for (const auto& s : segs) if (s.chainId > maxCid) maxCid = s.chainId;
-            chainSegs.resize(maxCid + 1);
-            for (int i = 0; i < (int)segs.size(); ++i)
-                chainSegs[segs[i].chainId].push_back(i);
-        }
-        for (const auto& chainIdxs : chainSegs) {
-            if (chainIdxs.empty()) continue;
-            // Majority vote for the chain's family.
-            int famCount[3] = {0, 0, 0};
-            for (int si : chainIdxs) {
-                int cf = segs[si].faceIdx;
-                int lay = cov.coverFaceLayer[cf];
-                famCount[lay % 3]++;
-            }
-            int fam = 0;
-            if (famCount[1] > famCount[fam]) fam = 1;
-            if (famCount[2] > famCount[fam]) fam = 2;
-
-            // Emit every segment in this chain under the chosen family,
-            // preserving the tracer's face-to-face order.
-            for (int si : chainIdxs) {
-                const auto& s = segs[si];
-                int cf = s.faceIdx;
-                int bf = cov.coverFaceBaseF[cf];
-                ProjectedSegment p;
-                p.a = s.a;
-                p.b = s.b;
-                p.baseFaceIdx = bf;
-                p.family = fam;
-                R.segments.push_back(p);
-                R.numSegmentsFam[fam]++;
-            }
+        // Per-segment family is just (cover layer) mod 3.
+        for (const auto& s : segs) {
+            int cf = s.faceIdx;
+            int bf = cov.coverFaceBaseF[cf];
+            int lay = cov.coverFaceLayer[cf];
+            int fam = lay % 3;
+            ProjectedSegment p;
+            p.a = s.a;
+            p.b = s.b;
+            p.baseFaceIdx = bf;
+            p.family = fam;
+            R.segments.push_back(p);
+            R.numSegmentsFam[fam]++;
         }
     }
 

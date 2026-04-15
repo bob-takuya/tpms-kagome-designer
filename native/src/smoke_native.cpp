@@ -13,6 +13,7 @@
 #include "alg1.h"
 #include "curl.h"
 #include "cover.h"
+#include "permutations.h"
 #include "alg2.h"
 #include "pipeline.h"
 
@@ -270,24 +271,35 @@ int main() {
                     mn, mx, -M_PI/6, M_PI/6);
     }
 
-    // Debug: histogram of σ per interior edge
+    // ── 6-fold branched cover (Vekhter 2019 §5.1 faithful port) ──────────
+    //
+    // Reference pipeline:
+    //   splitFromRoSy → 3-RoSy vectors per face
+    //   reassignAllPermutations → per-edge 3×3 signed permutations
+    //   findSingularFieldsPerVertex → per-field vertex singularities
+    //   augmentPs → 6×6 cover permutations
+    //   buildBranchedCover → BFS-glued cover mesh
+    Vec wRep3 = splitFromRoSy(m, frames, w0);
+    auto Ps = reassignAllPermutations(m, frames, wRep3);
     {
-        int hist[6] = {0};
-        for (const auto& e : m.eInt) {
-            int h = e.first;
-            int fi = m.he[h].face;
-            int fj = m.he[m.he[h].twin].face;
-            double beta = parallelTransport(m, frames, h);
-            int s = wgf::bestShift(phi[fi], phi[fj], beta);
-            hist[s]++;
-        }
-        std::printf("[smoke] σ histogram: [%d, %d, %d, %d, %d, %d] / %d edges\n",
-                    hist[0], hist[1], hist[2], hist[3], hist[4], hist[5],
-                    (int)m.eInt.size());
+        PsHistogram H = histogramPs(Ps);
+        std::printf("[smoke] Ps histogram: identity=%d sign-only=%d permuting=%d / %d edges\n",
+                    H.identity, H.signOnly, H.permuting, (int)Ps.size());
     }
-
-    // ── 6-fold branched cover ─────────────────────────────────────────────
-    auto cov = buildBranchedCover(m, frames, phi);
+    auto singularFields = findSingularFieldsPerVertex(m, Ps);
+    {
+        int nSing = 0, nSingFields = 0;
+        for (int mask : singularFields) {
+            if (mask) {
+                nSing++;
+                for (int b = 0; b < 3; ++b) if (mask & (1 << b)) nSingFields++;
+            }
+        }
+        std::printf("[smoke] singular verts=%d (v,field)-singularities=%d\n",
+                    nSing, nSingFields);
+    }
+    auto Pcover = augmentPs(Ps);
+    auto cov = buildBranchedCover(m, frames, Pcover, singularFields);
     std::printf("[smoke] cover:   V=%d  F=%d  singular=%d (%.1f%%)\n",
                 cov.mesh.nV(), cov.mesh.nF(), cov.numSingular,
                 100.0 * cov.numSingular / std::max(1, m.nV()));
