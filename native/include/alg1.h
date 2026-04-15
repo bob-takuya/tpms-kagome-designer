@@ -73,9 +73,9 @@ inline Alg1Result runAlg1(const Mesh& m,
                           const std::vector<FaceFrame>& frames,
                           const Vec& w0,
                           const std::vector<int>& handleFaces = {},
-                          double lambdaInit = 10.0,
-                          double lambdaMin  = 1e-2,
-                          int    maxIter    = 20,
+                          double lambdaInit = 1000.0,
+                          double lambdaMin  = 1e-3,
+                          int    maxIter    = 50,
                           double tol        = 1e-5,
                           int    progressStage = -1,
                           const char* progressLabel = "Algorithm 1") {
@@ -183,8 +183,11 @@ inline Alg1Result runAlg1(const Mesh& m,
                 double wyNew = ny * inv;
                 w[2*f]     = wxNew;
                 w[2*f + 1] = wyNew;
-                double dx = wxNew - wxOld, dy = wyNew - wyOld;
-                double d2 = dx*dx + dy*dy;
+                // Residual on the unit-norm projection step:
+                // δ^i_f = (w^{i-1}_f + δ̃_f) - w^i_f
+                double dx = wxOld + delta[2*f]     - wxNew;
+                double dy = wyOld + delta[2*f + 1] - wyNew;
+                double d2 = dx * dx + dy * dy;
                 if (d2 > maxUpd) maxUpd = d2;
             }
             totalIters++;
