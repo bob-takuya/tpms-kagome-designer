@@ -256,26 +256,67 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         int numISOLines = std::max(4, (int)std::round(8.0 * opt.userScale));
         pairedRoundTheta(cov.mesh, cov, thetaCover, numISOLines);
 
-        // 7. Extract angular isolines on the cover.
+        // 7. Extract angular isolines on the cover. The tracer produces
+        // chains (groups of segments with shared chainId) that follow a
+        // level set from face to face across the cover.
         reportProgress(STAGE_ASSEMBLE, 0, 1, "Extracting isolines");
         auto segs = extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
 
-        // 8. Project each cover segment back to its base face; the
-        // family is layer k mod 3. After paired rounding, segments
-        // from layers k and k+3 belong to the same kagome family
-        // (they share the same base face/direction) and sit at
-        // interleaved half-period offsets along the same stripe line.
-        for (const auto& s : segs) {
-            int covFace = s.faceIdx;
-            int bf  = cov.coverFaceBaseF[covFace];
-            int lay = cov.coverFaceLayer[covFace];
-            ProjectedSegment p;
-            p.a = s.a;
-            p.b = s.b;
-            p.baseFaceIdx = bf;
-            p.family = lay % 3;
-            R.segments.push_back(p);
-            R.numSegmentsFam[p.family]++;
+        // 8. Project each cover chain back to the base as a single
+        // contiguous ribbon.
+        //
+        // Key insight: a single cover-level-set chain can traverse
+        // multiple cover layers (because ~80% of cover edges have
+        // sigma mod 3 != 0). If we split it per-segment by
+        // (layer mod 3) it fragments into unconnected chunks in
+        // different family buckets, which is the "grass" effect.
+        //
+        // Instead, we keep each chain in ONE family bucket — the
+        // dominant layer mod 3 in that chain (majority vote over its
+        // segments). Within that bucket the segments share endpoints
+        // pairwise by construction, so kagome.ts's endpoint-matching
+        // stitcher builds the chain back into a continuous polyline.
+        // The "3 families at 60°" interpretation is lost (a family-0
+        // ribbon can locally be at any angle as it crosses layers),
+        // but the topological correctness of the cover pipeline is
+        // preserved.
+        //
+        // Group segments by chainId first.
+        std::vector<std::vector<int>> chainSegs;
+        {
+            int maxCid = -1;
+            for (const auto& s : segs) if (s.chainId > maxCid) maxCid = s.chainId;
+            chainSegs.resize(maxCid + 1);
+            for (int i = 0; i < (int)segs.size(); ++i)
+                chainSegs[segs[i].chainId].push_back(i);
+        }
+        for (const auto& chainIdxs : chainSegs) {
+            if (chainIdxs.empty()) continue;
+            // Majority vote for the chain's family.
+            int famCount[3] = {0, 0, 0};
+            for (int si : chainIdxs) {
+                int cf = segs[si].faceIdx;
+                int lay = cov.coverFaceLayer[cf];
+                famCount[lay % 3]++;
+            }
+            int fam = 0;
+            if (famCount[1] > famCount[fam]) fam = 1;
+            if (famCount[2] > famCount[fam]) fam = 2;
+
+            // Emit every segment in this chain under the chosen family,
+            // preserving the tracer's face-to-face order.
+            for (int si : chainIdxs) {
+                const auto& s = segs[si];
+                int cf = s.faceIdx;
+                int bf = cov.coverFaceBaseF[cf];
+                ProjectedSegment p;
+                p.a = s.a;
+                p.b = s.b;
+                p.baseFaceIdx = bf;
+                p.family = fam;
+                R.segments.push_back(p);
+                R.numSegmentsFam[fam]++;
+            }
         }
     }
 
