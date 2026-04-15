@@ -242,49 +242,39 @@ inline void pairedRoundTheta(
     const double phase  = 2.0 * M_PI / numISOLines;
     const double offset = M_PI / numISOLines;
 
-    // Gauss-Seidel rounding with a small batch per iteration.
-    //
-    // Strict Bommes 2009 §4.3 / CoMISo rounds ONE variable per solve,
-    // which requires ncorrs solves total. For ncorrs ~ 6000 that is
-    // ~10 minutes of CG even on native, and the output is
-    // indistinguishable from batching the top-~1% confident variables
-    // per iteration. We cap the batch at max(1, ncorrs/100) so the
-    // total solve count stays in the ~100-200 range while still
-    // iteratively re-solving after each rounding decision.
+    // Paper-strict Bommes 2009 §4.3 / CoMISo greedy integer rounding:
+    // each iteration rounds exactly ONE variable (the one with the
+    // smallest rounding error) and re-solves the continuous relaxation.
+    // This matches the reference's ConstrainedSolver call in
+    // CoverMesh::roundAntipodalCovers. No batching.
     std::vector<char>   fixedMask(ncorrs, 0);
     std::vector<double> nFixed(ncorrs, 0.0);
     int numRounded = 0;
-    const int batchSize = std::max(1, ncorrs / 100);
 
     Vec delta, nCont;
     while (numRounded < ncorrs) {
         reportProgress(STAGE_ASSEMBLE, numRounded, ncorrs,
-                       "Paired rounding (Gauss-Seidel)");
+                       "Paired rounding (strict Bommes)");
         if (!solveContinuousRelaxation(L, LepsFactor, pairs, fixedMask, nFixed,
                                        theta, phase, offset, delta, nCont)) {
             std::fprintf(stderr, "[paired-rounding] CG failed at iter %d\n", numRounded);
             break;
         }
 
-        // Collect all non-fixed rounding errors, sort, round the top N.
-        std::vector<std::pair<double,int>> errs;
-        errs.reserve(ncorrs - numRounded);
+        // Find the single non-fixed variable with the smallest
+        // rounding error, round it, and re-solve.
+        double bestErr = 1e300;
+        int    bestI   = -1;
         for (int i = 0; i < ncorrs; ++i) {
             if (fixedMask[i]) continue;
-            double nr = std::round(nCont[i]);
+            double nr  = std::round(nCont[i]);
             double err = std::fabs(nCont[i] - nr);
-            errs.emplace_back(err, i);
+            if (err < bestErr) { bestErr = err; bestI = i; }
         }
-        if (errs.empty()) break;
-        int toRound = std::min(batchSize, (int)errs.size());
-        std::nth_element(errs.begin(), errs.begin() + toRound - 1, errs.end(),
-                         [](const auto& a, const auto& b){ return a.first < b.first; });
-        for (int k = 0; k < toRound; ++k) {
-            int i = errs[k].second;
-            fixedMask[i] = 1;
-            nFixed[i] = std::round(nCont[i]);
-            numRounded++;
-        }
+        if (bestI < 0) break;
+        fixedMask[bestI] = 1;
+        nFixed[bestI] = std::round(nCont[bestI]);
+        numRounded++;
     }
 
     // Final re-solve with all n's fixed.
