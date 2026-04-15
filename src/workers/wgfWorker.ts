@@ -99,11 +99,11 @@ self.addEventListener('message', async (e: MessageEvent<RunMsg>) => {
     // real defaults live in PipelineOptions in pipeline.h; ours here
     // just mirror them so the worker's fallback path matches.
     const o = msg.opts;
-    const lambdaInit  = o.lambdaInit  ?? 10;
-    const lambdaMin   = o.lambdaMin   ?? 1e-2;
-    const alg1MaxIter = o.alg1MaxIter ?? 20;
+    const lambdaInit  = o.lambdaInit  ?? 1000;
+    const lambdaMin   = o.lambdaMin   ?? 1e-3;
+    const alg1MaxIter = o.alg1MaxIter ?? 50;
     const mu          = o.mu          ?? 1e-4;
-    const jointIters  = o.jointIters  ?? 4;
+    const jointIters  = o.jointIters  ?? 10;
     const userScale   = o.userScale   ?? 1.0;
     const useCover    = (o.useCover ?? true) ? 1 : 0;
 
