@@ -38,18 +38,15 @@
 namespace wgf {
 
 struct PipelineOptions {
-    // Browser-friendly defaults. The paper recommends lambdaInit=1000,
-    // lambdaMin→0, alg1MaxIter~50 and jointIters=10, which produces
-    // excellent results but takes minutes of CG solves in WASM. These
-    // smaller numbers converge fast enough for interactive use while
-    // still running the same algorithms end-to-end.
-    double lambdaInit     = 10.0;
-    double lambdaMin      = 1e-2;
-    int    alg1MaxIter    = 20;
+    // Paper-strict defaults (Vekhter et al. 2019 §5.2).
+    // No browser-friendly substitutions.
+    double lambdaInit     = 1000.0;  // paper §5.2
+    double lambdaMin      = 1e-3;    // paper: → 0 (we use 1e-3 to avoid div-by-0)
+    int    alg1MaxIter    = 50;      // paper §5.2
     double alg1Tol        = 1e-5;
-    double mu             = 1e-4;
-    int    jointIters     = 4;
-    double userScale      = 1.0;    // stripe density multiplier on top of π-rescale
+    double mu             = 1e-4;    // paper eq. 7
+    int    jointIters     = 10;      // paper §5.2 (eq. 8 alternations)
+    double userScale      = 1.0;
     bool   useCover       = true;
 };
 
@@ -273,11 +270,11 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
             wS[2*f + 1] = v / Ln;
         }
 
-        // (b) Per-component Alg 1 to sharpen the direction field.
+        // (b) Per-component Alg 1 — paper §5.2 schedule.
         Alg1Result RS = runAlg1(S.mesh, Sframes, wS, {},
-                                /*lambdaInit=*/1.0,
-                                /*lambdaMin =*/1e-2,
-                                /*maxIter   =*/8,
+                                /*lambdaInit=*/opt.lambdaInit,
+                                /*lambdaMin =*/opt.lambdaMin,
+                                /*maxIter   =*/opt.alg1MaxIter,
                                 opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
@@ -297,10 +294,12 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         sCompRaw *= opt.userScale * sScale;
 
         // (e) GN global integration → theta.
+        // Paper-strict: WeaveHook.h:109-110 in the reference sets
+        // globalAlternations=10, globalPowerIters=10.
         Vec thetaComp;
         gnGlobalIntegration(S.mesh, Sframes, RS.w, sCompRaw, thetaComp,
-                            /*outerIters=*/6,
-                            /*powerIters=*/20,
+                            /*outerIters=*/10,
+                            /*powerIters=*/10,
                             STAGE_COMPONENT,
                             "Cover: GN global integration");
 

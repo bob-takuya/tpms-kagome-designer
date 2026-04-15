@@ -126,20 +126,14 @@ inline Alg1Result runAlg1(const Mesh& m,
 
     std::vector<double> lambdaHist;
 
-    // Build the λ schedule up front: coarse geometric sequence from
-    // lambdaInit down to lambdaMin, stepping by 1/3 per level. This is
-    // the simplified browser-friendly version of the paper's §5.2
-    // recommendation (which halves 1000 → 0 over 21 levels). Halving
-    // would run a full CG-driven inner loop 21 times per pipeline
-    // execution, which in WASM takes minutes. A 3-step schedule is
-    // both fast enough for interactive use and, in practice, produces
-    // near-identical curl-free fields.
+    // Paper-strict λ schedule (Vekhter 2019 §5.2, Fig. 14): halve λ
+    // each level from lambdaInit down to lambdaMin (paper: → 0).
     std::vector<double> lambdaSchedule;
     {
         double l = lambdaInit;
         while (l > lambdaMin) {
             lambdaSchedule.push_back(l);
-            l /= 3.0;
+            l /= 2.0;
         }
         lambdaSchedule.push_back(lambdaMin);
     }

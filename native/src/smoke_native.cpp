@@ -313,9 +313,8 @@ int main() {
 
     // End-to-end pipeline run.
     {
+        // Paper-strict: use the PipelineOptions struct defaults.
         PipelineOptions opt;
-        opt.useCover = true;    // now exercises the 3-family rotated-Knoeppel path
-        opt.alg1MaxIter = 30;
         PipelineResult R2 = runPipeline(m, opt);
         std::printf("[smoke/3-family] segments=%zu (fam %d/%d/%d) curl %.3e -> %.3e  in %d iters\n",
                     R2.segments.size(),
