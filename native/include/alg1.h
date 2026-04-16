@@ -133,7 +133,7 @@ inline Alg1Result runAlg1(const Mesh& m,
         //  C,      0  ] [δ; μ] = [-λL u; -C u]
         std::vector<Trip> KK;
         KK.reserve((size_t)nW + Lvf.nonZeros() + C.nonZeros() * 2 + E);
-        for (int i = 0; i < nW; ++i) KK.emplace_back(i, i, Mvf[i]);
+        for (int i = 0; i < nW; ++i) KK.emplace_back(i, i, std::max(Mvf[i], 1e-12));
         for (int k = 0; k < Lvf.outerSize(); ++k) {
             for (SpMat::InnerIterator it(Lvf, k); it; ++it) {
                 KK.emplace_back((int)it.row(), (int)it.col(), lambda * it.value());
