@@ -51,7 +51,8 @@
 #include "mesh.h"
 #include "curl.h"
 #include "progress.h"
-#include <Eigen/SparseLU>
+#include <Eigen/SparseQR>
+#include <algorithm>
 #include <vector>
 #include <string>
 
@@ -115,7 +116,13 @@ inline Alg1Result runAlg1(const Mesh& m,
     }
     const int nLevels = (int)lambdaSchedule.size();
     const int totalOuterEstimate = nLevels * maxIter;
+    const int progressTotal = std::max(1, totalOuterEstimate);
     int totalIters = 0;
+
+    if (progressStage >= 0) {
+        std::string lbl = std::string(progressLabel) + " (initializing)";
+        reportProgress(progressStage, 0, progressTotal, lbl.c_str());
+    }
 
     for (int lvl = 0; lvl < nLevels; ++lvl) {
         const double lambda = lambdaSchedule[lvl];
@@ -148,10 +155,9 @@ inline Alg1Result runAlg1(const Mesh& m,
         KKT.setFromTriplets(KK.begin(), KK.end());
         KKT.makeCompressed();
 
-        Eigen::SparseLU<SpMat> lu;
-        lu.analyzePattern(KKT);
-        lu.factorize(KKT);
-        if (lu.info() != Eigen::Success) break;
+        Eigen::SparseQR<SpMat, Eigen::COLAMDOrdering<int>> qr;
+        qr.compute(KKT);
+        if (qr.info() != Eigen::Success) break;
 
         int innerIter = 0;
         for (; innerIter < maxIter; ++innerIter) {
@@ -161,15 +167,15 @@ inline Alg1Result runAlg1(const Mesh& m,
                     " (λ=" + std::to_string(lambda).substr(0, 5) +
                     ", lvl " + std::to_string(lvl + 1) + "/" +
                     std::to_string(nLevels) + ")";
-                reportProgress(progressStage, totalIters, totalOuterEstimate, lbl.c_str());
+                reportProgress(progressStage, totalIters, progressTotal, lbl.c_str());
             }
 
             Vec rhs(nW + E);
             rhs.setZero();
             rhs.head(nW) = -lambda * (Lvf * w);
             rhs.tail(E)  = -(C * w);
-            Vec sol = lu.solve(rhs);
-            if (lu.info() != Eigen::Success) break;
+            Vec sol = qr.solve(rhs);
+            if (qr.info() != Eigen::Success) break;
             Vec delta = sol.head(nW);
 
             double maxUpd = 0.0;
@@ -194,6 +200,11 @@ inline Alg1Result runAlg1(const Mesh& m,
 
             if (std::sqrt(maxUpd) < tol) { innerIter++; break; }
         }
+    }
+
+    if (progressStage >= 0) {
+        std::string lbl = std::string(progressLabel) + " (done)";
+        reportProgress(progressStage, progressTotal, progressTotal, lbl.c_str());
     }
 
     Alg1Result R;

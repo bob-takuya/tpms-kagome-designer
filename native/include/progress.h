@@ -19,6 +19,7 @@
 #else
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #endif
 
 namespace wgf {
@@ -60,18 +61,19 @@ inline void reportProgress(int stage, int cur, int total, const char* label) {
     // time the stage label changes, and a tight in-place update
     // otherwise, so the user sees live motion on stderr.
     static int         s_lastStage = -999;
-    static const char* s_lastLabel = nullptr;
+    static std::string s_lastLabel;
     static bool        s_needNewline = false;
 
-    const bool newStage = (stage != s_lastStage) || (s_lastLabel != label);
+    const std::string curLabel = label ? std::string(label) : std::string();
+    const bool newStage = (stage != s_lastStage) || (s_lastLabel != curLabel);
     if (newStage) {
         if (s_needNewline) { std::fprintf(stderr, "\n"); s_needNewline = false; }
-        std::fprintf(stderr, "[wgf §%d] %s", stage, label);
+        std::fprintf(stderr, "[wgf §%d] %s", stage, curLabel.c_str());
         s_lastStage = stage;
-        s_lastLabel = label;
+        s_lastLabel = curLabel;
     }
     if (total > 1) {
-        std::fprintf(stderr, "\r[wgf §%d] %s  %d/%d   ", stage, label, cur, total);
+        std::fprintf(stderr, "\r[wgf §%d] %s  %d/%d   ", stage, curLabel.c_str(), cur, total);
         s_needNewline = true;
     } else {
         std::fprintf(stderr, "\n");
