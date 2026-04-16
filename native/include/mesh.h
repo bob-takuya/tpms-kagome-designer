@@ -260,6 +260,36 @@ inline SpMat buildFaceDirichlet(const Mesh& m,
     return L;
 }
 
+// Drop triangles whose area is below `areaThreshold`. Marching-cubes can
+// emit a few zero-area slivers along voxel boundaries; downstream Algorithm 1
+// builds a KKT system whose diagonal includes per-face mass terms, so a single
+// degenerate face injects a hard zero on the diagonal and breaks SparseLU.
+// Removes faces only — vertices are kept (they may be referenced elsewhere).
+// Caller must rebuild half-edges; this routine clears `m.he/v2he/f2he/eInt`
+// because their indices reference the old face list.
+inline int removeDegenerateFaces(Mesh& m, double areaThreshold = 1e-14) {
+    const int nF0 = m.nF();
+    std::vector<int> keep;
+    keep.reserve(nF0);
+    for (int f = 0; f < nF0; ++f) {
+        Eigen::Vector3d a = m.V.row(m.F(f, 0));
+        Eigen::Vector3d b = m.V.row(m.F(f, 1));
+        Eigen::Vector3d c = m.V.row(m.F(f, 2));
+        double area = 0.5 * (b - a).cross(c - a).norm();
+        if (area > areaThreshold) keep.push_back(f);
+    }
+    const int nFnew = (int)keep.size();
+    if (nFnew == nF0) return 0;
+    MatF Fnew(nFnew, 3);
+    for (int i = 0; i < nFnew; ++i) Fnew.row(i) = m.F.row(keep[i]);
+    m.F = std::move(Fnew);
+    m.he.clear();
+    m.v2he.clear();
+    m.f2he.clear();
+    m.eInt.clear();
+    return nF0 - nFnew;
+}
+
 // Parallel-transport angle from face fi to face fj across their shared
 // half-edge h (h ∈ face fi). Needed by the 6-RoSy build.
 inline double parallelTransport(const Mesh& m,

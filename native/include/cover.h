@@ -167,7 +167,11 @@ inline CoverBuildResult buildBranchedCover(
         int holonomy = ((acc % 6) + 6) % 6;
         holHist[holonomy]++;
         if (isBdry) nBdry++;
-        if (isBdry || holonomy != 0) {
+        // Only true topological singularities (interior vertices with non-zero
+        // holonomy) become branch points. Boundary vertices have an open fan
+        // and θ terminates naturally at the boundary, so puncturing them just
+        // shatters the cover into many components.
+        if (!isBdry && holonomy != 0) {
             R.isSingularBaseV[v] = 1;
             R.numSingular++;
             // erase all offsets we stored for this singular vertex
