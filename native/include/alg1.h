@@ -51,7 +51,7 @@
 #include "mesh.h"
 #include "curl.h"
 #include "progress.h"
-#include <Eigen/SparseQR>
+#include <Eigen/SparseLU>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -155,9 +155,10 @@ inline Alg1Result runAlg1(const Mesh& m,
         KKT.setFromTriplets(KK.begin(), KK.end());
         KKT.makeCompressed();
 
-        Eigen::SparseQR<SpMat, Eigen::COLAMDOrdering<int>> qr;
-        qr.compute(KKT);
-        if (qr.info() != Eigen::Success) break;
+        Eigen::SparseLU<SpMat> lu;
+        lu.analyzePattern(KKT);
+        lu.factorize(KKT);
+        if (lu.info() != Eigen::Success) break;
 
         int innerIter = 0;
         for (; innerIter < maxIter; ++innerIter) {
@@ -174,8 +175,8 @@ inline Alg1Result runAlg1(const Mesh& m,
             rhs.setZero();
             rhs.head(nW) = -lambda * (Lvf * w);
             rhs.tail(E)  = -(C * w);
-            Vec sol = qr.solve(rhs);
-            if (qr.info() != Eigen::Success) break;
+            Vec sol = lu.solve(rhs);
+            if (lu.info() != Eigen::Success) break;
             Vec delta = sol.head(nW);
 
             double maxUpd = 0.0;
