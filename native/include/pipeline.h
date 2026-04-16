@@ -57,7 +57,18 @@ struct PipelineResult {
     int    numSegmentsFam[3] = {0, 0, 0};
 };
 
-inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) {
+inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt) {
+    // Marching cubes occasionally emits zero-area triangles along voxel
+    // boundaries; they propagate into the Algorithm-1 KKT diagonal as exact
+    // zeros and break SparseLU. Strip them once up front.
+    Mesh base = baseIn;
+    int dropped = removeDegenerateFaces(base);
+    if (dropped > 0) {
+        std::fprintf(stderr,
+            "[mesh] dropped %d degenerate face(s) (area < 1e-14)\n", dropped);
+        buildHalfEdges(base);
+    }
+
     PipelineResult R;
     R.baseV = base.nV();
     R.baseF = base.nF();
@@ -179,10 +190,11 @@ inline PipelineResult runPipeline(const Mesh& base, const PipelineOptions& opt) 
         }
 
         // (b) Per-component Alg 1 to sharpen the direction field.
+        // Use the same λ schedule as the base run (Vekhter et al. 2019 §4.1.3).
         Alg1Result RS = runAlg1(S.mesh, Sframes, wS, {},
-                                /*lambdaInit=*/1.0,
-                                /*lambdaMin =*/1e-2,
-                                /*maxIter   =*/8,
+                                opt.lambdaInit,
+                                opt.lambdaMin,
+                                opt.alg1MaxIter,
                                 opt.alg1Tol);
         R.alg1CoverFinalCurl += RS.finalCurl;
 
