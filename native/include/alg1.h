@@ -124,6 +124,13 @@ inline Alg1Result runAlg1(const Mesh& m,
         reportProgress(progressStage, 0, progressTotal, lbl.c_str());
     }
 
+    // The KKT sparsity pattern is identical across λ-levels (only the
+    // λ·Lvf and Mvf values vary), so SparseLU's symbolic factorization
+    // can be reused. analyzePattern is ~20–50% of the cost of a single
+    // factorize call, and we'd pay it nLevels times otherwise.
+    Eigen::SparseLU<SpMat> lu;
+    bool patternAnalyzed = false;
+
     for (int lvl = 0; lvl < nLevels; ++lvl) {
         const double lambda = lambdaSchedule[lvl];
         lambdaHist.push_back(lambda);
@@ -197,8 +204,10 @@ inline Alg1Result runAlg1(const Mesh& m,
             reportProgress(progressStage, totalIters, progressTotal, lbl.c_str());
         }
 
-        Eigen::SparseLU<SpMat> lu;
-        lu.analyzePattern(KKT);
+        if (!patternAnalyzed) {
+            lu.analyzePattern(KKT);
+            patternAnalyzed = true;
+        }
         lu.factorize(KKT);
         if (lu.info() != Eigen::Success) {
             fprintf(stderr,
