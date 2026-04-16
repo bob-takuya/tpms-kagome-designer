@@ -155,10 +155,24 @@ inline Alg1Result runAlg1(const Mesh& m,
         KKT.setFromTriplets(KK.begin(), KK.end());
         KKT.makeCompressed();
 
+        if (progressStage >= 0) {
+            std::string lbl = std::string(progressLabel)
+                + " (factorizing λ=" + std::to_string(lambda).substr(0, 5)
+                + " lvl " + std::to_string(lvl + 1) + "/" + std::to_string(nLevels) + ")";
+            reportProgress(progressStage, totalIters, progressTotal, lbl.c_str());
+        }
+
         Eigen::SparseLU<SpMat> lu;
         lu.analyzePattern(KKT);
         lu.factorize(KKT);
         if (lu.info() != Eigen::Success) break;
+
+        if (progressStage >= 0) {
+            std::string lbl = std::string(progressLabel)
+                + " (solving λ=" + std::to_string(lambda).substr(0, 5)
+                + " lvl " + std::to_string(lvl + 1) + "/" + std::to_string(nLevels) + ")";
+            reportProgress(progressStage, totalIters, progressTotal, lbl.c_str());
+        }
 
         int innerIter = 0;
         for (; innerIter < maxIter; ++innerIter) {
