@@ -155,6 +155,41 @@ inline Alg1Result runAlg1(const Mesh& m,
         KKT.setFromTriplets(KK.begin(), KK.end());
         KKT.makeCompressed();
 
+        // KKT 行列の統計を出力
+        {
+            double diagMin = 1e300, diagMax = -1e300, diagAbsMin = 1e300;
+            int negDiag = 0, zeroDiag = 0;
+            for (int i = 0; i < KKT.rows(); ++i) {
+                double d = KKT.coeff(i, i);
+                diagMin = std::min(diagMin, d);
+                diagMax = std::max(diagMax, d);
+                diagAbsMin = std::min(diagAbsMin, std::abs(d));
+                if (d < 0) negDiag++;
+                if (std::abs(d) < 1e-12) zeroDiag++;
+            }
+            fprintf(stderr,
+                "[alg1-diag] lvl=%d lambda=%.4g KKT %dx%d nnz=%d "
+                "diag[min=%.4g max=%.4g absMin=%.4g negCount=%d zeroCount=%d]\n",
+                lvl, lambda, (int)KKT.rows(), (int)KKT.cols(),
+                (int)KKT.nonZeros(),
+                diagMin, diagMax, diagAbsMin, negDiag, zeroDiag);
+        }
+
+        // cotan 重みの統計（最初のレベルのみ）
+        if (lvl == 0) {
+            double cotMin = 1e300, cotMax = -1e300;
+            int cotHuge = 0;
+            for (const auto& e : m.eInt) {
+                double cw = cotWeight(m, e.first);
+                cotMin = std::min(cotMin, cw);
+                cotMax = std::max(cotMax, cw);
+                if (std::abs(cw) > 100.0) cotHuge++;
+            }
+            fprintf(stderr,
+                "[alg1-diag] cotan weights: min=%.4g max=%.4g huge(>100)=%d / %d edges\n",
+                cotMin, cotMax, cotHuge, (int)m.eInt.size());
+        }
+
         if (progressStage >= 0) {
             std::string lbl = std::string(progressLabel)
                 + " (factorizing λ=" + std::to_string(lambda).substr(0, 5)
@@ -165,7 +200,13 @@ inline Alg1Result runAlg1(const Mesh& m,
         Eigen::SparseLU<SpMat> lu;
         lu.analyzePattern(KKT);
         lu.factorize(KKT);
-        if (lu.info() != Eigen::Success) break;
+        if (lu.info() != Eigen::Success) {
+            fprintf(stderr,
+                "[alg1-diag] SparseLU FAILED lvl=%d lambda=%.4g info=%d\n",
+                lvl, lambda, (int)lu.info());
+            break;
+        }
+        fprintf(stderr, "[alg1-diag] SparseLU OK lvl=%d lambda=%.4g\n", lvl, lambda);
 
         if (progressStage >= 0) {
             std::string lbl = std::string(progressLabel)
