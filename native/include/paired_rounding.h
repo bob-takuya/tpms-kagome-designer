@@ -613,6 +613,13 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         int diag_noExit_entryIn    = 0;
         int diag_noExit_entryNotIn = 0;
         int diag_noExit_dump       = 0;
+        // --- noExit-cache: edge-key agreement across shared edge ---
+        int diag_noExit_sameKey      = 0;
+        int diag_noExit_diffKey      = 0;
+        int diag_noExit_keyInCache   = 0;
+        int diag_noExit_keyMissing   = 0;
+        int diag_noExit_entryCrosses = 0;
+        int diag_noExit_entryNoCross = 0;
         std::vector<int> diag_chainLens;
 
         // --- Phase 4: crossing count per face for this iso ---
@@ -759,6 +766,17 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                 double bary = barys[piece];
                 int curface = faceSideNeighbor(m, seed, crossings[piece]);
                 bool diag_brokenInside = false;
+
+                // Seed-side initial exit edge info for noexit-cache diag.
+                // Updated below right before curface advances to the next face.
+                long long prevExitKey;
+                int       prevExitSide = crossings[piece];
+                double    prevExitBary = barys[piece];
+                {
+                    int va = m.F(seed, (prevExitSide + 1) % 3);
+                    int vb = m.F(seed, (prevExitSide + 2) % 3);
+                    prevExitKey = makeEdgeKey(va, vb, m.nV());
+                }
                 while (curface != -1 && !visited[curface]) {
                     // Phase 3: we are about to look up the entry side on curface.
                     diag_sideChecks++;
@@ -797,6 +815,16 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         seg.bary1 = curFC.bary[idx];
                         bary = curFC.bary[idx];
                         traces[piece].push_back(seg);
+                        // Capture exit-edge info on CURRENT curface so the
+                        // next iteration (or a noExit diag) can compare it
+                        // against the entry-edge view on the new curface.
+                        {
+                            int va = m.F(curface, (k + 1) % 3);
+                            int vb = m.F(curface, (k + 2) % 3);
+                            prevExitKey  = makeEdgeKey(va, vb, m.nV());
+                        }
+                        prevExitSide = k;
+                        prevExitBary = curFC.bary[idx];
                         prevface = curface;
                         curface = faceSideNeighbor(m, curface, k);
                         extended = true;
@@ -833,6 +861,34 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                             else         diag_noExit_entryNotIn++;
                         }
 
+                        // noexit-cache: compute curface's entry-side edge
+                        // key and compare against the prevface's exit-side
+                        // edge key captured before curface advanced.
+                        long long curEntryKey = -1;
+                        int curEntrySide = seg.side0;
+                        bool entryInCache = false;
+                        bool entryCrosses = false;
+                        double entryT = 0.0;
+                        {
+                            int va = m.F(curface, (curEntrySide + 1) % 3);
+                            int vb = m.F(curface, (curEntrySide + 2) % 3);
+                            curEntryKey = makeEdgeKey(va, vb, m.nV());
+                            auto it = edgeCache.find(curEntryKey);
+                            if (it != edgeCache.end()) {
+                                entryInCache = true;
+                                entryCrosses = it->second.hit;
+                                entryT       = it->second.bary;
+                            }
+                        }
+                        bool sameKey = (prevExitKey == curEntryKey);
+
+                        if (sameKey) diag_noExit_sameKey++;
+                        else         diag_noExit_diffKey++;
+                        if (entryInCache) diag_noExit_keyInCache++;
+                        else              diag_noExit_keyMissing++;
+                        if (entryCrosses) diag_noExit_entryCrosses++;
+                        else              diag_noExit_entryNoCross++;
+
                         // noExit-deep: first 10 dumps at iso=0 only.
                         if (isoIdx == 0 && diag_noExit_dump < 10) {
                             diag_noExit_dump++;
@@ -853,6 +909,19 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                                 curFC.count > 1
                                     ? faceSideNeighbor(m, curface, curFC.side[1])
                                     : -999);
+                            std::fprintf(stderr,
+                                "[noexit-cache-dump] iso=%d prevface=%d curface=%d "
+                                "prevExitSide=%d curEntrySide=%d "
+                                "prevExitKey=%lld curEntryKey=%lld sameKey=%d "
+                                "entryKeyInCache=%d entryCrosses=%d entryT=%.6f "
+                                "prevExitBary=%.6f curSides=[%d,%d] curBary=[%.6f,%.6f]\n",
+                                isoIdx, prevface, curface,
+                                prevExitSide, curEntrySide,
+                                prevExitKey, curEntryKey, sameKey ? 1 : 0,
+                                entryInCache ? 1 : 0, entryCrosses ? 1 : 0, entryT,
+                                prevExitBary,
+                                curFC.side[0], curFC.side[1],
+                                curFC.bary[0], curFC.bary[1]);
                         }
 
                         diag_brokenInside = true;
@@ -993,6 +1062,16 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         std::fprintf(stderr,
             "[noexit-entry-in-cross] iso=%d yes=%d no=%d\n",
             isoIdx, diag_noExit_entryIn, diag_noExit_entryNotIn);
+
+        // noExit-cache: edge-key agreement + entry-edge cache lookup result.
+        std::fprintf(stderr,
+            "[noexit-cache-stats] iso=%d "
+            "sameKey=%d diffKey=%d keyInCache=%d keyMissing=%d "
+            "entryCrosses=%d entryNoCross=%d\n",
+            isoIdx,
+            diag_noExit_sameKey, diag_noExit_diffKey,
+            diag_noExit_keyInCache, diag_noExit_keyMissing,
+            diag_noExit_entryCrosses, diag_noExit_entryNoCross);
     }
     return out;
 }
