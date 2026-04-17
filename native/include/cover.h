@@ -142,6 +142,25 @@ inline CoverBuildResult buildBranchedCover(
         int h0 = base.v2he[v];
         if (h0 < 0) continue;
 
+        // For a boundary vertex, v2he[v] may land anywhere in the open fan.
+        // The forward walk `h ← twin(prev(h))` terminates at the CW-end
+        // (where prev(h) is a boundary edge) but never crosses the CCW-end,
+        // so starting in the middle leaves the CCW-side of the fan with no
+        // cornerOffset entry — and those faces silently vanish from the
+        // cover. Rewind via the inverse rotation `h ← next(twin(h))` until
+        // we hit a boundary (CCW-end) or cycle back (closed fan).
+        {
+            int hRew = h0;
+            for (int g = 0; g < walkGuard; ++g) {
+                int tw = base.he[hRew].twin;
+                if (tw < 0) break;                  // reached CCW-end of fan
+                int nxt = base.he[tw].next;
+                if (nxt == h0) break;               // closed fan, original h0 fine
+                hRew = nxt;
+            }
+            h0 = hRew;
+        }
+
         int acc = 0;  // offset of face(h0) is 0 by convention
         int h = h0;
         bool isBdry = false;
