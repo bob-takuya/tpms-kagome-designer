@@ -46,6 +46,24 @@ struct PipelineOptions {
     int    jointIters     = 10;
     double userScale      = 1.0;    // stripe density multiplier on top of π-rescale
     bool   useCover       = true;
+
+    // Fast diagnostic mode. Skips paired rounding + per-component
+    // Algorithm 2 / Eq.8 solve; replaces the cover theta with a synthetic
+    // field that shares the same layer-wrap structure as the real output,
+    // so extractAngularIsolines runs on a realistic cover.
+    //   diagOnly = 0 : normal full pipeline (default)
+    //   diagOnly = 1 : skip paired rounding + per-component solve
+    //                  (uses base-vertex atan2 + layer * π/3 as theta)
+    //   diagOnly = 2 : BROKEN — per-face phi assigned to vertices is
+    //                  face-choice-dependent (see runPipeline for a full
+    //                  explanation). Reserved for a future correct
+    //                  implementation using vertex 6-RoSy or per-vertex
+    //                  averaged phi. Use diagOnly=1 instead.
+    int    diagOnly       = 0;
+    // Cap on input vertex count; 0 = no cap. Only issues a warning if
+    // exceeded (we don't mesh-decimate here, to keep the diagnostic run
+    // comparable to the full run).
+    int    maxVerts       = 0;
 };
 
 struct PipelineResult {
@@ -77,6 +95,12 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
     R.baseV = base.nV();
     R.baseF = base.nF();
     R.baseE = base.nE();
+
+    if (opt.maxVerts > 0 && base.nV() > opt.maxVerts) {
+        std::fprintf(stderr,
+            "[pipeline] warning: base.nV=%d exceeds maxVerts=%d; running anyway\n",
+            base.nV(), opt.maxVerts);
+    }
 
     reportProgress(STAGE_INIT, 0, 1, "Building face frames");
     auto frames = buildFaceFrames(base);
@@ -159,6 +183,73 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         std::fprintf(stderr,
             "[mesh-diag] cover: bdry_edges=%d bdry_verts=%d bdry_faces=%d bdry_loops=%d\n",
             cs.edges, cs.verts, cs.faces, cs.loops);
+    }
+
+    // --- Fast diagnostic path -----------------------------------------
+    //
+    // Skip everything after the cover build; fabricate a theta that has
+    // the same layer-wrap structure as a real run and call
+    // extractAngularIsolines once so its diagnostic logs fire. Useful for
+    // iterating on the tracer without paying for the 27k-variable
+    // paired_rounding Gauss-Seidel + per-component Alg2/Eq.8 solves.
+    if (opt.diagOnly >= 1) {
+        int numISOLines = 1;
+        Vec thetaCover(cov.mesh.nV());
+        for (int v = 0; v < cov.mesh.nV(); ++v) {
+            int baseV = cov.coverVertexBaseV[v];
+            int layer = cov.coverVertexLayer[v];
+            double thetaBase;
+            if (opt.diagOnly >= 2) {
+                // WARNING: diagOnly=2 is BROKEN as currently implemented.
+                //
+                // `phi` is per-FACE (6-RoSy canonical angle in (-π/6, π/6]);
+                // neighbouring faces at the same vertex differ by ≈ k·π/3
+                // (the 6-RoSy rotational ambiguity). Picking "any incident
+                // face" therefore produces a vertex-valued θ that is
+                // face-choice-dependent — you get a different θ for the
+                // same cover vertex depending on which base face we happen
+                // to visit via v2he, which breaks the per-cover-face wrap
+                // structure that diagOnly=1 preserves.
+                //
+                // A correct implementation would need one of:
+                //   (a) a vertex 6-RoSy phi (solve the Knoeppel eigenproblem
+                //       with a vertex mass matrix), or
+                //   (b) per-vertex averaging of phi across incident faces
+                //       AFTER unwrapping each face's phi to within π/6 of
+                //       some reference (e.g. the first face's phi).
+                //
+                // We keep the broken branch in place rather than removing it
+                // so that the option name stays reserved and so that this
+                // comment stays discoverable. diagOnly=1 is sufficient for
+                // the current diagnostic (it still exercises the tracer on
+                // a real layer-wrap structure, just skips paired_rounding
+                // + per-component Alg2/Eq.8).
+                int h = base.v2he[baseV];
+                int fBase = (h >= 0) ? base.he[h].face : 0;
+                thetaBase = phi[fBase];
+            } else {
+                thetaBase = std::atan2(base.V(baseV, 1), base.V(baseV, 0));
+            }
+            double t = thetaBase + layer * M_PI / 3.0;
+            while (t >  M_PI) t -= 2.0 * M_PI;
+            while (t < -M_PI) t += 2.0 * M_PI;
+            thetaCover[v] = t;
+        }
+        std::fprintf(stderr,
+            "[diag-only] mode=%d: synthetic theta on cover (nV=%d), "
+            "running extractAngularIsolines with %d iso(s)\n",
+            opt.diagOnly, cov.mesh.nV(), numISOLines);
+        if (opt.diagOnly >= 2) {
+            std::fprintf(stderr,
+                "[diag-only] WARNING: diagOnly=2 is known-broken "
+                "(per-face phi assigned to vertex). See pipeline.h "
+                "for details. Use diagOnly=1 for reliable diagnostics.\n");
+        }
+        reportProgress(STAGE_ASSEMBLE, 0, 1, "diag-only: extracting isolines");
+        (void)extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
+        R.segments.clear();
+        reportProgress(STAGE_DONE, 1, 1, "Done (diag-only)");
+        return R;
     }
 
     // 4. Connected components of the cover.
