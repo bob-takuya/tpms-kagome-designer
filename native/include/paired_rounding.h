@@ -470,6 +470,23 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
 
         // --- Phase 4: crossing count per face for this iso ---
         int diag_crossBuckets[5] = {0, 0, 0, 0, 0};  // 0, 1, 2, 3, >3
+
+        // --- 1-crossing interior-face theta distribution diagnostic ---
+        //
+        // Classifies each interior 1-cross face by the proximate cause:
+        //   - NaN/inf theta values (Alg2/Eq.8 numerical blow-up)
+        //   - Contains a "wrap edge" |Δθ| > π (crosses() wrap ambiguity)
+        //   - Neither (genuine odd-crossing topology)
+        // Dumps DUMP_LIMIT of the "interior + no NaN" faces with full
+        // vertex/theta/isoval/dtheta info + what a face-local unwrap
+        // would produce, so we can tell if face-local unwrap would
+        // flip the count from 1 to {0, 2}.
+        int diag_oneCrossWithWrap    = 0;
+        int diag_oneCrossWithoutWrap = 0;
+        int diag_oneCrossNaN         = 0;
+        const int DUMP_LIMIT = 20;
+        int dumpCount = 0;
+
         for (int f = 0; f < nF; ++f) {
             int cnt = 0;
             for (int j = 0; j < 3; ++j) {
@@ -483,8 +500,55 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
             if (cnt <= 3) diag_crossBuckets[cnt]++;
             else          diag_crossBuckets[4]++;
             if (cnt == 1) {
-                if (faceHasBoundaryEdge(m, f)) diag_oneCrossBdry++;
-                else                           diag_oneCrossInterior++;
+                bool isBdry = faceHasBoundaryEdge(m, f);
+                if (isBdry) diag_oneCrossBdry++;
+                else        diag_oneCrossInterior++;
+
+                int v0 = m.F(f, 0), v1 = m.F(f, 1), v2 = m.F(f, 2);
+                double t0 = theta[v0], t1 = theta[v1], t2 = theta[v2];
+                bool hasNaN = !std::isfinite(t0) || !std::isfinite(t1)
+                              || !std::isfinite(t2);
+                double d01 = std::fabs(t1 - t0);
+                double d12 = std::fabs(t2 - t1);
+                double d20 = std::fabs(t0 - t2);
+                bool hasWrap = (d01 > M_PI) || (d12 > M_PI) || (d20 > M_PI);
+
+                if (hasNaN) {
+                    diag_oneCrossNaN++;
+                } else if (!isBdry) {
+                    if (hasWrap) diag_oneCrossWithWrap++;
+                    else         diag_oneCrossWithoutWrap++;
+
+                    if (dumpCount < DUMP_LIMIT && isoIdx == 0) {
+                        dumpCount++;
+                        std::fprintf(stderr,
+                            "[one-cross-dump] face=%d v=[%d,%d,%d] "
+                            "theta=[%.4f,%.4f,%.4f] isoval=%.4f "
+                            "dtheta=[%.4f,%.4f,%.4f] hasWrap=%d\n",
+                            f, v0, v1, v2, t0, t1, t2, isoval,
+                            t1 - t0, t2 - t1, t0 - t2, hasWrap ? 1 : 0);
+
+                        auto unwrapTo = [](double x, double ref) {
+                            while (x - ref >  M_PI) x -= 2.0 * M_PI;
+                            while (x - ref < -M_PI) x += 2.0 * M_PI;
+                            return x;
+                        };
+                        double u0 = t0;
+                        double u1 = unwrapTo(t1, u0);
+                        double u2 = unwrapTo(t2, u0);
+                        auto crossSimple = [&](double iso, double a, double b) {
+                            return (a <= iso && iso < b) || (b <= iso && iso < a);
+                        };
+                        int unwrappedCnt = 0;
+                        if (crossSimple(isoval, u0, u1)) unwrappedCnt++;
+                        if (crossSimple(isoval, u1, u2)) unwrappedCnt++;
+                        if (crossSimple(isoval, u2, u0)) unwrappedCnt++;
+                        std::fprintf(stderr,
+                            "[one-cross-unwrapped] face=%d "
+                            "unwrapped_theta=[%.4f,%.4f,%.4f] new_cnt=%d\n",
+                            f, u0, u1, u2, unwrappedCnt);
+                    }
+                }
             }
         }
 
@@ -684,6 +748,18 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         std::fprintf(stderr,
             "[crossing-1-breakdown] iso=%d bdry=%d interior=%d\n",
             isoIdx, diag_oneCrossBdry, diag_oneCrossInterior);
+
+        // Causal breakdown of 1-crossing INTERIOR faces (ignores bdry).
+        //   wrap:   at least one face edge has |Δθ| > π → crosses() wrap
+        //           branch could be what flips the parity to odd
+        //   nowrap: all |Δθ| ≤ π, so crosses() is using the simple branch
+        //   nan:    theta has NaN/inf on this face
+        std::fprintf(stderr,
+            "[theta-wrap-stats] iso=%d one_cross_interior=%d "
+            "(wrap=%d, nowrap=%d, nan=%d)\n",
+            isoIdx, diag_oneCrossInterior,
+            diag_oneCrossWithWrap, diag_oneCrossWithoutWrap,
+            diag_oneCrossNaN);
 
         // Boundary vs interior breakdown of no-exit stops.
         std::fprintf(stderr,
