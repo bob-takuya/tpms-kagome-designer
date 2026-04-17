@@ -584,6 +584,39 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                             "unwrapped_theta=[%.4f,%.4f,%.4f] new_cnt=%d\n",
                             f, u0, u1, u2, unwrappedCnt);
                     }
+
+                    // --- Exhaustive post-fix dump: every remaining
+                    // 1-crossing interior face at iso=0, with the exact
+                    // face-local unwrap values used inside
+                    // computeFaceCrossings() so we can classify the
+                    // residual cause (vertex-hit, missing branch
+                    // candidate, or synthetic-θ stress).
+                    if (isoIdx == 0) {
+                        const double u0 = t0;
+                        const double u1 = unwrapToNear(t1, u0);
+                        const double u2 = unwrapToNear(t2, u0);
+                        const double iso_u = unwrapToNear(isoval, u0);
+                        std::fprintf(stderr,
+                            "[one-cross-after-fix] iso=%d face=%d "
+                            "theta_raw=[%.9f,%.9f,%.9f] "
+                            "theta_unwrap=[%.9f,%.9f,%.9f] "
+                            "isoval=%.9f iso_unwrap=%.9f "
+                            "dist_to_verts=[%.3e,%.3e,%.3e] "
+                            "edge_delta_unwrap=[%.9f,%.9f,%.9f] "
+                            "sides=[%d,%d] bary=[%.9f,%.9f] "
+                            "bdry=%d\n",
+                            isoIdx, f,
+                            t0, t1, t2,
+                            u0, u1, u2,
+                            isoval, iso_u,
+                            std::fabs(u0 - iso_u),
+                            std::fabs(u1 - iso_u),
+                            std::fabs(u2 - iso_u),
+                            u1 - u0, u2 - u1, u0 - u2,
+                            diagFC.side[0], diagFC.side[1],
+                            diagFC.bary[0], diagFC.bary[1],
+                            (int)isBdry);
+                    }
                 }
             }
         }
