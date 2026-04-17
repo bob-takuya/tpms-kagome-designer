@@ -59,6 +59,7 @@
 #include <Eigen/IterativeLinearSolvers>
 #include <vector>
 #include <cmath>
+#include <unordered_map>
 
 namespace wgf {
 
@@ -470,6 +471,98 @@ inline FaceIsoCrossing computeFaceCrossings(
     return res;
 }
 
+// Edge-centered crossing cache. Both faces sharing an edge see the same
+// hit/bary, so trace-loop entry/exit cannot disagree across the shared
+// edge (which was the failure mode after PR #16: face-local unwrap fixed
+// per-face parity but two adjacent faces could still pick different
+// branches and produce inconsistent crossings on the shared edge).
+struct EdgeCrossingEntry {
+    bool   hit  = false;
+    double bary = 0.0;  // along vmin -> vmax, in [0, 1)
+};
+
+inline long long makeEdgeKey(int a, int b, int nV) {
+    int vmin = std::min(a, b);
+    int vmax = std::max(a, b);
+    return (long long)vmin * (long long)nV + (long long)vmax;
+}
+
+// Build per-edge crossings for `isoval`. Walks every undirected edge once
+// (interior edges via the lower-indexed half-edge; boundary edges via the
+// only existing half-edge). Theta on vmax is unwrapped onto vmin's branch
+// so the iso/edge comparison is single-branched and bary direction is
+// canonical (vmin -> vmax).
+inline std::unordered_map<long long, EdgeCrossingEntry>
+buildEdgeCrossingCache(const Mesh& m, const Vec& theta, double isoval) {
+    std::unordered_map<long long, EdgeCrossingEntry> cache;
+    cache.reserve(m.he.size() / 2 + 8);
+    const int nV = m.nV();
+    const int nH = (int)m.he.size();
+    const double eps = 1e-12;
+
+    for (int h = 0; h < nH; ++h) {
+        int twin = m.he[h].twin;
+        // For interior edges, only process the half-edge with the lower
+        // index; for boundary edges (twin == -1), always process.
+        if (twin >= 0 && h > twin) continue;
+
+        int va = m.heStart(h);
+        int vb = m.he[h].vertex;
+        int vmin = std::min(va, vb);
+        int vmax = std::max(va, vb);
+
+        const double tmin = theta[vmin];
+        const double tmax = unwrapToNear(theta[vmax], tmin);
+        const double iso  = unwrapToNear(isoval,      tmin);
+
+        EdgeCrossingEntry ec;
+        if (std::fabs(tmax - tmin) > eps) {
+            const bool hit = (tmin <= iso && iso < tmax)
+                          || (tmax <= iso && iso < tmin);
+            if (hit) {
+                const double u = (iso - tmin) / (tmax - tmin);
+                if (u >= 0.0 && u < 1.0) {
+                    ec.hit  = true;
+                    ec.bary = u;
+                }
+            }
+        }
+        cache[makeEdgeKey(va, vb, nV)] = ec;
+    }
+    return cache;
+}
+
+// Read this face's crossings out of the edge cache. Side index follows
+// the reference convention (side j = edge F(f,(j+1)%3) -> F(f,(j+2)%3));
+// bary[i] in [0,1) along vs -> ve. Cache stores bary in vmin -> vmax
+// orientation, so we flip when the face traverses the edge in the
+// opposite direction.
+inline FaceIsoCrossing computeFaceCrossingsFromCache(
+    const Mesh& m,
+    const std::unordered_map<long long, EdgeCrossingEntry>& edgeCache,
+    int f)
+{
+    FaceIsoCrossing res;
+    res.count   = 0;
+    res.side[0] = res.side[1] = -1;
+    res.bary[0] = res.bary[1] = 0.0;
+
+    const int nV = m.nV();
+    for (int j = 0; j < 3 && res.count < 2; ++j) {
+        int vs = m.F(f, (j + 1) % 3);
+        int ve = m.F(f, (j + 2) % 3);
+        auto it = edgeCache.find(makeEdgeKey(vs, ve, nV));
+        if (it == edgeCache.end()) continue;
+        const EdgeCrossingEntry& ec = it->second;
+        if (!ec.hit) continue;
+
+        res.side[res.count] = j;
+        res.bary[res.count] = (vs < ve) ? ec.bary : (1.0 - ec.bary);
+        res.count++;
+    }
+    return res;
+}
+
 inline std::vector<AngularSegment>
 extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
     std::vector<AngularSegment> out;
@@ -493,6 +586,12 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
 
     for (int isoIdx = 0; isoIdx < numISOLines; ++isoIdx) {
         const double isoval = minval + (maxval - minval) * double(isoIdx) / double(numISOLines);
+
+        // Edge-centered crossing cache for this iso. Both faces sharing
+        // an edge read the SAME hit/bary, eliminating the cross-face
+        // disagreement that was producing curFC.count=0 noExit stops on
+        // the trace's incoming edge.
+        auto edgeCache = buildEdgeCrossingCache(m, theta, isoval);
 
         // --- Diagnostic counters (per-iso, read-only; do not affect algorithm) ---
         int diag_chains            = 0;
@@ -536,7 +635,7 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         int dumpCount = 0;
 
         for (int f = 0; f < nF; ++f) {
-            FaceIsoCrossing diagFC = computeFaceCrossings(m, theta, f, isoval);
+            FaceIsoCrossing diagFC = computeFaceCrossingsFromCache(m, edgeCache, f);
             int cnt = diagFC.count;
             if (cnt <= 3) diag_crossBuckets[cnt]++;
             else          diag_crossBuckets[4]++;
@@ -633,9 +732,9 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
             visited[seed] = 1;
 
             // Find which of the 3 sides of `seed` cross this isoline,
-            // using the face-local unwrap helper so the seed face and the
-            // trace loop agree on parity.
-            FaceIsoCrossing seedFC = computeFaceCrossings(m, theta, seed, isoval);
+            // reading the per-edge crossing cache so the seed face and
+            // the trace loop agree on each shared edge.
+            FaceIsoCrossing seedFC = computeFaceCrossingsFromCache(m, edgeCache, seed);
             if (seedFC.count < 2) continue;
             int    crossings[2] = { seedFC.side[0], seedFC.side[1] };
             double barys[2]     = { seedFC.bary[0], seedFC.bary[1] };
@@ -684,10 +783,12 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         break;
                     }
 
-                    // Find the other crossing on curface (exit), using
-                    // the same face-local unwrap logic as the seed face.
-                    FaceIsoCrossing curFC = computeFaceCrossings(
-                        m, theta, curface, isoval);
+                    // Find the other crossing on curface (exit) by
+                    // reading the same per-edge cache the seed face
+                    // used. This guarantees curface's view of the
+                    // shared incoming edge matches prevface's exit.
+                    FaceIsoCrossing curFC = computeFaceCrossingsFromCache(
+                        m, edgeCache, curface);
                     bool extended = false;
                     for (int idx = 0; idx < curFC.count; ++idx) {
                         int k = curFC.side[idx];
