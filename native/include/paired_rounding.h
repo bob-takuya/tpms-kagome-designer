@@ -403,36 +403,79 @@ inline BoundaryStats computeBoundaryStats(const Mesh& m) {
     return s;
 }
 
+// Unwrap x onto the branch within (ref - pi, ref + pi].
+inline double unwrapToNear(double x, double ref) {
+    while (x - ref >  M_PI) x -= 2.0 * M_PI;
+    while (x - ref < -M_PI) x += 2.0 * M_PI;
+    return x;
+}
+
+// Per-face iso-crossing result. `side[i]` follows the reference side-index
+// convention: side j is the edge opposite vertex j (= F(f,(j+1)%3) -> F(f,(j+2)%3)),
+// bary[i] in [0,1) measures the position along that edge with bary=0 at
+// F(f,(side+1)%3) and bary=1 at F(f,(side+2)%3).
+struct FaceIsoCrossing {
+    int    side[2];
+    double bary[2];
+    int    count;
+};
+
+// Compute the crossings of the `isoval` level set with face f using a
+// face-local unwrap of the three vertex theta values and the isovalue
+// onto the same 2π branch. This resolves 1-crossing interior face parity
+// bugs caused by edge-pair unwrap ambiguity in the old `crosses()` helper.
+inline FaceIsoCrossing computeFaceCrossings(
+    const Mesh& m,
+    const Vec& theta,
+    int f,
+    double isoval)
+{
+    FaceIsoCrossing res;
+    res.count   = 0;
+    res.side[0] = res.side[1] = -1;
+    res.bary[0] = res.bary[1] = 0.0;
+
+    const int v0 = m.F(f, 0);
+    const int v1 = m.F(f, 1);
+    const int v2 = m.F(f, 2);
+
+    // Face-local unwrap: pick v0's branch as reference, bring the other
+    // vertex values and the iso target onto the same branch.
+    const double t0  = theta[v0];
+    const double t1  = unwrapToNear(theta[v1], t0);
+    const double t2  = unwrapToNear(theta[v2], t0);
+    const double iso = unwrapToNear(isoval,    t0);
+
+    auto tryEdge = [&](int sideIdx, double a, double b) {
+        const double eps = 1e-12;
+        if (std::fabs(a - b) < eps) return;
+        // Half-open rule: iso hitting an endpoint counts for exactly one
+        // of the two incident edges.
+        const bool hit = (a <= iso && iso < b) || (b <= iso && iso < a);
+        if (!hit || res.count >= 2) return;
+        const double u = (iso - a) / (b - a);
+        if (u >= 0.0 && u < 1.0) {
+            res.side[res.count] = sideIdx;
+            res.bary[res.count] = u;
+            res.count++;
+        }
+    };
+
+    // Side j = edge from F(f,(j+1)%3) to F(f,(j+2)%3), matching sidePoint()
+    // and faceSideNeighbor() in this file.
+    tryEdge(0, t1, t2);  // side 0: v1 -> v2
+    tryEdge(1, t2, t0);  // side 1: v2 -> v0
+    tryEdge(2, t0, t1);  // side 2: v0 -> v1
+
+    return res;
+}
+
 inline std::vector<AngularSegment>
 extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
     std::vector<AngularSegment> out;
     const int nF = m.nF();
     const double minval = -M_PI;
     const double maxval =  M_PI;
-
-    auto crosses = [&](double isoval, double v1, double v2, double& bary) -> bool {
-        const double halfperiod = M_PI;
-        if (std::fabs(v2 - v1) <= halfperiod) {
-            bary = (isoval - v1) / (v2 - v1);
-            return bary >= 0.0 && bary < 1.0;
-        }
-        if (v1 < v2) {
-            double w1 = v1 + 2 * M_PI;
-            bary = (isoval - w1) / (v2 - w1);
-            if (bary >= 0.0 && bary < 1.0) return true;
-            double w2 = v2 - 2 * M_PI;
-            bary = (isoval - v1) / (w2 - v1);
-            if (bary >= 0.0 && bary < 1.0) return true;
-        } else {
-            double w1 = v1 - 2 * M_PI;
-            bary = (isoval - w1) / (v2 - w1);
-            if (bary >= 0.0 && bary < 1.0) return true;
-            double w2 = v2 + 2 * M_PI;
-            bary = (isoval - v1) / (w2 - v1);
-            if (bary >= 0.0 && bary < 1.0) return true;
-        }
-        return false;
-    };
 
     // Given a face f, side j in reference numbering, return the 3D point
     // at barycentric bary along that edge. Side j's edge connects
@@ -488,15 +531,8 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         int dumpCount = 0;
 
         for (int f = 0; f < nF; ++f) {
-            int cnt = 0;
-            for (int j = 0; j < 3; ++j) {
-                int vp1 = m.F(f, (j + 1) % 3);
-                int vp2 = m.F(f, (j + 2) % 3);
-                double bary;
-                if (crosses(isoval, theta[vp1], theta[vp2], bary)) {
-                    cnt++;
-                }
-            }
+            FaceIsoCrossing diagFC = computeFaceCrossings(m, theta, f, isoval);
+            int cnt = diagFC.count;
             if (cnt <= 3) diag_crossBuckets[cnt]++;
             else          diag_crossBuckets[4]++;
             if (cnt == 1) {
@@ -558,21 +594,13 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
             if (visited[seed]) continue;
             visited[seed] = 1;
 
-            // Find which of the 3 sides of `seed` cross this isoline.
-            int crossings[2]  = {-1, -1};
-            double barys[2]   = {0, 0};
-            int nCross = 0;
-            for (int j = 0; j < 3 && nCross < 2; ++j) {
-                int vp1 = m.F(seed, (j + 1) % 3);
-                int vp2 = m.F(seed, (j + 2) % 3);
-                double bary;
-                if (crosses(isoval, theta[vp1], theta[vp2], bary)) {
-                    crossings[nCross] = j;
-                    barys[nCross] = bary;
-                    nCross++;
-                }
-            }
-            if (nCross < 2) continue;
+            // Find which of the 3 sides of `seed` cross this isoline,
+            // using the face-local unwrap helper so the seed face and the
+            // trace loop agree on parity.
+            FaceIsoCrossing seedFC = computeFaceCrossings(m, theta, seed, isoval);
+            if (seedFC.count < 2) continue;
+            int    crossings[2] = { seedFC.side[0], seedFC.side[1] };
+            double barys[2]     = { seedFC.bary[0], seedFC.bary[1] };
 
             // For each of the 2 crossing sides, walk outward tracing the
             // level set until we hit a boundary or a visited face.
@@ -618,23 +646,22 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         break;
                     }
 
-                    // Find the other crossing on curface (exit).
+                    // Find the other crossing on curface (exit), using
+                    // the same face-local unwrap logic as the seed face.
+                    FaceIsoCrossing curFC = computeFaceCrossings(
+                        m, theta, curface, isoval);
                     bool extended = false;
-                    for (int k = 0; k < 3; ++k) {
+                    for (int idx = 0; idx < curFC.count; ++idx) {
+                        int k = curFC.side[idx];
                         if (k == seg.side0) continue;
-                        int vp1 = m.F(curface, (k + 1) % 3);
-                        int vp2 = m.F(curface, (k + 2) % 3);
-                        double newbary;
-                        if (crosses(isoval, theta[vp1], theta[vp2], newbary)) {
-                            seg.side1 = k;
-                            seg.bary1 = newbary;
-                            bary = newbary;
-                            traces[piece].push_back(seg);
-                            prevface = curface;
-                            curface = faceSideNeighbor(m, curface, k);
-                            extended = true;
-                            break;
-                        }
+                        seg.side1 = k;
+                        seg.bary1 = curFC.bary[idx];
+                        bary = curFC.bary[idx];
+                        traces[piece].push_back(seg);
+                        prevface = curface;
+                        curface = faceSideNeighbor(m, curface, k);
+                        extended = true;
+                        break;
                     }
                     if (!extended) {
                         diag_stopNoExitCrossing++;
