@@ -391,6 +391,35 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
     for (int isoIdx = 0; isoIdx < numISOLines; ++isoIdx) {
         const double isoval = minval + (maxval - minval) * double(isoIdx) / double(numISOLines);
 
+        // --- Diagnostic counters (per-iso, read-only; do not affect algorithm) ---
+        int diag_chains            = 0;
+        int diag_segments          = 0;
+        int diag_stopBoundary      = 0;
+        int diag_stopVisited       = 0;
+        int diag_stopNoEntrySide   = 0;
+        int diag_stopNoExitCrossing= 0;
+        int diag_closedLoop        = 0;
+        int diag_stopOther         = 0;
+        int diag_sideChecks        = 0;
+        int diag_sideMismatches    = 0;
+        std::vector<int> diag_chainLens;
+
+        // --- Phase 4: crossing count per face for this iso ---
+        int diag_crossBuckets[5] = {0, 0, 0, 0, 0};  // 0, 1, 2, 3, >3
+        for (int f = 0; f < nF; ++f) {
+            int cnt = 0;
+            for (int j = 0; j < 3; ++j) {
+                int vp1 = m.F(f, (j + 1) % 3);
+                int vp2 = m.F(f, (j + 2) % 3);
+                double bary;
+                if (crosses(isoval, theta[vp1], theta[vp2], bary)) {
+                    cnt++;
+                }
+            }
+            if (cnt <= 3) diag_crossBuckets[cnt]++;
+            else          diag_crossBuckets[4]++;
+        }
+
         std::vector<char> visited(nF, 0);
 
         for (int seed = 0; seed < nF; ++seed) {
@@ -432,7 +461,11 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                 int prevface = seed;
                 double bary = barys[piece];
                 int curface = faceSideNeighbor(m, seed, crossings[piece]);
+                bool diag_brokenInside = false;
                 while (curface != -1 && !visited[curface]) {
+                    // Phase 3: we are about to look up the entry side on curface.
+                    diag_sideChecks++;
+
                     visited[curface] = 1;
                     TraceSeg seg;
                     seg.face = curface;
@@ -446,7 +479,12 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                             break;
                         }
                     }
-                    if (seg.side0 < 0) break;
+                    if (seg.side0 < 0) {
+                        diag_sideMismatches++;
+                        diag_stopNoEntrySide++;
+                        diag_brokenInside = true;
+                        break;
+                    }
 
                     // Find the other crossing on curface (exit).
                     bool extended = false;
@@ -466,7 +504,22 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                             break;
                         }
                     }
-                    if (!extended) break;
+                    if (!extended) {
+                        diag_stopNoExitCrossing++;
+                        diag_brokenInside = true;
+                        break;
+                    }
+                }
+                // Classify the "natural" while-loop exit (not an inner break).
+                if (!diag_brokenInside) {
+                    if (curface == -1) {
+                        diag_stopBoundary++;
+                    } else if (visited[curface]) {
+                        if (curface == seed) diag_closedLoop++;
+                        else                 diag_stopVisited++;
+                    } else {
+                        diag_stopOther++;
+                    }
                 }
             }
 
@@ -506,7 +559,56 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                 seg.chainId = cid;
                 out.push_back(seg);
             }
+
+            // Diagnostic: record this chain's segment count.
+            int chainLen = (int)traces[0].size() + 1 + (int)traces[1].size();
+            diag_chains++;
+            diag_segments += chainLen;
+            diag_chainLens.push_back(chainLen);
         }
+
+        // --- Phase 2: chain length histogram for this iso ---
+        int chb[5] = {0, 0, 0, 0, 0};  // 1, 2-4, 5-20, 21-100, >100
+        int maxSeg = 0;
+        long long sumSeg = 0;
+        for (int L : diag_chainLens) {
+            sumSeg += L;
+            if (L > maxSeg) maxSeg = L;
+            if      (L == 1)   chb[0]++;
+            else if (L <= 4)   chb[1]++;
+            else if (L <= 20)  chb[2]++;
+            else if (L <= 100) chb[3]++;
+            else               chb[4]++;
+        }
+        double avgSeg = diag_chains > 0 ? (double)sumSeg / diag_chains : 0.0;
+
+        // --- Phase 1: trace stop-reason summary ---
+        std::fprintf(stderr,
+            "[trace-diag] iso=%d chains=%d segs=%d "
+            "bnd=%d vis=%d noEntry=%d noExit=%d closed=%d other=%d\n",
+            isoIdx, diag_chains, diag_segments,
+            diag_stopBoundary, diag_stopVisited,
+            diag_stopNoEntrySide, diag_stopNoExitCrossing,
+            diag_closedLoop, diag_stopOther);
+
+        std::fprintf(stderr,
+            "[chain-hist] iso=%d total=%d avgSeg=%.2f maxSeg=%d "
+            "buckets[1,2-4,5-20,21-100,>100]=[%d,%d,%d,%d,%d]\n",
+            isoIdx, diag_chains, avgSeg, maxSeg,
+            chb[0], chb[1], chb[2], chb[3], chb[4]);
+
+        // --- Phase 3: faceSideNeighbor mismatch count ---
+        std::fprintf(stderr,
+            "[side-check] iso=%d checks=%d mismatches=%d\n",
+            isoIdx, diag_sideChecks, diag_sideMismatches);
+
+        // --- Phase 4: per-face crossing count distribution ---
+        std::fprintf(stderr,
+            "[crossing-hist] iso=%d faces_with_crossings[0,1,2,3,>3]=[%d,%d,%d,%d,%d]\n",
+            isoIdx,
+            diag_crossBuckets[0], diag_crossBuckets[1],
+            diag_crossBuckets[2], diag_crossBuckets[3],
+            diag_crossBuckets[4]);
     }
     return out;
 }
