@@ -94,6 +94,8 @@ bool parseInput(std::istream& in, CliInput& out) {
                     else if (key == "jointIters")  out.opt.jointIters  = std::stoi(val);
                     else if (key == "userScale")   out.opt.userScale   = std::stod(val);
                     else if (key == "useCover")    out.opt.useCover    = (std::stoi(val) != 0);
+                    else if (key == "diagOnly")    out.opt.diagOnly    = std::stoi(val);
+                    else if (key == "maxVerts")    out.opt.maxVerts    = std::stoi(val);
                 } catch (...) {
                     std::fprintf(stderr, "[wgf-cli] malformed option: %s\n", kv.c_str());
                 }
@@ -114,6 +116,13 @@ int main(int /*argc*/, char** /*argv*/) {
         return 1;
     }
 
+    // Environment-variable override for diag-only fast mode (handy from
+    // Colab without editing wgf-input.txt).
+    if (const char* env = std::getenv("WGF_DIAG_ONLY")) {
+        int v = std::atoi(env);
+        if (v > 0) cin_.opt.diagOnly = v;
+    }
+
     Mesh mesh;
     mesh.V.resize(cin_.nV, 3);
     for (int i = 0; i < cin_.nV; ++i) {
@@ -132,10 +141,10 @@ int main(int /*argc*/, char** /*argv*/) {
     std::fprintf(stderr, "[wgf-cli] mesh  : V=%d F=%d E_int=%d\n",
                  mesh.nV(), mesh.nF(), mesh.nE());
     std::fprintf(stderr, "[wgf-cli] opts  : lambdaInit=%.3g lambdaMin=%.3g alg1MaxIter=%d "
-                 "mu=%.3g jointIters=%d userScale=%.3g useCover=%d\n",
+                 "mu=%.3g jointIters=%d userScale=%.3g useCover=%d diagOnly=%d maxVerts=%d\n",
                  cin_.opt.lambdaInit, cin_.opt.lambdaMin, cin_.opt.alg1MaxIter,
                  cin_.opt.mu, cin_.opt.jointIters, cin_.opt.userScale,
-                 cin_.opt.useCover ? 1 : 0);
+                 cin_.opt.useCover ? 1 : 0, cin_.opt.diagOnly, cin_.opt.maxVerts);
 
     PipelineResult R;
     try {
