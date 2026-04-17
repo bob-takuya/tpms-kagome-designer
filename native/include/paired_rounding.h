@@ -343,6 +343,66 @@ inline int faceSideNeighbor(const Mesh& m, int f, int j) {
     return m.he[twin].face;
 }
 
+// Diagnostic helper: does face f have at least one boundary half-edge?
+inline bool faceHasBoundaryEdge(const Mesh& m, int f) {
+    int h0 = m.f2he[f];
+    for (int i = 0; i < 3; ++i) {
+        if (m.he[h0 + i].twin < 0) return true;
+    }
+    return false;
+}
+
+// Diagnostic helper: count boundary loops by walking boundary half-edges.
+// A boundary half-edge has twin == -1. The next boundary half-edge
+// starting at the tip of `cur` is found by rotating around that vertex
+// via (twin, next) until another boundary half-edge is hit.
+inline int countBoundaryLoops(const Mesh& m) {
+    const int nH = (int)m.he.size();
+    std::vector<char> visited(nH, 0);
+    int loops = 0;
+    for (int h = 0; h < nH; ++h) {
+        if (m.he[h].twin >= 0) continue;
+        if (visited[h]) continue;
+        int cur = h;
+        while (!visited[cur]) {
+            visited[cur] = 1;
+            int next = m.he[cur].next;
+            while (m.he[next].twin >= 0) {
+                next = m.he[m.he[next].twin].next;
+            }
+            cur = next;
+        }
+        loops++;
+    }
+    return loops;
+}
+
+struct BoundaryStats {
+    int edges = 0;   // boundary half-edges
+    int verts = 0;   // unique vertices touching the boundary
+    int faces = 0;   // unique faces with at least one boundary edge
+    int loops = 0;   // number of boundary loops
+};
+
+inline BoundaryStats computeBoundaryStats(const Mesh& m) {
+    BoundaryStats s;
+    std::vector<char> bv(m.nV(), 0);
+    std::vector<char> bf(m.nF(), 0);
+    const int nH = (int)m.he.size();
+    for (int h = 0; h < nH; ++h) {
+        if (m.he[h].twin >= 0) continue;
+        s.edges++;
+        int vt = m.he[h].vertex;
+        int vs = m.heStart(h);
+        if (!bv[vt]) { bv[vt] = 1; s.verts++; }
+        if (!bv[vs]) { bv[vs] = 1; s.verts++; }
+        int fc = m.he[h].face;
+        if (!bf[fc]) { bf[fc] = 1; s.faces++; }
+    }
+    s.loops = countBoundaryLoops(m);
+    return s;
+}
+
 inline std::vector<AngularSegment>
 extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
     std::vector<AngularSegment> out;
@@ -402,6 +462,10 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         int diag_stopOther         = 0;
         int diag_sideChecks        = 0;
         int diag_sideMismatches    = 0;
+        int diag_oneCrossBdry      = 0;
+        int diag_oneCrossInterior  = 0;
+        int diag_noExitBdry        = 0;
+        int diag_noExitInterior    = 0;
         std::vector<int> diag_chainLens;
 
         // --- Phase 4: crossing count per face for this iso ---
@@ -418,6 +482,10 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
             }
             if (cnt <= 3) diag_crossBuckets[cnt]++;
             else          diag_crossBuckets[4]++;
+            if (cnt == 1) {
+                if (faceHasBoundaryEdge(m, f)) diag_oneCrossBdry++;
+                else                           diag_oneCrossInterior++;
+            }
         }
 
         std::vector<char> visited(nF, 0);
@@ -506,6 +574,8 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                     }
                     if (!extended) {
                         diag_stopNoExitCrossing++;
+                        if (faceHasBoundaryEdge(m, curface)) diag_noExitBdry++;
+                        else                                 diag_noExitInterior++;
                         diag_brokenInside = true;
                         break;
                     }
@@ -609,6 +679,16 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
             diag_crossBuckets[0], diag_crossBuckets[1],
             diag_crossBuckets[2], diag_crossBuckets[3],
             diag_crossBuckets[4]);
+
+        // Boundary vs interior breakdown of 1-crossing faces.
+        std::fprintf(stderr,
+            "[crossing-1-breakdown] iso=%d bdry=%d interior=%d\n",
+            isoIdx, diag_oneCrossBdry, diag_oneCrossInterior);
+
+        // Boundary vs interior breakdown of no-exit stops.
+        std::fprintf(stderr,
+            "[noexit-breakdown] iso=%d bdry=%d interior=%d\n",
+            isoIdx, diag_noExitBdry, diag_noExitInterior);
     }
     return out;
 }

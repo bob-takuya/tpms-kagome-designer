@@ -146,6 +146,21 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
     R.coverF = cov.mesh.nF();
     R.numSingular = cov.numSingular;
 
+    // Diagnostic: boundary structure of base and cover meshes. Used to
+    // classify whether 1-crossing faces and noExit stops inside
+    // extractAngularIsolines are driven by the mesh boundary or by
+    // interior topology/theta issues.
+    {
+        BoundaryStats bs = computeBoundaryStats(base);
+        std::fprintf(stderr,
+            "[mesh-diag] base: bdry_edges=%d bdry_verts=%d bdry_faces=%d bdry_loops=%d\n",
+            bs.edges, bs.verts, bs.faces, bs.loops);
+        BoundaryStats cs = computeBoundaryStats(cov.mesh);
+        std::fprintf(stderr,
+            "[mesh-diag] cover: bdry_edges=%d bdry_verts=%d bdry_faces=%d bdry_loops=%d\n",
+            cs.edges, cs.verts, cs.faces, cs.loops);
+    }
+
     // 4. Connected components of the cover.
     reportProgress(STAGE_COVER_SPLIT, 0, 1, "Labeling cover components");
     std::vector<int> comp;
