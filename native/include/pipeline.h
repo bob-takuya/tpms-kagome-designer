@@ -30,6 +30,10 @@
 #include "paired_rounding.h"
 #include "progress.h"
 
+#include <set>
+#include <cstddef>
+#include <climits>
+
 namespace wgf {
 
 struct PipelineOptions {
@@ -262,6 +266,61 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             for (int i = 0; i < (int)segs.size(); ++i)
                 chainSegs[segs[i].chainId].push_back(i);
         }
+        // --- Diagnostic: per-chain family/layer composition (log only) ---
+        {
+            int totalChains    = 0;
+            int uniqFamChains  = 0;
+            int mixedFamChains = 0;
+            std::size_t minLen = SIZE_MAX;
+            std::size_t maxLen = 0;
+            std::size_t totalLen = 0;
+            int bucket1_4    = 0;
+            int bucket5_20   = 0;
+            int bucket21_100 = 0;
+            int bucket101p   = 0;
+            for (int chainId = 0; chainId < (int)chainSegs.size(); ++chainId) {
+                const auto& chainIdxs = chainSegs[chainId];
+                if (chainIdxs.empty()) continue;
+                int famCount[3] = {0, 0, 0};
+                std::set<int> uniqueLayers;
+                for (int si : chainIdxs) {
+                    int lay = cov.coverFaceLayer[segs[si].faceIdx];
+                    famCount[lay % 3]++;
+                    uniqueLayers.insert(lay);
+                }
+                fprintf(stderr, "[chain-diag] chainId=%d segs=%zu fam=[%d,%d,%d] "
+                    "uniqLayers=%zu\n",
+                    chainId, chainIdxs.size(),
+                    famCount[0], famCount[1], famCount[2],
+                    uniqueLayers.size());
+
+                ++totalChains;
+                int nonZeroFam = (famCount[0] > 0) + (famCount[1] > 0) + (famCount[2] > 0);
+                if (nonZeroFam <= 1) ++uniqFamChains;
+                else                 ++mixedFamChains;
+                std::size_t L = chainIdxs.size();
+                totalLen += L;
+                if (L < minLen) minLen = L;
+                if (L > maxLen) maxLen = L;
+                if      (L <= 4)   ++bucket1_4;
+                else if (L <= 20)  ++bucket5_20;
+                else if (L <= 100) ++bucket21_100;
+                else               ++bucket101p;
+            }
+            if (totalChains == 0) minLen = 0;
+            double avgLen   = totalChains > 0 ? (double)totalLen / totalChains : 0.0;
+            double uniqPct  = totalChains > 0 ? 100.0 * uniqFamChains  / totalChains : 0.0;
+            double mixedPct = totalChains > 0 ? 100.0 * mixedFamChains / totalChains : 0.0;
+            fprintf(stderr,
+                "[chain-diag] summary: totalChains=%d uniqFam=%d(%.1f%%) "
+                "mixedFam=%d(%.1f%%) segLen min=%zu max=%zu avg=%.1f "
+                "buckets[1-4,5-20,21-100,>100]=[%d,%d,%d,%d]\n",
+                totalChains, uniqFamChains, uniqPct,
+                mixedFamChains, mixedPct,
+                minLen, maxLen, avgLen,
+                bucket1_4, bucket5_20, bucket21_100, bucket101p);
+        }
+
         for (const auto& chainIdxs : chainSegs) {
             if (chainIdxs.empty()) continue;
             // Majority vote for the chain's family.
