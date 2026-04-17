@@ -54,7 +54,11 @@ struct PipelineOptions {
     //   diagOnly = 0 : normal full pipeline (default)
     //   diagOnly = 1 : skip paired rounding + per-component solve
     //                  (uses base-vertex atan2 + layer * π/3 as theta)
-    //   diagOnly = 2 : also skip base Algorithm 1; uses raw 6-RoSy phi
+    //   diagOnly = 2 : BROKEN — per-face phi assigned to vertices is
+    //                  face-choice-dependent (see runPipeline for a full
+    //                  explanation). Reserved for a future correct
+    //                  implementation using vertex 6-RoSy or per-vertex
+    //                  averaged phi. Use diagOnly=1 instead.
     int    diagOnly       = 0;
     // Cap on input vertex count; 0 = no cap. Only issues a warning if
     // exceeded (we don't mesh-decimate here, to keep the diagnostic run
@@ -196,8 +200,30 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             int layer = cov.coverVertexLayer[v];
             double thetaBase;
             if (opt.diagOnly >= 2) {
-                // Raw 6-RoSy: sample the per-face phi at any incident
-                // base face. We pick the first face in base.v2he rotation.
+                // WARNING: diagOnly=2 is BROKEN as currently implemented.
+                //
+                // `phi` is per-FACE (6-RoSy canonical angle in (-π/6, π/6]);
+                // neighbouring faces at the same vertex differ by ≈ k·π/3
+                // (the 6-RoSy rotational ambiguity). Picking "any incident
+                // face" therefore produces a vertex-valued θ that is
+                // face-choice-dependent — you get a different θ for the
+                // same cover vertex depending on which base face we happen
+                // to visit via v2he, which breaks the per-cover-face wrap
+                // structure that diagOnly=1 preserves.
+                //
+                // A correct implementation would need one of:
+                //   (a) a vertex 6-RoSy phi (solve the Knoeppel eigenproblem
+                //       with a vertex mass matrix), or
+                //   (b) per-vertex averaging of phi across incident faces
+                //       AFTER unwrapping each face's phi to within π/6 of
+                //       some reference (e.g. the first face's phi).
+                //
+                // We keep the broken branch in place rather than removing it
+                // so that the option name stays reserved and so that this
+                // comment stays discoverable. diagOnly=1 is sufficient for
+                // the current diagnostic (it still exercises the tracer on
+                // a real layer-wrap structure, just skips paired_rounding
+                // + per-component Alg2/Eq.8).
                 int h = base.v2he[baseV];
                 int fBase = (h >= 0) ? base.he[h].face : 0;
                 thetaBase = phi[fBase];
@@ -213,6 +239,12 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             "[diag-only] mode=%d: synthetic theta on cover (nV=%d), "
             "running extractAngularIsolines with %d iso(s)\n",
             opt.diagOnly, cov.mesh.nV(), numISOLines);
+        if (opt.diagOnly >= 2) {
+            std::fprintf(stderr,
+                "[diag-only] WARNING: diagOnly=2 is known-broken "
+                "(per-face phi assigned to vertex). See pipeline.h "
+                "for details. Use diagOnly=1 for reliable diagnostics.\n");
+        }
         reportProgress(STAGE_ASSEMBLE, 0, 1, "diag-only: extracting isolines");
         (void)extractAngularIsolines(cov.mesh, thetaCover, numISOLines);
         R.segments.clear();
