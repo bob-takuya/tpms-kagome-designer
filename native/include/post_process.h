@@ -61,6 +61,18 @@ struct Polyline {
     bool isClosed = false;
 };
 
+// Per-polyline arclength record used by the chain-level diagnostics in
+// pipeline.h. Captures how much each reconstructed polyline shrank (or
+// grew) through the resample pass so that open chains, closed loops, and
+// individual worst offenders can be reported separately.
+struct ResamplePolyStat {
+    int    chainId   = -1;
+    int    family    = 0;
+    bool   isClosed  = false;
+    double beforeLen = 0.0;
+    double afterLen  = 0.0;
+};
+
 struct ResampleStats {
     double targetLength   = 0.0;
     double meshMeanEdge   = 0.0;
@@ -76,6 +88,12 @@ struct ResampleStats {
     double outputSegLenMin  = 0, outputSegLenMax = 0;
     double inputTotalArclen  = 0;
     double outputTotalArclen = 0;
+
+    // Per-polyline before/after arclength (one entry per reconstructed
+    // Polyline, including closed loops). Populated by
+    // resampleProjectedSegments and consumed by the chain-level diagnostic
+    // logger in pipeline.h.
+    std::vector<ResamplePolyStat> perPoly;
 };
 
 // Mean length of all undirected edges (including boundary edges) of the
@@ -486,10 +504,42 @@ inline std::vector<ProjectedSegment> resampleProjectedSegments(
 
     auto polys = buildOrderedPolylines(in);
 
+    // Arclength that matches what polylinesToSegments actually emits.
+    //
+    // Input polylines (buildOrderedPolylines): open chains store N points
+    // and N-1 segments; closed loops store N+1 points with the start
+    // duplicated at the end, so the wrap edge is already in the consecutive
+    // differences.
+    //
+    // Resampled polylines: open chains store N points and N-1 segments (same
+    // convention); closed loops store N points and polylinesToSegments adds
+    // the wrap edge (last -> first) implicitly, so we must include it here
+    // to compare apples-to-apples with the input's total.
+    auto polylineArclen = [](const Polyline& pl, bool addWrap) -> double {
+        double L = 0.0;
+        const int N = (int)pl.points.size();
+        if (N < 2) return 0.0;
+        for (int i = 1; i < N; ++i) {
+            L += (pl.points[i] - pl.points[i-1]).norm();
+        }
+        if (addWrap) L += (pl.points.front() - pl.points.back()).norm();
+        return L;
+    };
+
     std::vector<Polyline> resampled;
     resampled.reserve(polys.size());
+    stats.perPoly.reserve(polys.size());
     for (const auto& pl : polys) {
         Polyline rp = resamplePolyline(pl, L_target);
+
+        ResamplePolyStat ps;
+        ps.chainId   = pl.chainId;
+        ps.family    = pl.family;
+        ps.isClosed  = rp.isClosed;
+        ps.beforeLen = polylineArclen(pl, /*addWrap=*/false);
+        ps.afterLen  = polylineArclen(rp, /*addWrap=*/rp.isClosed);
+        stats.perPoly.push_back(ps);
+
         if (rp.isClosed) ++stats.closedLoops;
         else             ++stats.openChains;
         resampled.push_back(std::move(rp));
