@@ -596,6 +596,12 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
 
     int nextChainId = 0;
 
+    // One-shot dynamic probe flag: fires at the FIRST noExit stop
+    // across the whole extractAngularIsolines() call, so the probe
+    // shows the actual (prevface, curface) pair that tripped the
+    // sameKey=0/diffKey=637 diagnostic.
+    bool dynamicProbeDone = false;
+
     for (int isoIdx = 0; isoIdx < numISOLines; ++isoIdx) {
         const double isoval = minval + (maxval - minval) * double(isoIdx) / double(numISOLines);
 
@@ -604,6 +610,36 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         // disagreement that was producing curFC.count=0 noExit stops on
         // the trace's incoming edge.
         auto edgeCache = buildEdgeCrossingCache(m, theta, isoval);
+
+        // --- hedge-probe-static: dump raw half-edge endpoints vs
+        // faceSideVerts() / faceSideNeighbor() for a handful of faces
+        // mentioned in earlier [noexit-dump] traces, so we can read the
+        // side convention directly from the mesh. Fires once at iso=0
+        // only, read-only diagnostic.
+        if (isoIdx == 0) {
+            int probeFaces[] = {1158, 1212, 1164, 3618, 24845, 24899};
+            for (int f : probeFaces) {
+                if (f < 0 || f >= m.nF()) continue;
+                std::fprintf(stderr,
+                    "[hedge-probe-static] face=%d F=[%d,%d,%d]\n",
+                    f, m.F(f, 0), m.F(f, 1), m.F(f, 2));
+                for (int k = 0; k < 3; ++k) {
+                    int hePos = (k + 2) % 3;
+                    int h = m.f2he[f] + hePos;
+                    int vStart = m.heStart(h);
+                    int vEnd   = m.he[h].vertex;
+                    int twin   = m.he[h].twin;
+                    int twinFace = (twin >= 0) ? m.he[twin].face : -1;
+                    auto [a, b] = faceSideVerts(m, f, k);
+                    std::fprintf(stderr,
+                        "[hedge-probe-static]   side=%d hePos=%d h=%d "
+                        "halfedge=(%d->%d) twin=%d twinFace=%d "
+                        "faceSideVerts=(%d,%d) faceSideNeighbor=%d\n",
+                        k, hePos, h, vStart, vEnd, twin, twinFace,
+                        a, b, faceSideNeighbor(m, f, k));
+                }
+            }
+        }
 
         // --- Diagnostic counters (per-iso, read-only; do not affect algorithm) ---
         int diag_chains            = 0;
@@ -901,6 +937,39 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         else              diag_noExit_keyMissing++;
                         if (entryCrosses) diag_noExit_entryCrosses++;
                         else              diag_noExit_entryNoCross++;
+
+                        // hedge-probe-dynamic: one-shot probe at the
+                        // FIRST noExit stop. Dumps raw half-edge endpoints
+                        // vs faceSideVerts/faceSideNeighbor for the exact
+                        // (prevface, curface) pair that tripped it, so we
+                        // can read the side convention from real data.
+                        if (!dynamicProbeDone && isoIdx == 0) {
+                            dynamicProbeDone = true;
+                            int probeFaces[2] = { prevface, curface };
+                            for (int f : probeFaces) {
+                                if (f < 0 || f >= m.nF()) continue;
+                                std::fprintf(stderr,
+                                    "[hedge-probe-dynamic] face=%d F=[%d,%d,%d] "
+                                    "(role=%s)\n",
+                                    f, m.F(f, 0), m.F(f, 1), m.F(f, 2),
+                                    (f == prevface) ? "prev" : "cur");
+                                for (int k = 0; k < 3; ++k) {
+                                    int hePos = (k + 2) % 3;
+                                    int h = m.f2he[f] + hePos;
+                                    int vStart = m.heStart(h);
+                                    int vEnd   = m.he[h].vertex;
+                                    int twin   = m.he[h].twin;
+                                    int twinFace = (twin >= 0) ? m.he[twin].face : -1;
+                                    auto [a, b] = faceSideVerts(m, f, k);
+                                    std::fprintf(stderr,
+                                        "[hedge-probe-dynamic]   side=%d hePos=%d "
+                                        "halfedge=(%d->%d) twin=%d twinFace=%d "
+                                        "faceSideVerts=(%d,%d) faceSideNeighbor=%d\n",
+                                        k, hePos, vStart, vEnd, twin, twinFace,
+                                        a, b, faceSideNeighbor(m, f, k));
+                                }
+                            }
+                        }
 
                         // noExit-deep: first 10 dumps at iso=0 only.
                         if (isoIdx == 0 && diag_noExit_dump < 10) {
