@@ -22,8 +22,12 @@ export interface Viewport3DContext {
   renderer: THREE.WebGLRenderer;
   controls: OrbitControls;
   surfaceMesh: THREE.Mesh | null;
-  /** Group holding all dynamic overlays (isolines, strip meshes, junctions) */
+  /** Group holding strip ribbon meshes and junctions. */
   stripMeshes: THREE.Group;
+  /** Separate group for the per-chain isoline overlay so the ribbon /
+   *  line / radius / threshold toggles can rebuild it without
+   *  recomputing the Kagome strips. */
+  isolineGroup: THREE.Group;
   halfEdgeMesh: HalfEdgeMesh | null;
   isolinesByFamily: [Isoline[], Isoline[], Isoline[]] | null;
   stripeFields: [Float64Array, Float64Array, Float64Array] | null;
@@ -70,6 +74,9 @@ export function createViewport3D(container: HTMLElement): Viewport3DContext {
   const stripMeshes = new THREE.Group();
   scene.add(stripMeshes);
 
+  const isolineGroup = new THREE.Group();
+  scene.add(isolineGroup);
+
   const ctx: Viewport3DContext = {
     scene,
     camera,
@@ -77,6 +84,7 @@ export function createViewport3D(container: HTMLElement): Viewport3DContext {
     controls,
     surfaceMesh: null,
     stripMeshes,
+    isolineGroup,
     halfEdgeMesh: null,
     isolinesByFamily: null,
     stripeFields: null,
@@ -163,6 +171,7 @@ export function regenerateMesh(ctx: Viewport3DContext): void {
   // to run the (expensive) WGF pattern computation. The user triggers
   // that step explicitly via the "Generate Pattern" button.
   clearGroup(ctx.stripMeshes);
+  clearGroup(ctx.isolineGroup);
   ctx.kagomePattern = null;
   ctx.isolinesByFamily = null;
   ctx.stripeFields = null;
@@ -180,6 +189,7 @@ export async function regeneratePattern(
 
   // Clear previous overlays
   clearGroup(ctx.stripMeshes);
+  clearGroup(ctx.isolineGroup);
 
   // ── Stage 2 – Vekhter et al. 2019 "Weaving Geodesic Foliations" ──────
   //
@@ -292,18 +302,126 @@ function applyIsolinesToScene(
     renderJunction(ctx.stripMeshes, junc, state.kagome.layerColors);
   }
 
-  // 3c. Light isoline underlay (thin, semi-transparent) for reference
+  // 3c. Isoline overlay (ribbons or debug lines, live-toggleable).
+  renderIsolines(ctx);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Isoline overlay rendering (ribbon tubes / debug lines)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rebuild the per-chain isoline overlay from ctx.isolinesByFamily using
+ * the current `isolineView` settings. Safe to call repeatedly; previous
+ * geometry is disposed first. Does NOT touch the ribbon/junction group,
+ * so UI toggles can change the overlay without rerunning the WGF
+ * pipeline.
+ */
+export function renderIsolines(ctx: Viewport3DContext): void {
+  clearGroup(ctx.isolineGroup);
+  if (!ctx.isolinesByFamily) return;
+
+  const state = store.getState();
+  const { mode, minChainSegs, tubeRadius, chainIdColor } = state.isolineView;
+  const famColors = state.kagome.layerColors;
+
+  let kept = 0;
+  let pruned = 0;
+  let chainIdx = 0;
+
   for (let k = 0; k < 3; k++) {
-    const col = new THREE.Color(state.kagome.layerColors[k]).multiplyScalar(0.4);
-    for (const iso of isolinesByFamily[k]) {
-      if (iso.points.length < 2) continue;
-      const geo = new THREE.BufferGeometry().setFromPoints(iso.points);
-      const mat = new THREE.LineBasicMaterial({ color: col, linewidth: 1 });
-      mat.transparent = true;
-      mat.opacity = 0.35;
-      ctx.stripMeshes.add(new THREE.LineSegments(geo, mat));
+    const famColor = new THREE.Color(famColors[k]);
+    for (const iso of ctx.isolinesByFamily[k]) {
+      // Segments arrive as flat [a0,b0, a1,b1, ...] pairs. Split into
+      // connected sub-polylines: consecutive pairs that share an
+      // endpoint form one continuous chain. Disjoint pairs (v1 files,
+      // or cover-component breaks) become their own short polylines.
+      const polylines = segmentsToPolylines(iso.points);
+
+      for (const pts of polylines) {
+        if (pts.length - 1 < minChainSegs) { pruned++; continue; }
+        kept++;
+
+        const color = chainIdColor
+          ? rainbowColor(chainIdx++)
+          : famColor;
+
+        if (mode === 'ribbon') {
+          ctx.isolineGroup.add(buildTubeMesh(pts, color, tubeRadius));
+        } else {
+          ctx.isolineGroup.add(buildLineMesh(pts, color));
+        }
+      }
     }
   }
+
+  console.log(
+    `[Viewport] isolines: mode=${mode} radius=${tubeRadius} ` +
+    `minSegs=${minChainSegs} kept=${kept} pruned=${pruned}`,
+  );
+}
+
+/** Split a flat [a,b,a,b,...] segment list into connected polylines. */
+function segmentsToPolylines(
+  pts: THREE.Vector3[],
+  epsSq = 1e-10,
+): THREE.Vector3[][] {
+  const out: THREE.Vector3[][] = [];
+  if (pts.length < 2) return out;
+  let cur: THREE.Vector3[] = [pts[0], pts[1]];
+  for (let i = 2; i + 1 < pts.length; i += 2) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    const last = cur[cur.length - 1];
+    if (last.distanceToSquared(a) <= epsSq) {
+      cur.push(b);
+    } else {
+      if (cur.length >= 2) out.push(cur);
+      cur = [a, b];
+    }
+  }
+  if (cur.length >= 2) out.push(cur);
+  return out;
+}
+
+function buildTubeMesh(
+  pts: THREE.Vector3[],
+  color: THREE.Color,
+  radius: number,
+): THREE.Mesh {
+  // CatmullRomCurve3 needs at least 2 points; 'centripetal' minimises
+  // self-intersection on chains with sharp bends, which real WGF
+  // geodesic chains do exhibit near singular vertices.
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal');
+  // One tubular segment per input point is enough — the Catmull-Rom
+  // already provides curvature, and the polyline is already dense
+  // (one vertex per mesh-face crossing). Floor of 8 for very short
+  // chains so the cap isn't a triangle.
+  const tubularSegments = Math.max(pts.length, 8);
+  const geom = new THREE.TubeGeometry(curve, tubularSegments, radius, 6, false);
+  const mat = new THREE.MeshStandardMaterial({
+    color,
+    roughness: 0.6,
+    metalness: 0.1,
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
+function buildLineMesh(pts: THREE.Vector3[], color: THREE.Color): THREE.Line {
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: color.clone().multiplyScalar(0.6),
+    transparent: true,
+    opacity: 0.6,
+    linewidth: 1,
+  });
+  return new THREE.Line(geo, mat);
+}
+
+function rainbowColor(i: number): THREE.Color {
+  // Golden-ratio hue hop → maximally distinct neighbours.
+  const hue = (i * 0.6180339887) % 1;
+  return new THREE.Color().setHSL(hue, 0.7, 0.55);
 }
 
 /**
@@ -327,6 +445,7 @@ export function applyImportedPattern(
     `${parsed.numComponents} cover components`,
   );
   clearGroup(ctx.stripMeshes);
+  clearGroup(ctx.isolineGroup);
   const geo = applyParsedWgfResult(parsed);
   applyIsolinesToScene(ctx, geo.isolinesByFamily);
 }
