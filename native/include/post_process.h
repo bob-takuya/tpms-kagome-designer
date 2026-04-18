@@ -536,6 +536,16 @@ inline std::vector<ProjectedSegment> resampleProjectedSegments(
         ps.chainId   = pl.chainId;
         ps.family    = pl.family;
         ps.isClosed  = rp.isClosed;
+        // Input closed loops: buildOrderedPolylines appends the start
+        // vertex at the end (walk only breaks *after* pushing startPt via
+        // nextOther), so the wrap edge is already counted in the N
+        // consecutive differences of the N+1 points. addWrap=false here.
+        //
+        // Resampled closed loops: resampleClosedLoop emits N unique samples
+        // with t = totalLen*k/n (denominator n, not n-1) and no start
+        // duplicate; polylinesToSegments later closes the loop via
+        // (k+1)%N, so we must add the wrap edge manually to match the
+        // arclength that actually reaches R.segments.
         ps.beforeLen = polylineArclen(pl, /*addWrap=*/false);
         ps.afterLen  = polylineArclen(rp, /*addWrap=*/rp.isClosed);
         stats.perPoly.push_back(ps);
