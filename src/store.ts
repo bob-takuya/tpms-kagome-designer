@@ -39,6 +39,13 @@ export interface IsolineViewParams {
   tubeRadius:   number;
   /** Debug: colour each chain by index (HSL rainbow) instead of by family. */
   chainIdColor: boolean;
+  /** Quantisation grid spacing used to match endpoint 3D positions when
+   *  rebuilding polylines from the flat segment list. With the v2
+   *  exporter the base-mesh 3D points of a shared edge are computed
+   *  independently per face, so 1e-6 misses every real junction —
+   *  exposing this as a user-adjustable slider lets us diagnose the
+   *  projection bug without rebuilding the WASM module. */
+  adjacencyEps: number;
 }
 
 export interface DevelopParams {
@@ -113,6 +120,7 @@ const defaultState: AppState = {
     minChainSegs: 10,
     tubeRadius:   0.02,
     chainIdColor: false,
+    adjacencyEps: 1e-6,
   },
   develop: {
     scale: 50,   // mm per TPMS world unit (1 unit ≈ 50 mm → period ≈ 314 mm)

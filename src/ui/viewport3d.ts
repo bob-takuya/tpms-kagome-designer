@@ -322,7 +322,8 @@ export function renderIsolines(ctx: Viewport3DContext): void {
   if (!ctx.isolinesByFamily) return;
 
   const state = store.getState();
-  const { mode, minChainSegs, tubeRadius, chainIdColor } = state.isolineView;
+  const { mode, minChainSegs, tubeRadius, chainIdColor, adjacencyEps } =
+    state.isolineView;
   const famColors = state.kagome.layerColors;
 
   let kept = 0;
@@ -336,7 +337,7 @@ export function renderIsolines(ctx: Viewport3DContext): void {
       // connected sub-polylines: consecutive pairs that share an
       // endpoint form one continuous chain. Disjoint pairs (v1 files,
       // or cover-component breaks) become their own short polylines.
-      const polylines = segmentsToPolylines(iso.points);
+      const polylines = segmentsToPolylines(iso.points, adjacencyEps);
 
       for (const pts of polylines) {
         if (pts.length - 1 < minChainSegs) { pruned++; continue; }
@@ -450,6 +451,30 @@ function segmentsToPolylines(
     if (visited[i]) continue;
     walkFrom(i, segA(i), keyA[i]);
   }
+
+  // Debug diagnostic — expose endpoint-degree distribution and polyline
+  // length stats so we can tell, for the current eps, whether the
+  // segment list actually forms any junctions or stays as isolated pairs.
+  let deg1 = 0, deg2 = 0, degMore = 0;
+  for (const [, segs] of endpointToSegs) {
+    if (segs.length === 1) deg1++;
+    else if (segs.length === 2) deg2++;
+    else degMore++;
+  }
+  const polyLens = polylines.map(p => Math.max(0, p.length - 1));
+  const maxLen = polyLens.length > 0 ? Math.max(...polyLens) : 0;
+  const avgLen = polyLens.length > 0
+    ? polyLens.reduce((a, b) => a + b, 0) / polyLens.length
+    : 0;
+  console.log('[polyline]',
+    `eps=${eps}`,
+    `segs=${numSegs}`,
+    `polylines=${polylines.length}`,
+    `maxSegs=${maxLen}`,
+    `avgSegs=${avgLen.toFixed(2)}`,
+    `deg1=${deg1}`,
+    `deg2=${deg2}`,
+    `deg>=3=${degMore}`);
 
   return polylines;
 }
