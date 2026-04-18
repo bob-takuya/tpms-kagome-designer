@@ -17,8 +17,9 @@
 //
 // Output (stdout) — same style:
 //
-//     # wgf-output v2
-//     META initialCurl=<v> finalCurl=<v> iterations=<v> numSingular=<v>  (etc.)
+//     # wgf-output v3
+//     META initialCurl=<v> finalCurl=<v> iterations=<v> numSingular=<v>
+//          resampled=<0|1> targetLength=<v>                    (v3 only)
 //     SEG <nSeg>
 //     <ax> <ay> <az> <bx> <by> <bz> <family> <baseFaceIdx> <chainId>
 //     ...
@@ -28,6 +29,11 @@
 // single contiguous polyline on the cover/base. -1 means "unknown"
 // (e.g. the useCover=false debug path). Readers of the v1 8-column
 // format should treat a missing chainId as -1 for backward compat.
+//
+// v3 note: column layout is unchanged (still 9 columns); META gains two
+// keys describing the post-processing resample pass (Vekhter §5.2 step
+// 1). A v2-aware reader that ignores unknown META keys continues to
+// work unchanged.
 //
 // Diagnostic progress is written to stderr; stdout is just the result
 // so that `./wgf_cli < input.txt > output.txt` works unmodified.
@@ -101,6 +107,8 @@ bool parseInput(std::istream& in, CliInput& out) {
                     else if (key == "useCover")    out.opt.useCover    = (std::stoi(val) != 0);
                     else if (key == "diagOnly")    out.opt.diagOnly    = std::stoi(val);
                     else if (key == "maxVerts")    out.opt.maxVerts    = std::stoi(val);
+                    else if (key == "resample")       out.opt.resample       = (std::stoi(val) != 0);
+                    else if (key == "resampleLength") out.opt.resampleLength = std::stod(val);
                 } catch (...) {
                     std::fprintf(stderr, "[wgf-cli] malformed option: %s\n", kv.c_str());
                 }
@@ -114,7 +122,7 @@ bool parseInput(std::istream& in, CliInput& out) {
 
 } // anonymous namespace
 
-int main(int /*argc*/, char** /*argv*/) {
+int main(int argc, char** argv) {
     CliInput cin_;
     if (!parseInput(std::cin, cin_)) {
         std::fprintf(stderr, "[wgf-cli] failed to parse input (expected V / F / OPTS / END)\n");
@@ -126,6 +134,37 @@ int main(int /*argc*/, char** /*argv*/) {
     if (const char* env = std::getenv("WGF_DIAG_ONLY")) {
         int v = std::atoi(env);
         if (v > 0) cin_.opt.diagOnly = v;
+    }
+    // Env var override for the resample pass (Vekhter §5.2 step 1).
+    if (const char* env = std::getenv("WGF_RESAMPLE_LENGTH")) {
+        try { cin_.opt.resampleLength = std::stod(env); }
+        catch (...) {
+            std::fprintf(stderr, "[wgf-cli] malformed WGF_RESAMPLE_LENGTH=%s\n", env);
+        }
+    }
+    if (const char* env = std::getenv("WGF_NO_RESAMPLE")) {
+        if (std::atoi(env) != 0) cin_.opt.resample = false;
+    }
+
+    // Simple CLI flag parsing. Accepts `--flag value` and `--flag=value`.
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto takeVal = [&](const char* name) -> const char* {
+            std::string prefix = std::string(name) + "=";
+            if (a.rfind(prefix, 0) == 0) return a.c_str() + prefix.size();
+            if (a == name && i + 1 < argc) { ++i; return argv[i]; }
+            return nullptr;
+        };
+        if (a == "--no-resample") {
+            cin_.opt.resample = false;
+        } else if (const char* v = takeVal("--resample-length")) {
+            try { cin_.opt.resampleLength = std::stod(v); }
+            catch (...) {
+                std::fprintf(stderr, "[wgf-cli] malformed --resample-length=%s\n", v);
+            }
+        } else {
+            std::fprintf(stderr, "[wgf-cli] warning: unknown CLI arg '%s'\n", a.c_str());
+        }
     }
 
     Mesh mesh;
@@ -146,10 +185,12 @@ int main(int /*argc*/, char** /*argv*/) {
     std::fprintf(stderr, "[wgf-cli] mesh  : V=%d F=%d E_int=%d\n",
                  mesh.nV(), mesh.nF(), mesh.nE());
     std::fprintf(stderr, "[wgf-cli] opts  : lambdaInit=%.3g lambdaMin=%.3g alg1MaxIter=%d "
-                 "mu=%.3g jointIters=%d userScale=%.3g useCover=%d diagOnly=%d maxVerts=%d\n",
+                 "mu=%.3g jointIters=%d userScale=%.3g useCover=%d diagOnly=%d maxVerts=%d "
+                 "resample=%d resampleLength=%.6g\n",
                  cin_.opt.lambdaInit, cin_.opt.lambdaMin, cin_.opt.alg1MaxIter,
                  cin_.opt.mu, cin_.opt.jointIters, cin_.opt.userScale,
-                 cin_.opt.useCover ? 1 : 0, cin_.opt.diagOnly, cin_.opt.maxVerts);
+                 cin_.opt.useCover ? 1 : 0, cin_.opt.diagOnly, cin_.opt.maxVerts,
+                 cin_.opt.resample ? 1 : 0, cin_.opt.resampleLength);
 
     PipelineResult R;
     try {
@@ -169,7 +210,7 @@ int main(int /*argc*/, char** /*argv*/) {
                  R.numSegmentsFam[0], R.numSegmentsFam[1], R.numSegmentsFam[2]);
 
     // Write output on stdout.
-    std::cout << "# wgf-output v2\n";
+    std::cout << "# wgf-output v3\n";
     std::cout << "META"
               << " initialCurl="  << R.alg1BaseInitCurl
               << " finalCurl="    << R.alg1BaseFinalCurl
@@ -180,6 +221,8 @@ int main(int /*argc*/, char** /*argv*/) {
               << " fam0="         << R.numSegmentsFam[0]
               << " fam1="         << R.numSegmentsFam[1]
               << " fam2="         << R.numSegmentsFam[2]
+              << " resampled="    << (R.resampleApplied ? 1 : 0)
+              << " targetLength=" << R.resampleStats.targetLength
               << "\n";
     std::cout << "SEG " << R.segments.size() << "\n";
     // Use printf for the SEG rows so the column format matches the
