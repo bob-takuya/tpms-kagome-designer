@@ -481,17 +481,44 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
     //     (Vekhter §5.2, step 1). Cut / prune / extend come in later PRs.
     if (opt.resample && !R.segments.empty()) {
         double meshMean = meshMeanEdgeLength(base);
-        double L_target = (opt.resampleLength > 0.0)
-                        ? opt.resampleLength
-                        : meshMean;
+
+        // Auto-detect target length.
+        //
+        // Previously we used meshMeanEdge, but on typical marching-cubes
+        // meshes the traced segments are ~half the mesh edge length, so a
+        // mesh-edge-sized target collapsed neighbouring samples and shrank
+        // total arclength. Median of the *input* segment lengths tracks the
+        // tracer's native sampling density, so the resample pass now only
+        // uniformizes variance rather than downsampling.
+        double L_target;
+        const char* L_source;
+        if (opt.resampleLength > 0.0) {
+            L_target = opt.resampleLength;
+            L_source = "explicit";
+        } else {
+            std::vector<double> lens;
+            lens.reserve(R.segments.size());
+            for (const auto& s : R.segments) {
+                double d = (s.b - s.a).norm();
+                if (d > 0.0) lens.push_back(d);
+            }
+            if (!lens.empty()) {
+                std::sort(lens.begin(), lens.end());
+                L_target = lens[lens.size() / 2];
+                L_source = "input-median";
+            } else {
+                L_target = meshMean;
+                L_source = "mesh-mean-edge";
+            }
+        }
 
         ResampleStats rs;
         auto resampled = resampleProjectedSegments(R.segments, L_target, rs);
         rs.meshMeanEdge = meshMean;
 
         std::fprintf(stderr,
-            "[resample] targetLength=%.6f  meshMeanEdge=%.6f\n",
-            rs.targetLength, rs.meshMeanEdge);
+            "[resample] targetLength=%.6f source=%s meshMeanEdge=%.6f\n",
+            rs.targetLength, L_source, rs.meshMeanEdge);
         std::fprintf(stderr,
             "[resample] input-chains=%d output-polylines=%d  "
             "(open=%d closed=%d)\n",
@@ -515,6 +542,59 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         std::fprintf(stderr,
             "[resample] total-arclength: input=%.6f output=%.6f  diff=%.3f%%\n",
             rs.inputTotalArclen, rs.outputTotalArclen, diffPct);
+
+        // --- Chain-level arclength diagnostics --------------------------
+        //
+        // Histogram the per-polyline shrink magnitude |before-after|/before
+        // for open chains and closed loops separately, then print the 20
+        // worst offenders. Pinpoints which subset of chains is driving the
+        // total-arclength gap without having to diff full SEG dumps.
+        {
+            auto pctOf = [](const ResamplePolyStat& p) -> double {
+                if (p.beforeLen <= 0.0) return 0.0;
+                return 100.0 * std::fabs(p.beforeLen - p.afterLen) / p.beforeLen;
+            };
+
+            int openBuckets[6]   = {0, 0, 0, 0, 0, 0};
+            int closedBuckets[6] = {0, 0, 0, 0, 0, 0};
+            auto bucketIndex = [](double pct) -> int {
+                if (pct < 0.1)  return 0;
+                if (pct < 1.0)  return 1;
+                if (pct < 5.0)  return 2;
+                if (pct < 10.0) return 3;
+                if (pct < 20.0) return 4;
+                return 5;
+            };
+            for (const auto& p : rs.perPoly) {
+                int b = bucketIndex(pctOf(p));
+                if (p.isClosed) ++closedBuckets[b];
+                else            ++openBuckets[b];
+            }
+            std::fprintf(stderr,
+                "[resample-diff-hist] open:   <0.1%%=%d <1%%=%d <5%%=%d <10%%=%d <20%%=%d >=20%%=%d\n",
+                openBuckets[0], openBuckets[1], openBuckets[2],
+                openBuckets[3], openBuckets[4], openBuckets[5]);
+            std::fprintf(stderr,
+                "[resample-diff-hist] closed: <0.1%%=%d <1%%=%d <5%%=%d <10%%=%d <20%%=%d >=20%%=%d\n",
+                closedBuckets[0], closedBuckets[1], closedBuckets[2],
+                closedBuckets[3], closedBuckets[4], closedBuckets[5]);
+
+            std::vector<int> order(rs.perPoly.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
+            std::sort(order.begin(), order.end(),
+                [&](int i, int j) {
+                    return pctOf(rs.perPoly[i]) > pctOf(rs.perPoly[j]);
+                });
+            const int K = std::min<int>(20, (int)order.size());
+            std::fprintf(stderr, "[resample-diff-worst]\n");
+            for (int k = 0; k < K; ++k) {
+                const auto& p = rs.perPoly[order[k]];
+                std::fprintf(stderr,
+                    "  chainId=%d family=%d closed=%d before=%.6f after=%.6f diff=%.3f%%\n",
+                    p.chainId, p.family, p.isClosed ? 1 : 0,
+                    p.beforeLen, p.afterLen, pctOf(p));
+            }
+        }
 
         R.segments = std::move(resampled);
         R.numSegmentsFam[0] = R.numSegmentsFam[1] = R.numSegmentsFam[2] = 0;
