@@ -28,6 +28,7 @@
 #include "cover.h"
 #include "isolines.h"
 #include "paired_rounding.h"
+#include "post_process.h"
 #include "progress.h"
 
 #include <set>
@@ -64,6 +65,18 @@ struct PipelineOptions {
     // exceeded (we don't mesh-decimate here, to keep the diagnostic run
     // comparable to the full run).
     int    maxVerts       = 0;
+
+    // --- Post-processing (Vekhter §5.2) ------------------------------
+    // Step 1 of the paper's post-processing pipeline: resample isolines
+    // so that all segments are approximately the same length.
+    //
+    //   resample = true  : run the resample pass on R.segments before
+    //                      returning (default).
+    //   resample = false : emit raw traced segments (debug / compare).
+    //   resampleLength   : target segment length. <= 0 means "auto"
+    //                      (use the base mesh's mean edge length).
+    bool   resample       = true;
+    double resampleLength = 0.0;
 };
 
 struct PipelineResult {
@@ -77,6 +90,11 @@ struct PipelineResult {
     int    alg1BaseIters     = 0;
     double alg1CoverFinalCurl = 0;  // averaged or total over components
     int    numSegmentsFam[3] = {0, 0, 0};
+
+    // Resample pass (Vekhter §5.2 step 1). Populated when opt.resample
+    // is true; left zero-initialised otherwise.
+    bool          resampleApplied = false;
+    ResampleStats resampleStats;
 };
 
 inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt) {
@@ -457,6 +475,54 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 R.numSegmentsFam[fam]++;
             }
         }
+    }
+
+    // --- Post-processing: resample isolines to near-uniform length
+    //     (Vekhter §5.2, step 1). Cut / prune / extend come in later PRs.
+    if (opt.resample && !R.segments.empty()) {
+        double meshMean = meshMeanEdgeLength(base);
+        double L_target = (opt.resampleLength > 0.0)
+                        ? opt.resampleLength
+                        : meshMean;
+
+        ResampleStats rs;
+        auto resampled = resampleProjectedSegments(R.segments, L_target, rs);
+        rs.meshMeanEdge = meshMean;
+
+        std::fprintf(stderr,
+            "[resample] targetLength=%.6f  meshMeanEdge=%.6f\n",
+            rs.targetLength, rs.meshMeanEdge);
+        std::fprintf(stderr,
+            "[resample] input-chains=%d output-polylines=%d  "
+            "(open=%d closed=%d)\n",
+            rs.inputChains, rs.outputPolylines,
+            rs.openChains, rs.closedLoops);
+        std::fprintf(stderr,
+            "[resample] input-segs=%d output-segs=%d\n",
+            rs.inputSegs, rs.outputSegs);
+        std::fprintf(stderr,
+            "[resample] input-seg-length: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+            rs.inputSegLenMean, rs.inputSegLenStd,
+            rs.inputSegLenMin,  rs.inputSegLenMax);
+        std::fprintf(stderr,
+            "[resample] output-seg-length: mean=%.6f std=%.6f min=%.6f max=%.6f\n",
+            rs.outputSegLenMean, rs.outputSegLenStd,
+            rs.outputSegLenMin,  rs.outputSegLenMax);
+        double diffPct = (rs.inputTotalArclen > 0.0)
+            ? 100.0 * std::fabs(rs.outputTotalArclen - rs.inputTotalArclen)
+                    / rs.inputTotalArclen
+            : 0.0;
+        std::fprintf(stderr,
+            "[resample] total-arclength: input=%.6f output=%.6f  diff=%.3f%%\n",
+            rs.inputTotalArclen, rs.outputTotalArclen, diffPct);
+
+        R.segments = std::move(resampled);
+        R.numSegmentsFam[0] = R.numSegmentsFam[1] = R.numSegmentsFam[2] = 0;
+        for (const auto& s : R.segments) {
+            if (s.family >= 0 && s.family < 3) R.numSegmentsFam[s.family]++;
+        }
+        R.resampleApplied = true;
+        R.resampleStats   = rs;
     }
 
     reportProgress(STAGE_DONE, 1, 1, "Done");
