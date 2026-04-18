@@ -427,7 +427,8 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 bucket1_4, bucket5_20, bucket21_100, bucket101p);
         }
 
-        for (const auto& chainIdxs : chainSegs) {
+        for (int chainId = 0; chainId < (int)chainSegs.size(); ++chainId) {
+            const auto& chainIdxs = chainSegs[chainId];
             if (chainIdxs.empty()) continue;
             // Majority vote for the chain's family.
             int famCount[3] = {0, 0, 0};
@@ -451,6 +452,7 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 p.b = s.b;
                 p.baseFaceIdx = bf;
                 p.family = fam;
+                p.chainId = chainId;
                 R.segments.push_back(p);
                 R.numSegmentsFam[fam]++;
             }

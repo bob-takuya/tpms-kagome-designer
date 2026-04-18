@@ -60,6 +60,12 @@ struct ProjectedSegment {
     Eigen::Vector3d a, b;
     int baseFaceIdx;
     int family;       // 0, 1, or 2
+    // Chain identifier from the angular-isoline tracer. Segments with
+    // the same chainId form one contiguous polyline on the cover (and,
+    // after projection, one ribbon on the base). -1 means "unknown"
+    // (e.g. the useCover=false debug path, which doesn't run the
+    // chain-building tracer).
+    int chainId = -1;
 };
 
 inline std::vector<ProjectedSegment> projectToBase(

@@ -17,12 +17,17 @@
 //
 // Output (stdout) — same style:
 //
-//     # wgf-output v1
+//     # wgf-output v2
 //     META initialCurl=<v> finalCurl=<v> iterations=<v> numSingular=<v>  (etc.)
 //     SEG <nSeg>
-//     <ax> <ay> <az> <bx> <by> <bz> <family> <baseFaceIdx>
+//     <ax> <ay> <az> <bx> <by> <bz> <family> <baseFaceIdx> <chainId>
 //     ...
 //     END
+//
+// v2 note: `chainId` (9th column, >= 0) groups segments that form a
+// single contiguous polyline on the cover/base. -1 means "unknown"
+// (e.g. the useCover=false debug path). Readers of the v1 8-column
+// format should treat a missing chainId as -1 for backward compat.
 //
 // Diagnostic progress is written to stderr; stdout is just the result
 // so that `./wgf_cli < input.txt > output.txt` works unmodified.
@@ -164,7 +169,7 @@ int main(int /*argc*/, char** /*argv*/) {
                  R.numSegmentsFam[0], R.numSegmentsFam[1], R.numSegmentsFam[2]);
 
     // Write output on stdout.
-    std::cout << "# wgf-output v1\n";
+    std::cout << "# wgf-output v2\n";
     std::cout << "META"
               << " initialCurl="  << R.alg1BaseInitCurl
               << " finalCurl="    << R.alg1BaseFinalCurl
@@ -177,11 +182,14 @@ int main(int /*argc*/, char** /*argv*/) {
               << " fam2="         << R.numSegmentsFam[2]
               << "\n";
     std::cout << "SEG " << R.segments.size() << "\n";
-    std::cout.precision(10);
+    // Use printf for the SEG rows so the column format matches the
+    // wgf-output v2 spec exactly (%.9f for positions). stdio/iostream
+    // sync is on by default, so intermixing with std::cout is safe.
     for (const auto& s : R.segments) {
-        std::cout << s.a.x() << ' ' << s.a.y() << ' ' << s.a.z() << ' '
-                  << s.b.x() << ' ' << s.b.y() << ' ' << s.b.z() << ' '
-                  << s.family << ' ' << s.baseFaceIdx << "\n";
+        std::printf("%.9f %.9f %.9f %.9f %.9f %.9f %d %d %d\n",
+                    s.a.x(), s.a.y(), s.a.z(),
+                    s.b.x(), s.b.y(), s.b.z(),
+                    s.family, s.baseFaceIdx, s.chainId);
     }
     std::cout << "END\n";
 
