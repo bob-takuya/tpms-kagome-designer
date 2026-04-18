@@ -592,15 +592,21 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
     const double maxval =  M_PI;
 
     // Given a face f, side j in reference numbering, return the 3D point
-    // at barycentric bary along that edge. Side j's edge connects
-    // F(f, (j+1)%3) and F(f, (j+2)%3); bary=0 is at (j+1)%3, bary=1 is
-    // at (j+2)%3.
+    // at barycentric bary along that edge. Resolves the edge endpoints
+    // through faceSideVerts (the same helper used by buildEdgeCrossingCache
+    // and computeFaceCrossingsFromCache), so the two faces incident to a
+    // shared edge interpolate along the SAME (vs, ve) pair with the same
+    // canonical bary — yielding bit-identical 3D crossing points across
+    // adjacent faces.
+    //
+    // computeFaceCrossingsFromCache returns bary in vs->ve direction
+    // (cache stores it in vmin->vmax, then flips when vs > ve), so the
+    // formula below gives matching points from either incident face.
     auto sidePoint = [&](int f, int side, double bary) -> Eigen::Vector3d {
-        int vp1 = m.F(f, (side + 1) % 3);
-        int vp2 = m.F(f, (side + 2) % 3);
-        Eigen::Vector3d p1 = m.V.row(vp1);
-        Eigen::Vector3d p2 = m.V.row(vp2);
-        return (1.0 - bary) * p1 + bary * p2;
+        auto [vs, ve] = faceSideVerts(m, f, side);
+        Eigen::Vector3d ps = m.V.row(vs);
+        Eigen::Vector3d pe = m.V.row(ve);
+        return (1.0 - bary) * ps + bary * pe;
     };
 
     int nextChainId = 0;
