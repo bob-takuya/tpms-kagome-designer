@@ -109,6 +109,7 @@ bool parseInput(std::istream& in, CliInput& out) {
                     else if (key == "maxVerts")    out.opt.maxVerts    = std::stoi(val);
                     else if (key == "resample")       out.opt.resample       = (std::stoi(val) != 0);
                     else if (key == "resampleLength") out.opt.resampleLength = std::stod(val);
+                    else if (key == "resampleNoFastPath") out.opt.resampleNoFastPath = (std::stoi(val) != 0);
                 } catch (...) {
                     std::fprintf(stderr, "[wgf-cli] malformed option: %s\n", kv.c_str());
                 }
@@ -145,6 +146,9 @@ int main(int argc, char** argv) {
     if (const char* env = std::getenv("WGF_NO_RESAMPLE")) {
         if (std::atoi(env) != 0) cin_.opt.resample = false;
     }
+    if (const char* env = std::getenv("WGF_RESAMPLE_NO_FAST_PATH")) {
+        if (std::atoi(env) != 0) cin_.opt.resampleNoFastPath = true;
+    }
 
     // Simple CLI flag parsing. Accepts `--flag value` and `--flag=value`.
     for (int i = 1; i < argc; ++i) {
@@ -157,6 +161,8 @@ int main(int argc, char** argv) {
         };
         if (a == "--no-resample") {
             cin_.opt.resample = false;
+        } else if (a == "--resample-no-fast-path") {
+            cin_.opt.resampleNoFastPath = true;
         } else if (const char* v = takeVal("--resample-length")) {
             try { cin_.opt.resampleLength = std::stod(v); }
             catch (...) {
@@ -186,11 +192,12 @@ int main(int argc, char** argv) {
                  mesh.nV(), mesh.nF(), mesh.nE());
     std::fprintf(stderr, "[wgf-cli] opts  : lambdaInit=%.3g lambdaMin=%.3g alg1MaxIter=%d "
                  "mu=%.3g jointIters=%d userScale=%.3g useCover=%d diagOnly=%d maxVerts=%d "
-                 "resample=%d resampleLength=%.6g\n",
+                 "resample=%d resampleLength=%.6g resampleNoFastPath=%d\n",
                  cin_.opt.lambdaInit, cin_.opt.lambdaMin, cin_.opt.alg1MaxIter,
                  cin_.opt.mu, cin_.opt.jointIters, cin_.opt.userScale,
                  cin_.opt.useCover ? 1 : 0, cin_.opt.diagOnly, cin_.opt.maxVerts,
-                 cin_.opt.resample ? 1 : 0, cin_.opt.resampleLength);
+                 cin_.opt.resample ? 1 : 0, cin_.opt.resampleLength,
+                 cin_.opt.resampleNoFastPath ? 1 : 0);
 
     PipelineResult R;
     try {
