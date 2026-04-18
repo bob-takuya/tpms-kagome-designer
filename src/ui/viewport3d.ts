@@ -361,27 +361,97 @@ export function renderIsolines(ctx: Viewport3DContext): void {
   );
 }
 
-/** Split a flat [a,b,a,b,...] segment list into connected polylines. */
+/**
+ * Reconstruct polylines from a flat [a0,b0, a1,b1, ...] segment list.
+ *
+ * The exporter does not guarantee that segments within a single chain
+ * are emitted in walk order (empirically only 1/14858 chains are
+ * adjacency-sorted), so we can't just check "does b[i] == a[i+1]?".
+ * Instead we build an endpoint-adjacency graph using quantised-key
+ * lookups, then:
+ *   1. walk out from every degree-1 endpoint (open-chain ends), and
+ *   2. pick an arbitrary start for each remaining connected component
+ *      (pure closed loops).
+ *
+ * A single input chain may still produce multiple output polylines
+ * when the chain is physically disjoint or contains several closed
+ * loops. That's the caller's responsibility to handle.
+ */
 function segmentsToPolylines(
   pts: THREE.Vector3[],
-  epsSq = 1e-10,
+  eps = 1e-6,
 ): THREE.Vector3[][] {
-  const out: THREE.Vector3[][] = [];
-  if (pts.length < 2) return out;
-  let cur: THREE.Vector3[] = [pts[0], pts[1]];
-  for (let i = 2; i + 1 < pts.length; i += 2) {
-    const a = pts[i];
-    const b = pts[i + 1];
-    const last = cur[cur.length - 1];
-    if (last.distanceToSquared(a) <= epsSq) {
-      cur.push(b);
-    } else {
-      if (cur.length >= 2) out.push(cur);
-      cur = [a, b];
+  const numSegs = Math.floor(pts.length / 2);
+  if (numSegs === 0) return [];
+
+  // Quantised integer key for a point. 1/eps = grid spacing; 1e-6 is
+  // far below real geometric separation but still absorbs the float
+  // round-trip through the WGF exporter/parser.
+  const scale = 1 / eps;
+  const keyOf = (p: THREE.Vector3): string =>
+    `${Math.round(p.x * scale)},${Math.round(p.y * scale)},${Math.round(p.z * scale)}`;
+
+  const segA = (i: number): THREE.Vector3 => pts[2 * i];
+  const segB = (i: number): THREE.Vector3 => pts[2 * i + 1];
+
+  // endpoint-key → seg indices incident on that endpoint
+  const endpointToSegs = new Map<string, number[]>();
+  const keyA: string[] = new Array(numSegs);
+  const keyB: string[] = new Array(numSegs);
+  for (let i = 0; i < numSegs; i++) {
+    const k0 = keyOf(segA(i));
+    const k1 = keyOf(segB(i));
+    keyA[i] = k0;
+    keyB[i] = k1;
+    (endpointToSegs.get(k0) ?? endpointToSegs.set(k0, []).get(k0)!).push(i);
+    (endpointToSegs.get(k1) ?? endpointToSegs.set(k1, []).get(k1)!).push(i);
+  }
+
+  const visited = new Array<boolean>(numSegs).fill(false);
+  const polylines: THREE.Vector3[][] = [];
+
+  const walkFrom = (startSeg: number, startEnd: THREE.Vector3, startKey: string): void => {
+    const poly: THREE.Vector3[] = [startEnd];
+    let curSeg = startSeg;
+    let curKey = startKey;
+    while (!visited[curSeg]) {
+      visited[curSeg] = true;
+      // Advance across the current segment to its other endpoint.
+      const nextEnd = keyA[curSeg] === curKey ? segB(curSeg) : segA(curSeg);
+      poly.push(nextEnd);
+      curKey = keyOf(nextEnd);
+      // Find the next unvisited segment incident on that endpoint.
+      const candidates = endpointToSegs.get(curKey);
+      if (!candidates) break;
+      let next = -1;
+      for (const c of candidates) { if (!visited[c]) { next = c; break; } }
+      if (next < 0) break;
+      curSeg = next;
+    }
+    polylines.push(poly);
+  };
+
+  // Pass 1: open-chain ends (degree-1 endpoints). Starting from here
+  // guarantees we traverse the entire open chain in a single walk.
+  for (let i = 0; i < numSegs; i++) {
+    if (visited[i]) continue;
+    const degA = endpointToSegs.get(keyA[i])!.length;
+    const degB = endpointToSegs.get(keyB[i])!.length;
+    if (degA === 1) {
+      walkFrom(i, segA(i), keyA[i]);
+    } else if (degB === 1) {
+      walkFrom(i, segB(i), keyB[i]);
     }
   }
-  if (cur.length >= 2) out.push(cur);
-  return out;
+
+  // Pass 2: whatever is left belongs to closed loops — pick an
+  // arbitrary start and walk until we return to it.
+  for (let i = 0; i < numSegs; i++) {
+    if (visited[i]) continue;
+    walkFrom(i, segA(i), keyA[i]);
+  }
+
+  return polylines;
 }
 
 function buildTubeMesh(
