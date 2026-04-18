@@ -69,6 +69,11 @@ struct ResamplePolyStat {
     int    chainId   = -1;
     int    family    = 0;
     bool   isClosed  = false;
+    // True when the short-chain fast-path preserved this polyline verbatim
+    // instead of running the arclength-uniform resampler. Used by the
+    // fast-path-only diff histogram in pipeline.h to verify that preserved
+    // chains keep beforeLen == afterLen to numerical precision.
+    bool   fastPath  = false;
     double beforeLen = 0.0;
     double afterLen  = 0.0;
 };
@@ -88,6 +93,15 @@ struct ResampleStats {
     double outputSegLenMin  = 0, outputSegLenMax = 0;
     double inputTotalArclen  = 0;
     double outputTotalArclen = 0;
+
+    // Short-chain fast-path counters (E-1.5). A chain is "fast-path" when
+    // it was too short relative to L_target to resample without collapsing
+    // arclength, so the input was preserved verbatim (see
+    // resampleOpenChain / resampleClosedLoop).
+    std::size_t openFastPath    = 0;
+    std::size_t closedFastPath  = 0;
+    std::size_t openResampled   = 0;
+    std::size_t closedResampled = 0;
 
     // Per-polyline before/after arclength (one entry per reconstructed
     // Polyline, including closed loops). Populated by
@@ -300,19 +314,22 @@ inline std::vector<Polyline> buildOrderedPolylines(
 // Step B: near-uniform resample.
 // ---------------------------------------------------------------------------
 
-inline void resampleOpenChain(
+// Returns true when the short-chain fast-path kicked in (input preserved
+// verbatim). Caller uses this to count openFastPath vs openResampled.
+inline bool resampleOpenChain(
     const std::vector<Eigen::Vector3d>& input,
     const std::vector<int>&             inFaceIds,
     double                              L_target,
     std::vector<Eigen::Vector3d>&       output,
-    std::vector<int>&                   outFaceIds)
+    std::vector<int>&                   outFaceIds,
+    bool                                disableFastPath = false)
 {
     output.clear();
     outFaceIds.clear();
     if (input.size() < 2) {
         output = input;
         outFaceIds = inFaceIds;
-        return;
+        return true;
     }
 
     std::vector<double> s(input.size(), 0.0);
@@ -324,10 +341,29 @@ inline void resampleOpenChain(
         output.push_back(input.front());
         output.push_back(input.back());
         outFaceIds.push_back(inFaceIds.empty() ? -1 : inFaceIds.front());
-        return;
+        return true;
     }
 
-    int n = std::max(2, (int)std::llround(totalLen / std::max(L_target, 1e-30)) + 1);
+    // Short-chain fast-path (E-1.5): when the total arclength is shorter
+    // than ~1.5 * target, resampling would force n=2 and collapse the
+    // polyline to a single chord — losing up to ~97% of the arclength
+    // (worst case seen in production: L=0.054, target=0.042 -> n=2 ->
+    // 97% shrink). Instead, preserve the input verbatim. PR #24 / #25
+    // already guarantee 3D endpoint continuity across adjacent cover
+    // segments, so emitting the input points directly keeps arclength
+    // and shape exactly.
+    if (!disableFastPath && totalLen < L_target * 1.5) {
+        output = input;
+        outFaceIds = inFaceIds;
+        return true;
+    }
+
+    // ceil instead of round biases n upward when L/target has a fractional
+    // part, shortening each segment below target and making the chord sum
+    // track arclength more faithfully. The "+1" converts segments to sample
+    // points, and max(3, ...) guarantees at least 2 output segments (3 points)
+    // so we never collapse to a single chord even when rounding would pick n=2.
+    int n = std::max(3, (int)std::ceil(totalLen / std::max(L_target, 1e-30)) + 1);
     output.reserve(n);
     outFaceIds.reserve(n);
 
@@ -342,21 +378,24 @@ inline void resampleOpenChain(
         int face = (inFaceIds.size() >= i) ? inFaceIds[i-1] : -1;
         outFaceIds.push_back(face);
     }
+    return false;
 }
 
-inline void resampleClosedLoop(
+// Returns true when the short-chain fast-path kicked in.
+inline bool resampleClosedLoop(
     const std::vector<Eigen::Vector3d>& input,
     const std::vector<int>&             inFaceIds,
     double                              L_target,
     std::vector<Eigen::Vector3d>&       output,
-    std::vector<int>&                   outFaceIds)
+    std::vector<int>&                   outFaceIds,
+    bool                                disableFastPath = false)
 {
     output.clear();
     outFaceIds.clear();
     if (input.size() < 3) {
         output = input;
         outFaceIds = inFaceIds;
-        return;
+        return true;
     }
 
     std::vector<double> s(input.size(), 0.0);
@@ -367,10 +406,29 @@ inline void resampleClosedLoop(
     if (totalLen <= 0.0) {
         output.push_back(input.front());
         outFaceIds.push_back(inFaceIds.empty() ? -1 : inFaceIds.front());
-        return;
+        return true;
     }
 
-    int n = std::max(3, (int)std::llround(totalLen / std::max(L_target, 1e-30)));
+    // Short-chain fast-path (E-1.5): closed loops shorter than ~3 * target
+    // would resample to n=3 (a triangle) and lose perimeter arclength to
+    // the three chord approximations. Preserve the input verbatim instead.
+    //
+    // Convention translation: buildOrderedPolylines stores closed loops
+    // with the start vertex duplicated at the end (N+1 points, N face ids,
+    // case A). polylinesToSegments expects N unique points and closes the
+    // loop via (k+1)%N. Drop the trailing duplicate so the output obeys
+    // the resampled-closed convention.
+    if (!disableFastPath && totalLen < L_target * 3.0) {
+        output.assign(input.begin(), input.end() - 1);
+        outFaceIds = inFaceIds;
+        return true;
+    }
+
+    // ceil biases n upward (shorter segments, better arclength tracking);
+    // min n = 6 guarantees at least a hexagonal approximation and avoids
+    // the triangle degeneracy that n=3 would otherwise produce for loops
+    // just above the fast-path cutoff.
+    int n = std::max(6, (int)std::ceil(totalLen / std::max(L_target, 1e-30)));
     output.reserve(n);
     outFaceIds.reserve(n);
 
@@ -388,25 +446,30 @@ inline void resampleClosedLoop(
         int face = (inFaceIds.size() >= i) ? inFaceIds[i-1] : -1;
         outFaceIds.push_back(face);
     }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
 // Step B (wrapper): resample a single Polyline.
 // ---------------------------------------------------------------------------
-inline Polyline resamplePolyline(const Polyline& in, double L_target) {
-    Polyline out;
+//
+// Returns true when the short-chain fast-path preserved the input verbatim.
+// Callers use this to update the per-polyline and aggregate fast-path stats.
+inline bool resamplePolyline(const Polyline& in, double L_target, Polyline& out,
+                             bool disableFastPath = false) {
     out.chainId  = in.chainId;
     out.family   = in.family;
     out.isClosed = in.isClosed;
 
+    bool fastPath;
     if (in.isClosed) {
-        resampleClosedLoop(in.points, in.faceIds, L_target,
-                           out.points, out.faceIds);
+        fastPath = resampleClosedLoop(in.points, in.faceIds, L_target,
+                                      out.points, out.faceIds, disableFastPath);
     } else {
-        resampleOpenChain(in.points, in.faceIds, L_target,
-                          out.points, out.faceIds);
+        fastPath = resampleOpenChain(in.points, in.faceIds, L_target,
+                                     out.points, out.faceIds, disableFastPath);
     }
-    return out;
+    return fastPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +548,8 @@ inline void segmentLengthStats(
 inline std::vector<ProjectedSegment> resampleProjectedSegments(
     const std::vector<ProjectedSegment>& in,
     double                               L_target,
-    ResampleStats&                       stats)
+    ResampleStats&                       stats,
+    bool                                 disableFastPath = false)
 {
     stats = ResampleStats{};
     stats.targetLength = L_target;
@@ -530,28 +594,37 @@ inline std::vector<ProjectedSegment> resampleProjectedSegments(
     resampled.reserve(polys.size());
     stats.perPoly.reserve(polys.size());
     for (const auto& pl : polys) {
-        Polyline rp = resamplePolyline(pl, L_target);
+        Polyline rp;
+        bool fastPath = resamplePolyline(pl, L_target, rp, disableFastPath);
 
         ResamplePolyStat ps;
         ps.chainId   = pl.chainId;
         ps.family    = pl.family;
         ps.isClosed  = rp.isClosed;
+        ps.fastPath  = fastPath;
         // Input closed loops: buildOrderedPolylines appends the start
         // vertex at the end (walk only breaks *after* pushing startPt via
         // nextOther), so the wrap edge is already counted in the N
         // consecutive differences of the N+1 points. addWrap=false here.
         //
-        // Resampled closed loops: resampleClosedLoop emits N unique samples
-        // with t = totalLen*k/n (denominator n, not n-1) and no start
-        // duplicate; polylinesToSegments later closes the loop via
-        // (k+1)%N, so we must add the wrap edge manually to match the
-        // arclength that actually reaches R.segments.
+        // Resampled closed loops (including fast-path): stored as N unique
+        // samples; the fast-path strips the input's duplicated trailing
+        // start for exactly this reason. polylinesToSegments closes the
+        // loop via (k+1)%N, so we must add the wrap edge manually to
+        // match the arclength that actually reaches R.segments.
         ps.beforeLen = polylineArclen(pl, /*addWrap=*/false);
         ps.afterLen  = polylineArclen(rp, /*addWrap=*/rp.isClosed);
         stats.perPoly.push_back(ps);
 
-        if (rp.isClosed) ++stats.closedLoops;
-        else             ++stats.openChains;
+        if (rp.isClosed) {
+            ++stats.closedLoops;
+            if (fastPath) ++stats.closedFastPath;
+            else          ++stats.closedResampled;
+        } else {
+            ++stats.openChains;
+            if (fastPath) ++stats.openFastPath;
+            else          ++stats.openResampled;
+        }
         resampled.push_back(std::move(rp));
     }
     stats.outputPolylines = (int)resampled.size();

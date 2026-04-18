@@ -75,8 +75,11 @@ struct PipelineOptions {
     //   resample = false : emit raw traced segments (debug / compare).
     //   resampleLength   : target segment length. <= 0 means "auto"
     //                      (use the base mesh's mean edge length).
-    bool   resample       = true;
-    double resampleLength = 0.0;
+    //   resampleNoFastPath : disable the short-chain fast-path in the
+    //                      resampler. For ablation / debugging only.
+    bool   resample           = true;
+    double resampleLength     = 0.0;
+    bool   resampleNoFastPath = false;
 };
 
 struct PipelineResult {
@@ -513,7 +516,8 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         }
 
         ResampleStats rs;
-        auto resampled = resampleProjectedSegments(R.segments, L_target, rs);
+        auto resampled = resampleProjectedSegments(
+            R.segments, L_target, rs, opt.resampleNoFastPath);
         rs.meshMeanEdge = meshMean;
 
         std::fprintf(stderr,
@@ -542,6 +546,32 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         std::fprintf(stderr,
             "[resample] total-arclength: input=%.6f output=%.6f  diff=%.3f%%\n",
             rs.inputTotalArclen, rs.outputTotalArclen, diffPct);
+
+        // --- Fast-path bookkeeping (E-1.5) ------------------------------
+        //
+        // How many chains were preserved verbatim by the short-chain
+        // fast-path vs. actually resampled, plus the ratio within each
+        // open/closed class. Disabled when --resample-no-fast-path is set
+        // (both counters will be zero on the fast-path side then).
+        {
+            std::size_t totalFast =
+                rs.openFastPath + rs.closedFastPath;
+            std::size_t totalAll =
+                (std::size_t)rs.outputPolylines;
+            double fastPct = (totalAll > 0)
+                ? 100.0 * (double)totalFast / (double)totalAll
+                : 0.0;
+            std::fprintf(stderr,
+                "[resample-fastpath] open-fastpath=%zu closed-fastpath=%zu "
+                "total=%zu/%zu (%.2f%%)\n",
+                rs.openFastPath, rs.closedFastPath,
+                totalFast, totalAll, fastPct);
+            std::fprintf(stderr,
+                "[resample-counts] open-resampled=%zu open-preserved=%zu "
+                "closed-resampled=%zu closed-preserved=%zu\n",
+                rs.openResampled, rs.openFastPath,
+                rs.closedResampled, rs.closedFastPath);
+        }
 
         // --- Chain-level arclength diagnostics --------------------------
         //
@@ -578,6 +608,33 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 "[resample-diff-hist] closed: <0.1%%=%d <1%%=%d <5%%=%d <10%%=%d <20%%=%d >=20%%=%d\n",
                 closedBuckets[0], closedBuckets[1], closedBuckets[2],
                 closedBuckets[3], closedBuckets[4], closedBuckets[5]);
+
+            // Fast-path chains should have before/after arclength equal to
+            // numerical precision (the resampler copies points verbatim,
+            // and polylineArclen computes both sums with the same formula).
+            // Split the histogram into "<1e-12 abs diff" vs anything else
+            // so any regression in the preservation invariant surfaces
+            // immediately. Counts are absolute (not percentage) because
+            // fast-path chains have, by construction, tiny diffs and the
+            // % bucket thresholds would all land in the <0.1% bin.
+            std::size_t openFastZero = 0, openFastOther = 0;
+            std::size_t closedFastZero = 0, closedFastOther = 0;
+            for (const auto& p : rs.perPoly) {
+                if (!p.fastPath) continue;
+                double absDiff = std::fabs(p.beforeLen - p.afterLen);
+                bool zero = (absDiff < 1e-12);
+                if (p.isClosed) {
+                    if (zero) ++closedFastZero; else ++closedFastOther;
+                } else {
+                    if (zero) ++openFastZero;   else ++openFastOther;
+                }
+            }
+            std::fprintf(stderr,
+                "[resample-diff-fastpath-only] open:   <1e-12=%zu others=%zu\n",
+                openFastZero, openFastOther);
+            std::fprintf(stderr,
+                "[resample-diff-fastpath-only] closed: <1e-12=%zu others=%zu\n",
+                closedFastZero, closedFastOther);
 
             std::vector<int> order(rs.perPoly.size());
             for (std::size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
