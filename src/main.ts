@@ -4,6 +4,7 @@ import { createSidebar, downloadFile } from './ui/sidebar';
 import {
   createViewport3D, regenerateMesh, regeneratePattern,
   updateColors, highlightStrip, applyImportedPattern,
+  renderIsolines,
 } from './ui/viewport3d';
 import { createViewport2D, regenerateUnfold, getUnfoldedStrips } from './ui/viewport2d';
 import { showStripDetail, hideStripDetail } from './ui/stripDetail';
@@ -216,6 +217,12 @@ window.addEventListener('update-colors', () => {
   updateColors(ctx3D);
 });
 
+// Cheap overlay rebuild: ribbon/line toggle, min-chain-segs, tube radius,
+// rainbow mode. Does NOT touch Kagome strips/junctions or rerun WGF.
+window.addEventListener('isoline-view-changed', () => {
+  renderIsolines(ctx3D);
+});
+
 // ─── Strip click → show 2D unfold overlay ──────────────────────────────────
 
 window.addEventListener('strip-selected', ((e: CustomEvent<{ stripId: string }>) => {
@@ -300,6 +307,7 @@ declare global {
     'import-colab-result': CustomEvent<{ text: string }>;
     'regenerate-unfold': CustomEvent;
     'update-colors': CustomEvent;
+    'isoline-view-changed': CustomEvent;
     'export-dxf': CustomEvent;
     'export-svg': CustomEvent;
     'export-csv': CustomEvent;
