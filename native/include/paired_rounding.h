@@ -327,6 +327,27 @@ struct AngularSegment {
     int chainId;     // consecutive segments with the same chainId are one polyline
 };
 
+// Helper: given a face f and side index (0..2), return the two vertex
+// indices spanning that side's physical edge. MUST reference the same
+// half-edge that faceSideNeighbor(f, side) uses (hePos = (side+2)%3),
+// otherwise prevExitKey (built on `curface` side) and curEntryKey
+// (built on the new `curface` after the neighbor walk) key different
+// physical edges and never match across a shared edge.
+//
+// hePos i in face f has endpoints (F(f, i), F(f, (i+1)%3)). With
+// hePos = (side+2)%3 the two endpoints are:
+//     a = F(f, (side+2)%3)
+//     b = F(f, (side)  %3)    [= (hePos+1)%3]
+//
+// This is the single source of truth for (face, side) -> (vA, vB) used
+// by makeEdgeKey() (cache build, cache lookup, prevExit/curEntry diag).
+inline std::pair<int,int> faceSideVerts(const Mesh& m, int f, int side) {
+    int hePos = (side + 2) % 3;
+    int a = m.F(f, hePos);
+    int b = m.F(f, (hePos + 1) % 3);
+    return {a, b};
+}
+
 // Helper: given a face f and the "side" index j (0..2) as the reference
 // uses (= the edge opposite vertex j in the face's F-row), return the
 // index of the neighbor face across that edge, or -1 if none.
@@ -487,47 +508,48 @@ inline long long makeEdgeKey(int a, int b, int nV) {
     return (long long)vmin * (long long)nV + (long long)vmax;
 }
 
-// Build per-edge crossings for `isoval`. Walks every undirected edge once
-// (interior edges via the lower-indexed half-edge; boundary edges via the
-// only existing half-edge). Theta on vmax is unwrapped onto vmin's branch
-// so the iso/edge comparison is single-branched and bary direction is
-// canonical (vmin -> vmax).
+// Build per-edge crossings for `isoval`. Iterates every (face, side)
+// pair through faceSideVerts() — the SAME helper the cache-lookup and
+// trace diagnostics use — so keys are generated identically everywhere.
+// Interior edges are visited twice (once per incident face); we dedup
+// on key. Theta on vmax is unwrapped onto vmin's branch so the
+// iso/edge comparison is single-branched and bary direction is canonical
+// (vmin -> vmax), independent of which face we entered the edge from.
 inline std::unordered_map<long long, EdgeCrossingEntry>
 buildEdgeCrossingCache(const Mesh& m, const Vec& theta, double isoval) {
     std::unordered_map<long long, EdgeCrossingEntry> cache;
-    cache.reserve(m.he.size() / 2 + 8);
     const int nV = m.nV();
-    const int nH = (int)m.he.size();
+    const int nF = m.nF();
+    cache.reserve((size_t)nF * 2 + 8);
     const double eps = 1e-12;
 
-    for (int h = 0; h < nH; ++h) {
-        int twin = m.he[h].twin;
-        // For interior edges, only process the half-edge with the lower
-        // index; for boundary edges (twin == -1), always process.
-        if (twin >= 0 && h > twin) continue;
+    for (int f = 0; f < nF; ++f) {
+        for (int side = 0; side < 3; ++side) {
+            auto [va, vb] = faceSideVerts(m, f, side);
+            long long key = makeEdgeKey(va, vb, nV);
+            if (cache.find(key) != cache.end()) continue;
 
-        int va = m.heStart(h);
-        int vb = m.he[h].vertex;
-        int vmin = std::min(va, vb);
-        int vmax = std::max(va, vb);
+            int vmin = std::min(va, vb);
+            int vmax = std::max(va, vb);
 
-        const double tmin = theta[vmin];
-        const double tmax = unwrapToNear(theta[vmax], tmin);
-        const double iso  = unwrapToNear(isoval,      tmin);
+            const double tmin = theta[vmin];
+            const double tmax = unwrapToNear(theta[vmax], tmin);
+            const double iso  = unwrapToNear(isoval,      tmin);
 
-        EdgeCrossingEntry ec;
-        if (std::fabs(tmax - tmin) > eps) {
-            const bool hit = (tmin <= iso && iso < tmax)
-                          || (tmax <= iso && iso < tmin);
-            if (hit) {
-                const double u = (iso - tmin) / (tmax - tmin);
-                if (u >= 0.0 && u < 1.0) {
-                    ec.hit  = true;
-                    ec.bary = u;
+            EdgeCrossingEntry ec;
+            if (std::fabs(tmax - tmin) > eps) {
+                const bool hit = (tmin <= iso && iso < tmax)
+                              || (tmax <= iso && iso < tmin);
+                if (hit) {
+                    const double u = (iso - tmin) / (tmax - tmin);
+                    if (u >= 0.0 && u < 1.0) {
+                        ec.hit  = true;
+                        ec.bary = u;
+                    }
                 }
             }
+            cache[key] = ec;
         }
-        cache[makeEdgeKey(va, vb, nV)] = ec;
     }
     return cache;
 }
@@ -549,8 +571,7 @@ inline FaceIsoCrossing computeFaceCrossingsFromCache(
 
     const int nV = m.nV();
     for (int j = 0; j < 3 && res.count < 2; ++j) {
-        int vs = m.F(f, (j + 1) % 3);
-        int ve = m.F(f, (j + 2) % 3);
+        auto [vs, ve] = faceSideVerts(m, f, j);
         auto it = edgeCache.find(makeEdgeKey(vs, ve, nV));
         if (it == edgeCache.end()) continue;
         const EdgeCrossingEntry& ec = it->second;
@@ -584,6 +605,12 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
 
     int nextChainId = 0;
 
+    // One-shot dynamic probe flag: fires at the FIRST noExit stop
+    // across the whole extractAngularIsolines() call, so the probe
+    // shows the actual (prevface, curface) pair that tripped the
+    // sameKey=0/diffKey=637 diagnostic.
+    bool dynamicProbeDone = false;
+
     for (int isoIdx = 0; isoIdx < numISOLines; ++isoIdx) {
         const double isoval = minval + (maxval - minval) * double(isoIdx) / double(numISOLines);
 
@@ -592,6 +619,36 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
         // disagreement that was producing curFC.count=0 noExit stops on
         // the trace's incoming edge.
         auto edgeCache = buildEdgeCrossingCache(m, theta, isoval);
+
+        // --- hedge-probe-static: dump raw half-edge endpoints vs
+        // faceSideVerts() / faceSideNeighbor() for a handful of faces
+        // mentioned in earlier [noexit-dump] traces, so we can read the
+        // side convention directly from the mesh. Fires once at iso=0
+        // only, read-only diagnostic.
+        if (isoIdx == 0) {
+            int probeFaces[] = {1158, 1212, 1164, 3618, 24845, 24899};
+            for (int f : probeFaces) {
+                if (f < 0 || f >= m.nF()) continue;
+                std::fprintf(stderr,
+                    "[hedge-probe-static] face=%d F=[%d,%d,%d]\n",
+                    f, m.F(f, 0), m.F(f, 1), m.F(f, 2));
+                for (int k = 0; k < 3; ++k) {
+                    int hePos = (k + 2) % 3;
+                    int h = m.f2he[f] + hePos;
+                    int vStart = m.heStart(h);
+                    int vEnd   = m.he[h].vertex;
+                    int twin   = m.he[h].twin;
+                    int twinFace = (twin >= 0) ? m.he[twin].face : -1;
+                    auto [a, b] = faceSideVerts(m, f, k);
+                    std::fprintf(stderr,
+                        "[hedge-probe-static]   side=%d hePos=%d h=%d "
+                        "halfedge=(%d->%d) twin=%d twinFace=%d "
+                        "faceSideVerts=(%d,%d) faceSideNeighbor=%d\n",
+                        k, hePos, h, vStart, vEnd, twin, twinFace,
+                        a, b, faceSideNeighbor(m, f, k));
+                }
+            }
+        }
 
         // --- Diagnostic counters (per-iso, read-only; do not affect algorithm) ---
         int diag_chains            = 0;
@@ -768,13 +825,14 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                 bool diag_brokenInside = false;
 
                 // Seed-side initial exit edge info for noexit-cache diag.
-                // Updated below right before curface advances to the next face.
+                // Compute from the SEED face (= the face we are about to
+                // leave on this piece), matching the "prevExit = face we
+                // are leaving" invariant used inside the while-loop.
                 long long prevExitKey;
                 int       prevExitSide = crossings[piece];
                 double    prevExitBary = barys[piece];
                 {
-                    int va = m.F(seed, (prevExitSide + 1) % 3);
-                    int vb = m.F(seed, (prevExitSide + 2) % 3);
+                    auto [va, vb] = faceSideVerts(m, seed, prevExitSide);
                     prevExitKey = makeEdgeKey(va, vb, m.nV());
                 }
                 while (curface != -1 && !visited[curface]) {
@@ -815,18 +873,19 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         seg.bary1 = curFC.bary[idx];
                         bary = curFC.bary[idx];
                         traces[piece].push_back(seg);
-                        // Capture exit-edge info on CURRENT curface so the
-                        // next iteration (or a noExit diag) can compare it
-                        // against the entry-edge view on the new curface.
+                        // CRITICAL: compute prevExitKey BEFORE curface advances.
+                        // Using curface here refers to the face we are about to LEAVE;
+                        // once curface = faceSideNeighbor(...) runs below, curface
+                        // points to the NEXT face and any edge key would be wrong.
                         {
-                            int va = m.F(curface, (k + 1) % 3);
-                            int vb = m.F(curface, (k + 2) % 3);
+                            auto [va, vb] = faceSideVerts(m, curface, k);
                             prevExitKey  = makeEdgeKey(va, vb, m.nV());
                         }
                         prevExitSide = k;
                         prevExitBary = curFC.bary[idx];
+
                         prevface = curface;
-                        curface = faceSideNeighbor(m, curface, k);
+                        curface = faceSideNeighbor(m, curface, k);   // curface moves AFTER
                         extended = true;
                         break;
                     }
@@ -870,8 +929,7 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         bool entryCrosses = false;
                         double entryT = 0.0;
                         {
-                            int va = m.F(curface, (curEntrySide + 1) % 3);
-                            int vb = m.F(curface, (curEntrySide + 2) % 3);
+                            auto [va, vb] = faceSideVerts(m, curface, curEntrySide);
                             curEntryKey = makeEdgeKey(va, vb, m.nV());
                             auto it = edgeCache.find(curEntryKey);
                             if (it != edgeCache.end()) {
@@ -888,6 +946,39 @@ extractAngularIsolines(const Mesh& m, const Vec& theta, int numISOLines) {
                         else              diag_noExit_keyMissing++;
                         if (entryCrosses) diag_noExit_entryCrosses++;
                         else              diag_noExit_entryNoCross++;
+
+                        // hedge-probe-dynamic: one-shot probe at the
+                        // FIRST noExit stop. Dumps raw half-edge endpoints
+                        // vs faceSideVerts/faceSideNeighbor for the exact
+                        // (prevface, curface) pair that tripped it, so we
+                        // can read the side convention from real data.
+                        if (!dynamicProbeDone && isoIdx == 0) {
+                            dynamicProbeDone = true;
+                            int probeFaces[2] = { prevface, curface };
+                            for (int f : probeFaces) {
+                                if (f < 0 || f >= m.nF()) continue;
+                                std::fprintf(stderr,
+                                    "[hedge-probe-dynamic] face=%d F=[%d,%d,%d] "
+                                    "(role=%s)\n",
+                                    f, m.F(f, 0), m.F(f, 1), m.F(f, 2),
+                                    (f == prevface) ? "prev" : "cur");
+                                for (int k = 0; k < 3; ++k) {
+                                    int hePos = (k + 2) % 3;
+                                    int h = m.f2he[f] + hePos;
+                                    int vStart = m.heStart(h);
+                                    int vEnd   = m.he[h].vertex;
+                                    int twin   = m.he[h].twin;
+                                    int twinFace = (twin >= 0) ? m.he[twin].face : -1;
+                                    auto [a, b] = faceSideVerts(m, f, k);
+                                    std::fprintf(stderr,
+                                        "[hedge-probe-dynamic]   side=%d hePos=%d "
+                                        "halfedge=(%d->%d) twin=%d twinFace=%d "
+                                        "faceSideVerts=(%d,%d) faceSideNeighbor=%d\n",
+                                        k, hePos, vStart, vEnd, twin, twinFace,
+                                        a, b, faceSideNeighbor(m, f, k));
+                                }
+                            }
+                        }
 
                         // noExit-deep: first 10 dumps at iso=0 only.
                         if (isoIdx == 0 && diag_noExit_dump < 10) {
