@@ -21,13 +21,17 @@
  *
  * Output file (what the CLI writes, what the browser reads):
  *
- *   # wgf-output v1
+ *   # wgf-output v2
  *   META initialCurl=... finalCurl=... iterations=... numSingular=...
  *        segments=... components=... fam0=... fam1=... fam2=...
  *   SEG <nSeg>
- *   ax ay az bx by bz family baseFaceIdx
+ *   ax ay az bx by bz family baseFaceIdx chainId
  *   ...
  *   END
+ *
+ * v1 compatibility: old 8-column rows (no chainId) still parse; the
+ * missing chainId field is filled with -1 ("unknown"). Downstream
+ * code falls back to the pre-chain behaviour in that case.
  */
 
 import type { HalfEdgeMesh } from './halfEdge';
@@ -78,6 +82,11 @@ export interface ParsedWgfSegment {
   bx: number; by: number; bz: number;
   family:  number;
   faceIdx: number;
+  // Chain identifier from the native tracer (wgf-output v2). Segments
+  // with the same chainId form one contiguous polyline. -1 means the
+  // field was absent (v1 file) or unknown — readers should fall back
+  // to the old per-family bucketing behaviour.
+  chainId: number;
 }
 
 export interface ParsedWgfResult {
@@ -146,12 +155,14 @@ export function parseResultText(text: string): ParsedWgfResult {
         if (i >= n) throw new Error(`SEG: expected ${nSeg} rows, got ${k}`);
         const p = lines[i].trim().split(/\s+/);
         i++;
-        if (p.length < 8) throw new Error(`SEG row ${k}: expected 8 cols, got ${p.length}`);
+        if (p.length < 8) throw new Error(`SEG row ${k}: expected >=8 cols, got ${p.length}`);
         result.segments.push({
           ax: parseFloat(p[0]), ay: parseFloat(p[1]), az: parseFloat(p[2]),
           bx: parseFloat(p[3]), by: parseFloat(p[4]), bz: parseFloat(p[5]),
           family:  parseInt(p[6], 10),
           faceIdx: parseInt(p[7], 10),
+          // v2: 9th column. Default to -1 for v1 (8-column) files.
+          chainId: p.length >= 9 ? parseInt(p[8], 10) : -1,
         });
       }
       continue;
