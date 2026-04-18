@@ -327,15 +327,24 @@ struct AngularSegment {
     int chainId;     // consecutive segments with the same chainId are one polyline
 };
 
-// Helper: given a face f and side index (0..2) in reference numbering
-// (side j = edge opposite vertex j = F(f,(j+1)%3) -> F(f,(j+2)%3)),
-// return the two vertex indices spanning that edge. This is the single
-// source of truth for (face, side) -> (vA, vB) used by makeEdgeKey()
-// so every call site (cache build, cache lookup, trace prevExit/curEntry)
-// indexes edges identically.
+// Helper: given a face f and side index (0..2), return the two vertex
+// indices spanning that side's physical edge. MUST reference the same
+// half-edge that faceSideNeighbor(f, side) uses (hePos = (side+2)%3),
+// otherwise prevExitKey (built on `curface` side) and curEntryKey
+// (built on the new `curface` after the neighbor walk) key different
+// physical edges and never match across a shared edge.
+//
+// hePos i in face f has endpoints (F(f, i), F(f, (i+1)%3)). With
+// hePos = (side+2)%3 the two endpoints are:
+//     a = F(f, (side+2)%3)
+//     b = F(f, (side)  %3)    [= (hePos+1)%3]
+//
+// This is the single source of truth for (face, side) -> (vA, vB) used
+// by makeEdgeKey() (cache build, cache lookup, prevExit/curEntry diag).
 inline std::pair<int,int> faceSideVerts(const Mesh& m, int f, int side) {
-    int a = m.F(f, (side + 1) % 3);
-    int b = m.F(f, (side + 2) % 3);
+    int hePos = (side + 2) % 3;
+    int a = m.F(f, hePos);
+    int b = m.F(f, (hePos + 1) % 3);
     return {a, b};
 }
 
