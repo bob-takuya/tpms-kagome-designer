@@ -16,6 +16,7 @@ export function createSidebar(container: HTMLElement): void {
       ${createAccordionSection('Noise', createNoiseControls())}
       ${createAccordionSection('Strip', createStripControls())}
       ${createAccordionSection('Kagome', createKagomeControls())}
+      ${createAccordionSection('Isoline view', createIsolineViewControls())}
       ${createAccordionSection('Develop', createDevelopControls())}
       ${createAccordionSection('Export', createExportControls())}
     </div>
@@ -173,6 +174,35 @@ function createKagomeControls(): string {
         <input type="color" id="layer-color-1" value="${state.kagome.layerColors[1]}">
         <input type="color" id="layer-color-2" value="${state.kagome.layerColors[2]}">
       </div>
+    </div>
+  `;
+}
+
+function createIsolineViewControls(): string {
+  const v = store.getState().isolineView;
+  return `
+    <div class="control-group">
+      <label for="iso-mode">描画モード</label>
+      <select id="iso-mode">
+        <option value="ribbon" ${v.mode === 'ribbon' ? 'selected' : ''}>Ribbon (TubeGeometry)</option>
+        <option value="line"   ${v.mode === 'line'   ? 'selected' : ''}>Line (debug)</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label for="iso-min-segs">最小 chain セグメント数</label>
+      <input type="range" id="iso-min-segs" min="1" max="50" step="1" value="${v.minChainSegs}">
+      <span class="value-display" id="iso-min-segs-value">${v.minChainSegs}</span>
+    </div>
+    <div class="control-group">
+      <label for="iso-tube-radius">Tube 半径 (world units)</label>
+      <input type="range" id="iso-tube-radius" min="0.005" max="0.1" step="0.005" value="${v.tubeRadius}">
+      <span class="value-display" id="iso-tube-radius-value">${v.tubeRadius.toFixed(3)}</span>
+    </div>
+    <div class="control-group">
+      <label for="iso-rainbow">
+        <input type="checkbox" id="iso-rainbow" ${v.chainIdColor ? 'checked' : ''}>
+        chainId 毎に虹色 (debug)
+      </label>
     </div>
   `;
 }
@@ -336,6 +366,44 @@ function setupEventListeners(): void {
     store.getState().setStrip({ widthRatio: v });
     const el = document.getElementById('width-ratio-value');
     if (el) el.textContent = v.toFixed(2);
+  });
+
+  // ── Isoline view controls (live → dispatch 'isoline-view-changed') ─────────
+  // These toggle the overlay rendering only; no WGF recompute needed.
+  document.getElementById('iso-mode')?.addEventListener('change', (e) => {
+    const mode = (e.target as HTMLSelectElement).value as 'ribbon' | 'line';
+    store.getState().setIsolineView({ mode });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+  // Use 'change' (fires on slider release) for the range sliders so we
+  // don't rebuild 7k tubes on every intermediate drag frame.
+  const minSegsEl = document.getElementById('iso-min-segs') as HTMLInputElement | null;
+  minSegsEl?.addEventListener('input', (e) => {
+    // Reflect the live value in the label while dragging…
+    const v = parseInt((e.target as HTMLInputElement).value, 10);
+    const lbl = document.getElementById('iso-min-segs-value');
+    if (lbl) lbl.textContent = String(v);
+  });
+  minSegsEl?.addEventListener('change', (e) => {
+    const v = parseInt((e.target as HTMLInputElement).value, 10);
+    store.getState().setIsolineView({ minChainSegs: v });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+  const radiusEl = document.getElementById('iso-tube-radius') as HTMLInputElement | null;
+  radiusEl?.addEventListener('input', (e) => {
+    const v = parseFloat((e.target as HTMLInputElement).value);
+    const lbl = document.getElementById('iso-tube-radius-value');
+    if (lbl) lbl.textContent = v.toFixed(3);
+  });
+  radiusEl?.addEventListener('change', (e) => {
+    const v = parseFloat((e.target as HTMLInputElement).value);
+    store.getState().setIsolineView({ tubeRadius: v });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+  document.getElementById('iso-rainbow')?.addEventListener('change', (e) => {
+    const on = (e.target as HTMLInputElement).checked;
+    store.getState().setIsolineView({ chainIdColor: on });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
   });
 
   // ── Kagome controls (store-only) ────────────────────────────────────────────

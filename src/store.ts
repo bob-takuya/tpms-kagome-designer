@@ -29,6 +29,18 @@ export interface KagomeParams {
   layerColors:   [string, string, string];
 }
 
+export interface IsolineViewParams {
+  /** 'ribbon' → TubeGeometry per chain, 'line' → thin LineSegments (debug). */
+  mode:         'ribbon' | 'line';
+  /** Minimum number of segments a chain must have to be drawn. Short
+   *  "tanzaku" chains get pruned so the viewport isn't flooded. */
+  minChainSegs: number;
+  /** Tube radius in world units (before mm-per-unit scaling). */
+  tubeRadius:   number;
+  /** Debug: colour each chain by index (HSL rainbow) instead of by family. */
+  chainIdColor: boolean;
+}
+
 export interface DevelopParams {
   scale: number;
   margin: number;
@@ -44,6 +56,7 @@ export interface AppState {
   noise: NoiseParams;
   strip: StripParams;
   kagome: KagomeParams;
+  isolineView: IsolineViewParams;
   develop: DevelopParams;
   export: ExportParams;
   viewMode: '3d' | '2d';
@@ -61,6 +74,7 @@ export interface AppActions {
   setNoise: (params: Partial<NoiseParams>) => void;
   setStrip: (params: Partial<StripParams>) => void;
   setKagome: (params: Partial<KagomeParams>) => void;
+  setIsolineView: (params: Partial<IsolineViewParams>) => void;
   setDevelop: (params: Partial<DevelopParams>) => void;
   setExport: (params: Partial<ExportParams>) => void;
   setViewMode: (mode: '3d' | '2d') => void;
@@ -94,6 +108,12 @@ const defaultState: AppState = {
     holeRadiusMm: 2,    // 2 mm default
     layerColors:  ['#ff4444', '#ffff44', '#44ff44'] as [string, string, string],
   },
+  isolineView: {
+    mode:         'ribbon' as 'ribbon' | 'line',
+    minChainSegs: 10,
+    tubeRadius:   0.02,
+    chainIdColor: false,
+  },
   develop: {
     scale: 50,   // mm per TPMS world unit (1 unit ≈ 50 mm → period ≈ 314 mm)
     margin: 5,
@@ -119,6 +139,8 @@ export const store = createStore<AppState & AppActions>((set, get) => ({
   setNoise: (params) => set((state) => ({ noise: { ...state.noise, ...params } })),
   setStrip: (params) => set((state) => ({ strip: { ...state.strip, ...params } })),
   setKagome: (params) => set((state) => ({ kagome: { ...state.kagome, ...params } })),
+  setIsolineView: (params) =>
+    set((state) => ({ isolineView: { ...state.isolineView, ...params } })),
   setDevelop: (params) => set((state) => ({ develop: { ...state.develop, ...params } })),
   setExport: (params) => set((state) => ({ export: { ...state.export, ...params } })),
   setViewMode: (mode) => set({ viewMode: mode }),
@@ -132,6 +154,7 @@ export const store = createStore<AppState & AppActions>((set, get) => ({
       noise: state.noise,
       strip: state.strip,
       kagome: state.kagome,
+      isolineView: state.isolineView,
       develop: state.develop,
       export: state.export,
     };
@@ -146,6 +169,7 @@ export const store = createStore<AppState & AppActions>((set, get) => ({
         noise: { ...defaultState.noise, ...data.noise },
         strip: { ...defaultState.strip, ...data.strip },
         kagome: { ...defaultState.kagome, ...data.kagome },
+        isolineView: { ...defaultState.isolineView, ...data.isolineView },
         develop: { ...defaultState.develop, ...data.develop },
         export: { ...defaultState.export, ...data.export },
       });
