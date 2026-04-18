@@ -93,23 +93,48 @@ export async function computeGeodesicFoliationIsolines(
 export function applyParsedWgfResult(
   parsed: ParsedWgfResult,
 ): GeodesicFoliationResult {
-  const perFamPoints: [THREE.Vector3[], THREE.Vector3[], THREE.Vector3[]] = [[], [], []];
-  const perFamFaces:  [number[],        number[],        number[]]        = [[], [], []];
+  // Two buckets per family:
+  //   - "unknown" (chainId < 0, i.e. v1 file): collapse into a single
+  //     Isoline per family, matching the pre-chainId behaviour so old
+  //     wgf-output files keep working.
+  //   - chainId >= 0 (v2 file): one Isoline per (family, chainId) so the
+  //     kagome stitcher sees each cover chain as its own polyline.
+  const unknownPoints: [THREE.Vector3[], THREE.Vector3[], THREE.Vector3[]] = [[], [], []];
+  const unknownFaces:  [number[],        number[],        number[]]        = [[], [], []];
+  const chainBuckets:  [Map<number, Isoline>, Map<number, Isoline>, Map<number, Isoline>] =
+    [new Map(), new Map(), new Map()];
 
   for (const s of parsed.segments) {
     const fam = s.family % 3;
-    perFamPoints[fam].push(new THREE.Vector3(s.ax, s.ay, s.az));
-    perFamPoints[fam].push(new THREE.Vector3(s.bx, s.by, s.bz));
-    perFamFaces[fam].push(s.faceIdx);
+    const a = new THREE.Vector3(s.ax, s.ay, s.az);
+    const b = new THREE.Vector3(s.bx, s.by, s.bz);
+    if (s.chainId < 0) {
+      unknownPoints[fam].push(a, b);
+      unknownFaces[fam].push(s.faceIdx);
+    } else {
+      let iso = chainBuckets[fam].get(s.chainId);
+      if (!iso) {
+        iso = { points: [], faceIndices: [] };
+        chainBuckets[fam].set(s.chainId, iso);
+      }
+      iso.points.push(a, b);
+      iso.faceIndices.push(s.faceIdx);
+    }
   }
 
   const isolinesByFamily: [Isoline[], Isoline[], Isoline[]] = [[], [], []];
   for (let k = 0; k < 3; k++) {
-    if (perFamPoints[k].length === 0) continue;
-    isolinesByFamily[k].push({
-      points: perFamPoints[k],
-      faceIndices: perFamFaces[k],
-    });
+    if (unknownPoints[k].length > 0) {
+      isolinesByFamily[k].push({
+        points: unknownPoints[k],
+        faceIndices: unknownFaces[k],
+      });
+    }
+    // Stable order by chainId so repeated imports produce identical output.
+    const ids = [...chainBuckets[k].keys()].sort((a, b) => a - b);
+    for (const id of ids) {
+      isolinesByFamily[k].push(chainBuckets[k].get(id)!);
+    }
   }
 
   return {
