@@ -204,6 +204,16 @@ function createIsolineViewControls(): string {
         chainId 毎に虹色 (debug)
       </label>
     </div>
+    <div class="control-group">
+      <label for="iso-adj-eps">Adjacency eps (debug)</label>
+      <select id="iso-adj-eps">
+        <option value="1e-6" ${v.adjacencyEps === 1e-6 ? 'selected' : ''}>1e-6 (tight)</option>
+        <option value="1e-5" ${v.adjacencyEps === 1e-5 ? 'selected' : ''}>1e-5</option>
+        <option value="1e-4" ${v.adjacencyEps === 1e-4 ? 'selected' : ''}>1e-4</option>
+        <option value="1e-3" ${v.adjacencyEps === 1e-3 ? 'selected' : ''}>1e-3</option>
+        <option value="1e-2" ${v.adjacencyEps === 1e-2 ? 'selected' : ''}>1e-2 (loose)</option>
+      </select>
+    </div>
   `;
 }
 
@@ -403,6 +413,11 @@ function setupEventListeners(): void {
   document.getElementById('iso-rainbow')?.addEventListener('change', (e) => {
     const on = (e.target as HTMLInputElement).checked;
     store.getState().setIsolineView({ chainIdColor: on });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+  document.getElementById('iso-adj-eps')?.addEventListener('change', (e) => {
+    const v = parseFloat((e.target as HTMLSelectElement).value);
+    store.getState().setIsolineView({ adjacencyEps: v });
     window.dispatchEvent(new CustomEvent('isoline-view-changed'));
   });
 
