@@ -36,6 +36,16 @@ export interface GeodesicFoliationResult {
   finalCurl:   number;
   iterations:  number;
   numSingular: number;
+  /** Producer capability hints — populated when an imported wgf-output
+   *  exposes them via META. The in-browser pipeline reports v=2 (chains
+   *  only); v3/v4 features are surfaced only by Colab-CLI imports. */
+  meta?: {
+    version: number;
+    numIsoLevels: number;
+    hasResample: boolean;
+    hasCut:      boolean;
+    hasPrune:    boolean;
+  };
 }
 
 export async function computeGeodesicFoliationIsolines(
@@ -72,6 +82,7 @@ export async function computeGeodesicFoliationIsolines(
     isolinesByFamily[k].push({
       points: perFamPoints[k],
       faceIndices: perFamFaces[k],
+      family: k,
     });
   }
 
@@ -81,6 +92,13 @@ export async function computeGeodesicFoliationIsolines(
     finalCurl:   res.finalCurl,
     iterations:  res.iterations,
     numSingular: res.numSingular,
+    meta: {
+      version: 2,            // in-browser WASM pipeline emits v2-equivalent data
+      numIsoLevels: 0,
+      hasResample: false,
+      hasCut:      false,
+      hasPrune:    false,
+    },
   };
 }
 
@@ -114,7 +132,17 @@ export function applyParsedWgfResult(
     } else {
       let iso = chainBuckets[fam].get(s.chainId);
       if (!iso) {
-        iso = { points: [], faceIndices: [] };
+        iso = {
+          points: [],
+          faceIndices: [],
+          family:   fam,
+          chainId:  s.chainId,
+          // First segment seen wins for the per-chain attributes — by
+          // construction the v3+ exporter writes the same isoLevel/flag
+          // for every segment of one chain.
+          isoLevel: s.isoLevel,
+          flag:     s.flag,
+        };
         chainBuckets[fam].set(s.chainId, iso);
       }
       iso.points.push(a, b);
@@ -128,6 +156,10 @@ export function applyParsedWgfResult(
       isolinesByFamily[k].push({
         points: unknownPoints[k],
         faceIndices: unknownFaces[k],
+        family: k,
+        isoLevel: -1,
+        chainId: -1,
+        flag: -1,
       });
     }
     // Stable order by chainId so repeated imports produce identical output.
@@ -143,5 +175,12 @@ export function applyParsedWgfResult(
     finalCurl:   parsed.finalCurl,
     iterations:  parsed.iterations,
     numSingular: parsed.numSingular,
+    meta: {
+      version:      parsed.version,
+      numIsoLevels: parsed.numIsoLevels,
+      hasResample:  parsed.hasResample,
+      hasCut:       parsed.hasCut,
+      hasPrune:     parsed.hasPrune,
+    },
   };
 }

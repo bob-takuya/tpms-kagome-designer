@@ -223,6 +223,42 @@ body {
   gap: 8px;
 }
 
+.toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.toggle-btn-pill {
+  min-width: 28px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-secondary, #888);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s, color 0.1s;
+}
+
+.toggle-btn-pill.on {
+  background: var(--accent, #4a90e2);
+  color: #fff;
+  border-color: var(--accent, #4a90e2);
+}
+
+.toggle-btn-pill.off:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.muted {
+  color: var(--text-secondary, #888);
+  font-size: 11px;
+}
+
 .color-row input[type="color"] {
   width: 40px;
   height: 24px;
