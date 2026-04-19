@@ -1,18 +1,20 @@
 // post_process.h — isoline post-processing (Vekhter 2019 §5.2).
 //
-// This header implements the first post-processing step from §5.2:
+// This header implements the first three post-processing steps from §5.2:
 //
-//   "resample the isolines so that all segments are approximately the
-//    same length"
+//   1. "resample the isolines so that all segments are approximately the
+//       same length"
+//   2. "cut the ribbons into two pieces at points with very high amounts
+//       of geodesic curvature"
+//   3. "prune very short ribbon segments"
 //
-// The subsequent steps (cut at sharp turns, prune short chains, extend
-// near-coincident endpoints) are intentionally NOT implemented here;
-// they will follow in their own PRs.
+// Step 4 ("extend to crossings") is intentionally NOT implemented here;
+// it will follow in its own PR (Phase E-3).
 //
 // Pipeline position: runs AFTER the centerline extraction emits its
 // ProjectedSegments (one per traced isoline face-crossing) and BEFORE
 // the pipeline returns. Takes raw ProjectedSegments in, returns
-// resampled ProjectedSegments with near-uniform length.
+// resampled-cut-pruned ProjectedSegments.
 //
 // Algorithm:
 //   A. Bucket segments by chainId and rebuild ordered polylines from
@@ -26,6 +28,15 @@
 //      perimeter (n output segments with a wrap-around closing edge).
 //   C. Emit one ProjectedSegment per output segment, keeping chainId and
 //      family, and inheriting baseFaceIdx from the source input interval.
+//   D. For each polyline, compute a discrete geodesic curvature proxy
+//      (turning-angle / local-arclength) at interior points, decide a
+//      per-chain threshold (adaptive 95th percentile clamped by absolute
+//      caps at π/(4·L_target) and π/L_target), and split the polyline
+//      at every point whose kappa exceeds the threshold. Sub-chains
+//      share the cut point. Closed loops with >=1 cut become open chains.
+//   E. Drop any surviving polyline whose total arclength is below a
+//      per-chain minimum (default 3 · L_target). This prunes the short
+//      "carpet scraps" that §5.2 calls out.
 
 #pragma once
 
@@ -651,6 +662,457 @@ inline std::vector<ProjectedSegment> resampleProjectedSegments(
                                stats.outputSegLenMin, stats.outputSegLenMax,
                                stats.outputTotalArclen);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Step D / E: curvature cut + short prune (Vekhter §5.2, steps 2 & 3).
+// ---------------------------------------------------------------------------
+
+struct CutPruneOptions {
+    // Curvature cut (§5.2 step 2)
+    //
+    // cutThresholdAbs > 0 : use this absolute kappa threshold for every
+    //                       chain (bypasses the per-chain adaptive rule).
+    // cutThresholdAbs <= 0: per-chain adaptive percentile, clamped to the
+    //                       interval [kappaMinCap, kappaMaxCap] where
+    //                       kappaMinCap = π / (4·L_target),
+    //                       kappaMaxCap = π /     L_target.
+    double cutThresholdAbs = 0.0;
+    double cutPercentile   = 0.95;
+    bool   disableCut      = false;
+
+    // Short prune (§5.2 step 3)
+    //
+    // minChainLengthAbs > 0 : use this absolute minimum arclength.
+    // minChainLengthAbs <= 0: use minChainMult · L_target.
+    double minChainLengthAbs = 0.0;
+    double minChainMult      = 3.0;
+    bool   disablePrune      = false;
+
+    double L_target = 1.0;
+};
+
+struct CutPruneStats {
+    // Counts across the full pass.
+    int inputPolylines      = 0;
+    int afterCutPolylines   = 0;
+    int afterPrunePolylines = 0;
+    int cutsApplied         = 0;
+    int prunedPolylines     = 0;
+
+    // Kappa distribution over all interior points of all input polylines.
+    int    totalKappaSamples = 0;
+    double kappaP50 = 0.0, kappaP75 = 0.0, kappaP90 = 0.0;
+    double kappaP95 = 0.0, kappaP99 = 0.0, kappaMax = 0.0;
+
+    // Per-chain threshold distribution (adaptive path only).
+    int    thresholdSamples = 0;
+    double thrMin  = 0.0, thrMax = 0.0, thrMean = 0.0;
+
+    // Length histograms (bucketed by multiples of L_target).
+    // Buckets: [<1·L, <2·L, <5·L, <10·L, >=10·L]
+    int lenHistBefore[5] = {0, 0, 0, 0, 0};
+    int lenHistAfter [5] = {0, 0, 0, 0, 0};
+
+    // Arclength totals (for the summary report).
+    double inputArclen = 0.0, cutArclen = 0.0, outputArclen = 0.0;
+
+    // Family counts after prune (for balance check).
+    int familyCountsAfter[3] = {0, 0, 0};
+
+    // Kappa distribution over the OUTPUT interior points (sanity check:
+    // should have p99 below the threshold after a successful cut).
+    double outKappaP95 = 0.0, outKappaP99 = 0.0, outKappaMax = 0.0;
+
+    // Echo of the effective configuration used.
+    double effectiveMinChainLength = 0.0;
+    bool   cutWasAdaptive          = true;
+};
+
+namespace detail {
+
+// Discrete geodesic curvature proxy at each "interior" point of a polyline.
+//
+// Open chain: kappa defined for i = 1 .. N-2 → returns N-2 values
+//             (element i corresponds to points[i+1]).
+// Closed loop: kappa defined for every i = 0 .. N-1 using the cyclic
+//             previous / next indices → returns N values (element i
+//             corresponds to points[i]).
+//
+// "Interior" index convention (what the caller uses to cut):
+//   open  : cut indices live in [1, N-2], kappa[k] ↔ cut index k+1
+//   closed: cut indices live in [0, N-1], kappa[k] ↔ cut index k
+inline std::vector<double> geodesicCurvatureProxy(const Polyline& pl) {
+    std::vector<double> kappa;
+    const int N = (int)pl.points.size();
+    if (N < 3) return kappa;
+
+    auto kappaAt = [&](int prev, int cur, int next) -> double {
+        Eigen::Vector3d v1 = pl.points[cur]  - pl.points[prev];
+        Eigen::Vector3d v2 = pl.points[next] - pl.points[cur];
+        double L1 = v1.norm();
+        double L2 = v2.norm();
+        if (L1 < 1e-12 || L2 < 1e-12) return 0.0;
+        v1 /= L1;
+        v2 /= L2;
+        double dot_val = std::clamp(v1.dot(v2), -1.0, 1.0);
+        double angle = std::acos(dot_val);
+        double L_local = 0.5 * (L1 + L2);
+        return angle / std::max(L_local, 1e-9);
+    };
+
+    if (pl.isClosed) {
+        kappa.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            int ip = (i - 1 + N) % N;
+            int in = (i + 1) % N;
+            kappa.push_back(kappaAt(ip, i, in));
+        }
+    } else {
+        kappa.reserve(N - 2);
+        for (int i = 1; i < N - 1; ++i) {
+            kappa.push_back(kappaAt(i - 1, i, i + 1));
+        }
+    }
+    return kappa;
+}
+
+inline double polylineArclength(const Polyline& pl) {
+    const int N = (int)pl.points.size();
+    if (N < 2) return 0.0;
+    double L = 0.0;
+    for (int i = 1; i < N; ++i) L += (pl.points[i] - pl.points[i-1]).norm();
+    if (pl.isClosed) L += (pl.points.front() - pl.points.back()).norm();
+    return L;
+}
+
+// Decide a per-chain threshold given the chain's kappa values.
+// Returns +inf when the chain has no interior points (no candidate cuts).
+inline double decideCutThreshold(
+    const std::vector<double>& kappas,
+    double percentile,
+    double L_target)
+{
+    if (kappas.empty()) return std::numeric_limits<double>::infinity();
+    std::vector<double> sorted = kappas;
+    std::sort(sorted.begin(), sorted.end());
+    // Floor-index: for a 20-element vector and p=0.95, we want index 19
+    // (the largest). std::min guards against percentile=1.0.
+    int idx = (int)std::floor(percentile * (double)sorted.size());
+    if (idx < 0) idx = 0;
+    if (idx >= (int)sorted.size()) idx = (int)sorted.size() - 1;
+    double p = sorted[idx];
+    double kmin = M_PI / (4.0 * std::max(L_target, 1e-9));
+    double kmax = M_PI /        std::max(L_target, 1e-9);
+    return std::clamp(p, kmin, kmax);
+}
+
+// Cut an open polyline at a sorted set of interior indices (each in [1, N-2]).
+// Produces K+1 open sub-polylines that share each cut point between
+// neighbouring sub-chains. Face ids are partitioned along the cuts.
+inline std::vector<Polyline> cutOpenAtIndices(
+    const Polyline& pl, const std::vector<int>& cuts)
+{
+    const int N = (int)pl.points.size();
+    const int M = (int)pl.faceIds.size();
+    std::vector<Polyline> out;
+    if (cuts.empty()) { out.push_back(pl); return out; }
+
+    // Sentinel 0 on the left and N-1 on the right; each sub-chain spans
+    // bounds[j]..bounds[j+1] inclusive.
+    std::vector<int> bounds;
+    bounds.reserve(cuts.size() + 2);
+    bounds.push_back(0);
+    for (int c : cuts) bounds.push_back(c);
+    bounds.push_back(N - 1);
+
+    for (std::size_t j = 0; j + 1 < bounds.size(); ++j) {
+        int a = bounds[j];
+        int b = bounds[j + 1];
+        if (b <= a) continue;
+        Polyline sub;
+        sub.chainId  = pl.chainId;
+        sub.family   = pl.family;
+        sub.isClosed = false;
+        sub.points.assign(pl.points.begin() + a, pl.points.begin() + b + 1);
+        int faceLo = a;
+        int faceHi = std::min(b, M);           // faceIds are [0, M)
+        if (faceHi > faceLo) {
+            sub.faceIds.assign(pl.faceIds.begin() + faceLo,
+                               pl.faceIds.begin() + faceHi);
+        }
+        out.push_back(std::move(sub));
+    }
+    return out;
+}
+
+// Cut a closed polyline at a sorted set of indices (each in [0, N-1]).
+// With K >= 1 cuts, the loop becomes K open sub-polylines (cyclic pieces).
+// With K == 0 the loop is returned unchanged.
+//
+// For K == 1, we emit one open sub-polyline that wraps once around the
+// loop back to the (shared) cut point.
+inline std::vector<Polyline> cutClosedAtIndices(
+    const Polyline& pl, const std::vector<int>& cuts)
+{
+    const int N = (int)pl.points.size();
+    std::vector<Polyline> out;
+    if (cuts.empty()) { out.push_back(pl); return out; }
+
+    const int K = (int)cuts.size();
+    // faceIds.size() should be == N on resampled closed loops (one per
+    // segment, including the wrap-around edge). Fall back gracefully if
+    // the invariant is ever violated.
+    const int M = (int)pl.faceIds.size();
+
+    // Number of forward edges covered per sub-chain. For K >= 2 the cuts
+    // carve the cycle into K arcs; for K == 1 the whole cycle becomes one
+    // open arc of length N that starts and ends at the single cut point.
+    for (int j = 0; j < K; ++j) {
+        int start = cuts[j];
+        int end   = cuts[(j + 1) % K];
+        int edgeCount;
+        if (K == 1) {
+            edgeCount = N;                      // full wrap
+        } else {
+            edgeCount = (end - start + N) % N;  // forward distance mod N
+            if (edgeCount == 0) edgeCount = N;  // colocated cuts => full wrap
+        }
+        Polyline sub;
+        sub.chainId  = pl.chainId;
+        sub.family   = pl.family;
+        sub.isClosed = false;
+        int idx = start;
+        sub.points.push_back(pl.points[idx]);
+        for (int step = 0; step < edgeCount; ++step) {
+            if (M > 0) sub.faceIds.push_back(pl.faceIds[idx % M]);
+            idx = (idx + 1) % N;
+            sub.points.push_back(pl.points[idx]);
+        }
+        out.push_back(std::move(sub));
+    }
+    return out;
+}
+
+// Normalize a closed-loop polyline to the compact N-unique-points
+// convention (no duplicated start at the end). buildOrderedPolylines
+// emits closed loops in "convention A" — N+1 points where points.back()
+// quantizes to points.front() — which would confuse the cyclic index
+// math in geodesicCurvatureProxy / cutClosedAtIndices. After this call,
+// points.size() == N, faceIds.size() == N (one per edge, including the
+// implicit wrap-around edge from points[N-1] to points[0]). Open chains
+// are left untouched.
+inline void normalizeClosedLoopCompact(Polyline& pl) {
+    if (!pl.isClosed) return;
+    const int N = (int)pl.points.size();
+    if (N < 2) return;
+    if (quantKey(pl.points.front()) == quantKey(pl.points.back())) {
+        pl.points.pop_back();
+    }
+}
+
+inline int lengthBucketIndex(double L, double L_target) {
+    double r = L / std::max(L_target, 1e-30);
+    if (r < 1.0)  return 0;
+    if (r < 2.0)  return 1;
+    if (r < 5.0)  return 2;
+    if (r < 10.0) return 3;
+    return 4;
+}
+
+} // namespace detail
+
+// Apply cut + prune to a batch of Polylines. Returns the surviving
+// polylines (post-prune), with chainIds rewritten so that cut sub-chains
+// get fresh ids from (maxInputChainId + 1) onwards and un-cut chains
+// keep their original id.
+inline std::vector<Polyline> cutAndPrunePolylines(
+    std::vector<Polyline> polys,
+    const CutPruneOptions& opt,
+    CutPruneStats&         stats)
+{
+    stats = CutPruneStats{};
+    stats.inputPolylines = (int)polys.size();
+    stats.effectiveMinChainLength =
+        (opt.minChainLengthAbs > 0.0)
+            ? opt.minChainLengthAbs
+            : opt.minChainMult * opt.L_target;
+    stats.cutWasAdaptive = (opt.cutThresholdAbs <= 0.0);
+
+    // Normalize closed loops to the compact convention so that cyclic
+    // index math in the curvature proxy and the cut helpers lines up.
+    for (auto& pl : polys) detail::normalizeClosedLoopCompact(pl);
+
+    // --- Pass 1: gather kappa statistics over the whole batch -----------
+    std::vector<double> allKappas;
+    for (const auto& pl : polys) {
+        for (double k : detail::geodesicCurvatureProxy(pl)) allKappas.push_back(k);
+    }
+    stats.totalKappaSamples = (int)allKappas.size();
+    if (!allKappas.empty()) {
+        std::vector<double> sorted = allKappas;
+        std::sort(sorted.begin(), sorted.end());
+        auto pick = [&](double p) {
+            int idx = (int)std::floor(p * (double)sorted.size());
+            if (idx < 0) idx = 0;
+            if (idx >= (int)sorted.size()) idx = (int)sorted.size() - 1;
+            return sorted[idx];
+        };
+        stats.kappaP50 = pick(0.50);
+        stats.kappaP75 = pick(0.75);
+        stats.kappaP90 = pick(0.90);
+        stats.kappaP95 = pick(0.95);
+        stats.kappaP99 = pick(0.99);
+        stats.kappaMax = sorted.back();
+    }
+
+    // --- Pass 2: cut -----------------------------------------------------
+    int maxChainId = -1;
+    for (const auto& pl : polys) if (pl.chainId > maxChainId) maxChainId = pl.chainId;
+    int nextChainId = maxChainId + 1;
+
+    std::vector<Polyline> cutOut;
+    cutOut.reserve(polys.size());
+    double sumThr = 0.0;
+    double thrMinAcc =  std::numeric_limits<double>::infinity();
+    double thrMaxAcc = -std::numeric_limits<double>::infinity();
+    int    thrCount = 0;
+
+    stats.inputArclen = 0.0;
+    for (const auto& pl : polys) {
+        stats.inputArclen += detail::polylineArclength(pl);
+    }
+
+    for (const auto& pl : polys) {
+        const int N = (int)pl.points.size();
+        if (opt.disableCut || N < 3) {
+            cutOut.push_back(pl);
+            continue;
+        }
+
+        auto kappas = detail::geodesicCurvatureProxy(pl);
+        if (kappas.empty()) {
+            cutOut.push_back(pl);
+            continue;
+        }
+
+        double thr;
+        if (opt.cutThresholdAbs > 0.0) {
+            thr = opt.cutThresholdAbs;
+        } else {
+            thr = detail::decideCutThreshold(kappas, opt.cutPercentile, opt.L_target);
+            if (std::isfinite(thr)) {
+                sumThr += thr;
+                thrMinAcc = std::min(thrMinAcc, thr);
+                thrMaxAcc = std::max(thrMaxAcc, thr);
+                ++thrCount;
+            }
+        }
+
+        // Translate kappa-array indices to polyline point indices.
+        std::vector<int> cutIndices;
+        cutIndices.reserve(kappas.size());
+        if (pl.isClosed) {
+            for (int k = 0; k < (int)kappas.size(); ++k) {
+                if (kappas[k] > thr) cutIndices.push_back(k);
+            }
+        } else {
+            // kappa[k] corresponds to point index k+1 in [1, N-2].
+            for (int k = 0; k < (int)kappas.size(); ++k) {
+                if (kappas[k] > thr) cutIndices.push_back(k + 1);
+            }
+        }
+
+        if (cutIndices.empty()) {
+            cutOut.push_back(pl);
+            continue;
+        }
+
+        std::vector<Polyline> subs = pl.isClosed
+            ? detail::cutClosedAtIndices(pl, cutIndices)
+            : detail::cutOpenAtIndices(pl, cutIndices);
+
+        // Assign fresh chainIds to every sub-chain produced by a cut.
+        // Skip degenerate (<2 pts) remnants so they don't inflate counts.
+        for (auto& sub : subs) {
+            if ((int)sub.points.size() < 2) continue;
+            sub.chainId = nextChainId++;
+            cutOut.push_back(std::move(sub));
+        }
+        stats.cutsApplied += (int)cutIndices.size();
+    }
+    stats.afterCutPolylines = (int)cutOut.size();
+    stats.cutArclen = 0.0;
+    for (const auto& pl : cutOut) stats.cutArclen += detail::polylineArclength(pl);
+    if (thrCount > 0) {
+        stats.thresholdSamples = thrCount;
+        stats.thrMin  = thrMinAcc;
+        stats.thrMax  = thrMaxAcc;
+        stats.thrMean = sumThr / (double)thrCount;
+    }
+
+    // Length histogram (before prune).
+    for (const auto& pl : cutOut) {
+        double L = detail::polylineArclength(pl);
+        int b = detail::lengthBucketIndex(L, opt.L_target);
+        if (b >= 0 && b < 5) ++stats.lenHistBefore[b];
+    }
+
+    // --- Pass 3: prune ---------------------------------------------------
+    std::vector<Polyline> finalOut;
+    finalOut.reserve(cutOut.size());
+    const double Lmin = stats.effectiveMinChainLength;
+    for (auto& pl : cutOut) {
+        double L = detail::polylineArclength(pl);
+        if (!opt.disablePrune && L < Lmin) {
+            ++stats.prunedPolylines;
+            continue;
+        }
+        finalOut.push_back(std::move(pl));
+    }
+    stats.afterPrunePolylines = (int)finalOut.size();
+
+    for (const auto& pl : finalOut) {
+        double L = detail::polylineArclength(pl);
+        int b = detail::lengthBucketIndex(L, opt.L_target);
+        if (b >= 0 && b < 5) ++stats.lenHistAfter[b];
+        stats.outputArclen += L;
+        if (pl.family >= 0 && pl.family < 3) ++stats.familyCountsAfter[pl.family];
+    }
+
+    // Output-side kappa sanity stats.
+    {
+        std::vector<double> outK;
+        for (const auto& pl : finalOut) {
+            for (double k : detail::geodesicCurvatureProxy(pl)) outK.push_back(k);
+        }
+        if (!outK.empty()) {
+            std::sort(outK.begin(), outK.end());
+            auto pick = [&](double p) {
+                int idx = (int)std::floor(p * (double)outK.size());
+                if (idx < 0) idx = 0;
+                if (idx >= (int)outK.size()) idx = (int)outK.size() - 1;
+                return outK[idx];
+            };
+            stats.outKappaP95 = pick(0.95);
+            stats.outKappaP99 = pick(0.99);
+            stats.outKappaMax = outK.back();
+        }
+    }
+
+    return finalOut;
+}
+
+// Convenience wrapper: rebuild polylines from ProjectedSegments, run
+// cut + prune, re-emit ProjectedSegments with the rewritten chainIds.
+inline std::vector<ProjectedSegment> cutAndPruneProjectedSegments(
+    const std::vector<ProjectedSegment>& in,
+    const CutPruneOptions&               opt,
+    CutPruneStats&                       stats)
+{
+    auto polys = buildOrderedPolylines(in);
+    auto kept  = cutAndPrunePolylines(std::move(polys), opt, stats);
+    return polylinesToSegments(kept);
 }
 
 } // namespace wgf
