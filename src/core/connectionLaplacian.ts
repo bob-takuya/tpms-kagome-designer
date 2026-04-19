@@ -28,6 +28,16 @@ import { cotangentWeight, getHalfEdgeStart } from './halfEdge';
 export interface Isoline {
   points: THREE.Vector3[];
   faceIndices: number[];
+  /** Family index this chain belongs to (0..2). Set by importers that
+   *  split per-family buckets into per-chain entries. -1 if unknown. */
+  family?: number;
+  /** Iso-level index within the family (v3+ wgf-output). -1 if unknown. */
+  isoLevel?: number;
+  /** Native chainId from the WGF tracer (v2+ wgf-output). -1 if unknown. */
+  chainId?: number;
+  /** Per-chain classification flag (v4+):
+   *  0=normal, 1=cut chain, 2=fast-path chain, -1 if unknown. */
+  flag?: number;
 }
 
 export interface StripeFieldResult {

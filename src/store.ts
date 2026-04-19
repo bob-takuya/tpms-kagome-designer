@@ -33,7 +33,8 @@ export interface IsolineViewParams {
   /** 'ribbon' → TubeGeometry per chain, 'line' → thin LineSegments (debug). */
   mode:         'ribbon' | 'line';
   /** Minimum number of segments a chain must have to be drawn. Short
-   *  "tanzaku" chains get pruned so the viewport isn't flooded. */
+   *  "tanzaku" chains get pruned so the viewport isn't flooded.
+   *  Applies to BOTH the chain overlay and the kagome strip ribbons. */
   minChainSegs: number;
   /** Tube radius in world units (before mm-per-unit scaling). */
   tubeRadius:   number;
@@ -46,6 +47,29 @@ export interface IsolineViewParams {
    *  exposing this as a user-adjustable slider lets us diagnose the
    *  projection bug without rebuilding the WASM module. */
   adjacencyEps: number;
+  /** Bitmask of visible families (bit k → family k). Default 0b111 = all on. */
+  familyMask:   number;
+  /** Bitmask of visible iso-levels (bit k → iso-level k). Up to 32 levels.
+   *  Chains with isoLevel<0 (v1/v2 imports without per-level info) are
+   *  always shown. Default 0xFFFFFFFF = all on. */
+  isoLevelMask: number;
+  /** Highlight cut chains (v4 flag=1) in a distinct colour. */
+  highlightCutChains: boolean;
+  /** Highlight fast-path chains (v4 flag=2) in a distinct colour. */
+  highlightFastChains: boolean;
+}
+
+/** Capability + version info detected from the most recently loaded
+ *  wgf-output file (or from the in-browser pipeline). Drives which
+ *  filter widgets the sidebar exposes. */
+export interface WgfMeta {
+  /** Detected file version (1..4). 0 = nothing loaded yet. */
+  version:      number;
+  /** Number of iso-levels reported in META (v3+). 0 means "filter UI off". */
+  numIsoLevels: number;
+  hasResample:  boolean;
+  hasCut:       boolean;
+  hasPrune:     boolean;
 }
 
 export interface DevelopParams {
@@ -66,6 +90,7 @@ export interface AppState {
   isolineView: IsolineViewParams;
   develop: DevelopParams;
   export: ExportParams;
+  wgfMeta: WgfMeta;
   viewMode: '3d' | '2d';
   sidebarCollapsed: boolean;
   stats: {
@@ -84,6 +109,7 @@ export interface AppActions {
   setIsolineView: (params: Partial<IsolineViewParams>) => void;
   setDevelop: (params: Partial<DevelopParams>) => void;
   setExport: (params: Partial<ExportParams>) => void;
+  setWgfMeta: (meta: Partial<WgfMeta>) => void;
   setViewMode: (mode: '3d' | '2d') => void;
   toggleSidebar: () => void;
   setStats: (stats: Partial<AppState['stats']>) => void;
@@ -121,6 +147,10 @@ const defaultState: AppState = {
     tubeRadius:   0.02,
     chainIdColor: false,
     adjacencyEps: 1e-6,
+    familyMask:   0b111,
+    isoLevelMask: 0xFFFFFFFF >>> 0,    // unsigned 32-bit, all bits set
+    highlightCutChains:  false,
+    highlightFastChains: false,
   },
   develop: {
     scale: 50,   // mm per TPMS world unit (1 unit ≈ 50 mm → period ≈ 314 mm)
@@ -129,6 +159,13 @@ const defaultState: AppState = {
   export: {
     includeHoleIds: true,
     includeFoldLines: true,
+  },
+  wgfMeta: {
+    version:      0,
+    numIsoLevels: 0,
+    hasResample:  false,
+    hasCut:       false,
+    hasPrune:     false,
   },
   viewMode: '3d',
   sidebarCollapsed: false,
@@ -151,6 +188,7 @@ export const store = createStore<AppState & AppActions>((set, get) => ({
     set((state) => ({ isolineView: { ...state.isolineView, ...params } })),
   setDevelop: (params) => set((state) => ({ develop: { ...state.develop, ...params } })),
   setExport: (params) => set((state) => ({ export: { ...state.export, ...params } })),
+  setWgfMeta: (meta) => set((state) => ({ wgfMeta: { ...state.wgfMeta, ...meta } })),
   setViewMode: (mode) => set({ viewMode: mode }),
   toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
   setStats: (stats) => set((state) => ({ stats: { ...state.stats, ...stats } })),
