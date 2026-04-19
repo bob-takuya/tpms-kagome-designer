@@ -314,6 +314,16 @@ inline std::vector<Polyline> buildOrderedPolylines(
 // Step B: near-uniform resample.
 // ---------------------------------------------------------------------------
 
+// Open-chain tuning constants (E-1.6). Bumped from 1.5/3 to 2.5/5 so that
+// medium-shrink open chains (L/target ~ 1.5-2.5, n=3 -> 30-62% shrink in
+// production data) take the fast-path or get enough samples (>=4 chords)
+// to follow curvature. Kept as named constants so future tuning lives in
+// one place. Closed-loop constants stay inline at their call sites because
+// the closed path is already within tolerance and we want changes here to
+// not bleed across.
+constexpr double OPEN_FASTPATH_MULT = 2.5;
+constexpr int    OPEN_MIN_N         = 5;
+
 // Returns true when the short-chain fast-path kicked in (input preserved
 // verbatim). Caller uses this to count openFastPath vs openResampled.
 inline bool resampleOpenChain(
@@ -344,15 +354,16 @@ inline bool resampleOpenChain(
         return true;
     }
 
-    // Short-chain fast-path (E-1.5): when the total arclength is shorter
-    // than ~1.5 * target, resampling would force n=2 and collapse the
-    // polyline to a single chord — losing up to ~97% of the arclength
-    // (worst case seen in production: L=0.054, target=0.042 -> n=2 ->
-    // 97% shrink). Instead, preserve the input verbatim. PR #24 / #25
-    // already guarantee 3D endpoint continuity across adjacent cover
-    // segments, so emitting the input points directly keeps arclength
-    // and shape exactly.
-    if (!disableFastPath && totalLen < L_target * 1.5) {
+    // Short-chain fast-path (E-1.5, widened in E-1.6): when the total
+    // arclength is shorter than OPEN_FASTPATH_MULT * target, resampling
+    // produces too few sample points to follow curvature and the chord
+    // sum collapses below the input arclength. Production data after
+    // PR #27 still showed open chains with L/target in the 1.5-2.9 range
+    // shrinking 30-62%, all from the n=3 (2-chord) regime. Preserve the
+    // input verbatim instead. PR #24 / #25 already guarantee 3D endpoint
+    // continuity across adjacent cover segments, so emitting the input
+    // points directly keeps arclength and shape exactly.
+    if (!disableFastPath && totalLen < L_target * OPEN_FASTPATH_MULT) {
         output = input;
         outFaceIds = inFaceIds;
         return true;
@@ -361,9 +372,10 @@ inline bool resampleOpenChain(
     // ceil instead of round biases n upward when L/target has a fractional
     // part, shortening each segment below target and making the chord sum
     // track arclength more faithfully. The "+1" converts segments to sample
-    // points, and max(3, ...) guarantees at least 2 output segments (3 points)
-    // so we never collapse to a single chord even when rounding would pick n=2.
-    int n = std::max(3, (int)std::ceil(totalLen / std::max(L_target, 1e-30)) + 1);
+    // points; OPEN_MIN_N guarantees at least 4 output segments (5 points)
+    // for chains that just clear the fast-path cutoff, where n=3 would
+    // otherwise reproduce the medium-shrink regime we just widened past.
+    int n = std::max(OPEN_MIN_N, (int)std::ceil(totalLen / std::max(L_target, 1e-30)) + 1);
     output.reserve(n);
     outFaceIds.reserve(n);
 
