@@ -213,6 +213,11 @@ export async function regeneratePattern(
     onProgress,
   );
 
+  if (wgf.meta) {
+    store.getState().setWgfMeta(wgf.meta);
+    window.dispatchEvent(new CustomEvent('wgf-meta-updated'));
+  }
+
   applyIsolinesToScene(ctx, wgf.isolinesByFamily);
 }
 
@@ -278,6 +283,11 @@ function applyIsolinesToScene(
     widthFallback,
   );
 
+  // Build a quick stripId → strip lookup so we can attach per-chain
+  // filter metadata (isoLevel/chainSegs) onto the rendered mesh.
+  const stripById = new Map<string, typeof strips[number]>();
+  for (const s of strips) stripById.set(s.id, s);
+
   console.group(`[Viewport] adding ${stripThreeMeshes.length} strip meshes to scene`);
   for (const m of stripThreeMeshes) {
     const ud  = m.userData as { stripId: string; family: number; layer: number };
@@ -285,12 +295,22 @@ function applyIsolinesToScene(
     geo.computeBoundingSphere();
     const bs  = geo.boundingSphere;
     const mat = m.material as THREE.MeshBasicMaterial;
+    // Enrich userData with the filter inputs renderIsolines() consults.
+    // Iso-level is read from either of the strip's two source isolines
+    // (they match for non-junction strips). chainSegs uses centerline
+    // length so the same minChainSegs slider acts on both the chain
+    // overlay and the kagome ribbons.
+    const strip = stripById.get(ud.stripId);
+    const lvl   = strip?.isolines?.[0]?.isoLevel ?? strip?.isolines?.[1]?.isoLevel ?? -1;
+    const segs  = strip ? Math.max(0, strip.centerline.length - 1) : 0;
+    Object.assign(m.userData, { isoLevel: lvl, chainSegs: segs });
     console.log(
       `  ${ud.stripId.padEnd(3)} visible=${m.visible} ` +
       `frustumCulled=${m.frustumCulled} ` +
       `color=#${mat.color.getHexString()} ` +
       `opacity=${mat.opacity} transparent=${mat.transparent} ` +
-      `bs.r=${bs?.radius?.toFixed(3) ?? 'null'}`,
+      `bs.r=${bs?.radius?.toFixed(3) ?? 'null'} ` +
+      `lvl=${lvl} segs=${segs}`,
     );
     ctx.stripMeshes.add(m);
   }
@@ -322,17 +342,41 @@ export function renderIsolines(ctx: Viewport3DContext): void {
   if (!ctx.isolinesByFamily) return;
 
   const state = store.getState();
-  const { mode, minChainSegs, tubeRadius, chainIdColor, adjacencyEps } =
-    state.isolineView;
+  const {
+    mode, minChainSegs, tubeRadius, chainIdColor, adjacencyEps,
+    familyMask, isoLevelMask, highlightCutChains, highlightFastChains,
+  } = state.isolineView;
   const famColors = state.kagome.layerColors;
+
+  // Distinct accent colours for v4 chain classes (only used when the
+  // user enabled the corresponding toggle).
+  const cutColor  = new THREE.Color(0xff5577);
+  const fastColor = new THREE.Color(0x55ddff);
 
   let kept = 0;
   let pruned = 0;
+  let filtered = 0;
   let chainIdx = 0;
 
   for (let k = 0; k < 3; k++) {
+    if ((familyMask & (1 << k)) === 0) continue;
     const famColor = new THREE.Color(famColors[k]);
     for (const iso of ctx.isolinesByFamily[k]) {
+      // Per-chain iso-level filter. -1 means "unknown" (v1/v2 imports);
+      // those are always shown so old files keep working.
+      const lvl = iso.isoLevel ?? -1;
+      if (lvl >= 0 && lvl < 32 && (isoLevelMask & (1 << lvl)) === 0) {
+        filtered++;
+        continue;
+      }
+
+      // Pick an override colour for v4 chain classes if the user asked
+      // for highlighting. Falls through to the family colour otherwise.
+      const flag = iso.flag ?? -1;
+      let chainOverride: THREE.Color | null = null;
+      if      (highlightCutChains  && flag === 1) chainOverride = cutColor;
+      else if (highlightFastChains && flag === 2) chainOverride = fastColor;
+
       // Segments arrive as flat [a0,b0, a1,b1, ...] pairs. Split into
       // connected sub-polylines: consecutive pairs that share an
       // endpoint form one continuous chain. Disjoint pairs (v1 files,
@@ -340,12 +384,18 @@ export function renderIsolines(ctx: Viewport3DContext): void {
       const polylines = segmentsToPolylines(iso.points, adjacencyEps);
 
       for (const pts of polylines) {
+        // Prune short chains in BOTH ribbon and line modes — earlier
+        // versions of this branch only honoured the threshold for the
+        // line overlay, leaving the viewport flooded with sub-segment
+        // tubes when users dialled the slider up.
         if (pts.length - 1 < minChainSegs) { pruned++; continue; }
         kept++;
 
-        const color = chainIdColor
-          ? rainbowColor(chainIdx++)
-          : famColor;
+        const color = chainOverride
+          ? chainOverride
+          : chainIdColor
+            ? rainbowColor(chainIdx++)
+            : famColor;
 
         if (mode === 'ribbon') {
           ctx.isolineGroup.add(buildTubeMesh(pts, color, tubeRadius));
@@ -358,8 +408,52 @@ export function renderIsolines(ctx: Viewport3DContext): void {
 
   console.log(
     `[Viewport] isolines: mode=${mode} radius=${tubeRadius} ` +
-    `minSegs=${minChainSegs} kept=${kept} pruned=${pruned}`,
+    `minSegs=${minChainSegs} kept=${kept} pruned=${pruned} ` +
+    `filtered=${filtered} famMask=${familyMask.toString(2)} ` +
+    `lvlMask=${isoLevelMask.toString(2)}`,
   );
+
+  // Strip-ribbon visibility piggybacks on the same filters so the
+  // kagome ribbons (rendered to ctx.stripMeshes, not isolineGroup)
+  // also disappear when the user hides a family / iso-level / short
+  // chain. This is done in-place to avoid rebuilding strip geometries.
+  applyStripVisibilityFilters(ctx);
+}
+
+/**
+ * Toggle per-strip visibility on the kagome ribbon meshes according to
+ * the current `isolineView` filters. Cheap (O(strips)) — runs on every
+ * isoline-view-changed event.
+ *
+ * The strip meshes are tagged with `userData.family`, `userData.isoLevel`
+ * and `userData.chainSegs` at build time (see applyIsolinesToScene), so
+ * we don't need to walk back into the kagome data structures.
+ */
+function applyStripVisibilityFilters(ctx: Viewport3DContext): void {
+  const { minChainSegs, familyMask, isoLevelMask } = store.getState().isolineView;
+  let hidden = 0;
+  for (const child of ctx.stripMeshes.children) {
+    const ud = child.userData as {
+      stripId?: string;
+      family?: number;
+      isoLevel?: number;
+      chainSegs?: number;
+    };
+    if (ud.stripId === undefined) continue;        // junctions etc.
+    let visible = true;
+    if (ud.family !== undefined && (familyMask & (1 << ud.family)) === 0) visible = false;
+    if (visible && ud.isoLevel !== undefined && ud.isoLevel >= 0 && ud.isoLevel < 32) {
+      if ((isoLevelMask & (1 << ud.isoLevel)) === 0) visible = false;
+    }
+    if (visible && ud.chainSegs !== undefined && ud.chainSegs < minChainSegs) {
+      visible = false;
+    }
+    if (child.visible !== visible) hidden += visible ? 0 : 1;
+    child.visible = visible;
+  }
+  if (hidden > 0) {
+    console.log(`[Viewport] strip ribbons hidden by filter: ${hidden}`);
+  }
 }
 
 /**
@@ -542,6 +636,10 @@ export function applyImportedPattern(
   clearGroup(ctx.stripMeshes);
   clearGroup(ctx.isolineGroup);
   const geo = applyParsedWgfResult(parsed);
+  if (geo.meta) {
+    store.getState().setWgfMeta(geo.meta);
+    window.dispatchEvent(new CustomEvent('wgf-meta-updated'));
+  }
   applyIsolinesToScene(ctx, geo.isolinesByFamily);
 }
 

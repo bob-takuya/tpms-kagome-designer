@@ -308,6 +308,7 @@ declare global {
     'regenerate-unfold': CustomEvent;
     'update-colors': CustomEvent;
     'isoline-view-changed': CustomEvent;
+    'wgf-meta-updated': CustomEvent;
     'export-dxf': CustomEvent;
     'export-svg': CustomEvent;
     'export-csv': CustomEvent;

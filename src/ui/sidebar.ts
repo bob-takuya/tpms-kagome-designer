@@ -190,13 +190,37 @@ function createIsolineViewControls(): string {
     </div>
     <div class="control-group">
       <label for="iso-min-segs">最小 chain セグメント数</label>
-      <input type="range" id="iso-min-segs" min="1" max="50" step="1" value="${v.minChainSegs}">
+      <input type="range" id="iso-min-segs" min="1" max="300" step="1" value="${v.minChainSegs}">
       <span class="value-display" id="iso-min-segs-value">${v.minChainSegs}</span>
     </div>
     <div class="control-group">
       <label for="iso-tube-radius">Tube 半径 (world units)</label>
       <input type="range" id="iso-tube-radius" min="0.005" max="0.1" step="0.005" value="${v.tubeRadius}">
       <span class="value-display" id="iso-tube-radius-value">${v.tubeRadius.toFixed(3)}</span>
+    </div>
+    <div class="control-group">
+      <label>Family filter</label>
+      <div class="toggle-row" id="iso-family-row">
+        ${renderFamilyToggles(v.familyMask)}
+      </div>
+    </div>
+    <div class="control-group" id="iso-level-group" style="display:none">
+      <label>
+        Iso-level filter
+        <small id="iso-level-version-note"></small>
+      </label>
+      <div class="toggle-row" id="iso-level-row"></div>
+    </div>
+    <div class="control-group" id="iso-flag-group" style="display:none">
+      <label>v4 chain class</label>
+      <label for="iso-hl-cut">
+        <input type="checkbox" id="iso-hl-cut" ${v.highlightCutChains ? 'checked' : ''}>
+        cut chain を強調
+      </label>
+      <label for="iso-hl-fast">
+        <input type="checkbox" id="iso-hl-fast" ${v.highlightFastChains ? 'checked' : ''}>
+        fast-path chain を強調
+      </label>
     </div>
     <div class="control-group">
       <label for="iso-rainbow">
@@ -214,7 +238,30 @@ function createIsolineViewControls(): string {
         <option value="1e-2" ${v.adjacencyEps === 1e-2 ? 'selected' : ''}>1e-2 (loose)</option>
       </select>
     </div>
+    <div class="control-group">
+      <small id="wgf-version-line" class="muted">wgf-output: (none loaded)</small>
+    </div>
   `;
+}
+
+function renderFamilyToggles(mask: number): string {
+  const labels = ['A', 'B', 'C'];
+  return labels.map((lbl, k) => {
+    const on = (mask & (1 << k)) !== 0;
+    return `<button type="button" class="toggle-btn-pill ${on ? 'on' : 'off'}" data-fam="${k}">${lbl}</button>`;
+  }).join('');
+}
+
+function renderIsoLevelToggles(mask: number, count: number): string {
+  if (count <= 0) return '';
+  const buttons: string[] = [];
+  for (let k = 0; k < count; k++) {
+    const on = (mask & (1 << k)) !== 0;
+    buttons.push(
+      `<button type="button" class="toggle-btn-pill ${on ? 'on' : 'off'}" data-iso="${k}">${k}</button>`,
+    );
+  }
+  return buttons.join('');
 }
 
 function createDevelopControls(): string {
@@ -421,6 +468,50 @@ function setupEventListeners(): void {
     window.dispatchEvent(new CustomEvent('isoline-view-changed'));
   });
 
+  // Family-toggle pills
+  document.getElementById('iso-family-row')?.addEventListener('click', (e) => {
+    const t = e.target as HTMLElement;
+    const famAttr = t.getAttribute('data-fam');
+    if (famAttr === null) return;
+    const k = parseInt(famAttr, 10);
+    const cur = store.getState().isolineView.familyMask;
+    const next = cur ^ (1 << k);
+    store.getState().setIsolineView({ familyMask: next });
+    t.classList.toggle('on');
+    t.classList.toggle('off');
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+
+  // Iso-level toggle pills (delegated; the row is repopulated when META updates)
+  document.getElementById('iso-level-row')?.addEventListener('click', (e) => {
+    const t = e.target as HTMLElement;
+    const isoAttr = t.getAttribute('data-iso');
+    if (isoAttr === null) return;
+    const k = parseInt(isoAttr, 10);
+    const cur = store.getState().isolineView.isoLevelMask;
+    const next = (cur ^ (1 << k)) >>> 0;   // keep unsigned
+    store.getState().setIsolineView({ isoLevelMask: next });
+    t.classList.toggle('on');
+    t.classList.toggle('off');
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+
+  document.getElementById('iso-hl-cut')?.addEventListener('change', (e) => {
+    const on = (e.target as HTMLInputElement).checked;
+    store.getState().setIsolineView({ highlightCutChains: on });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+  document.getElementById('iso-hl-fast')?.addEventListener('change', (e) => {
+    const on = (e.target as HTMLInputElement).checked;
+    store.getState().setIsolineView({ highlightFastChains: on });
+    window.dispatchEvent(new CustomEvent('isoline-view-changed'));
+  });
+
+  // Refresh version-aware widgets when an import/generate publishes new META.
+  window.addEventListener('wgf-meta-updated', refreshWgfMetaUI);
+  // Initial pass so the version line is consistent at load time.
+  refreshWgfMetaUI();
+
   // ── Kagome controls (store-only) ────────────────────────────────────────────
   setupSlider('hole-radius', 'range', (value) => {
     const v = parseFloat(value);
@@ -516,6 +607,60 @@ function setupSlider(id: string, type: string, onChange: (value: string) => void
     }
     onChange(value);
   });
+}
+
+/**
+ * Re-render the version-dependent parts of the Isoline-view section
+ * after a wgf-output file is loaded (or the in-browser pipeline runs).
+ *
+ *   v1/v2 → only family filter + min-segs slider
+ *   v3+   → also iso-level toggle row (count from META)
+ *   v4    → also cut/fast-path highlight toggles
+ *
+ * Filters never disappear from the store — they just stop being shown
+ * in the sidebar. That way an old session's familyMask stays valid if a
+ * v4 file is reloaded later.
+ */
+function refreshWgfMetaUI(): void {
+  const meta = store.getState().wgfMeta;
+  const view = store.getState().isolineView;
+
+  const versionLine = document.getElementById('wgf-version-line');
+  if (versionLine) {
+    if (meta.version === 0) {
+      versionLine.textContent = 'wgf-output: (none loaded)';
+    } else {
+      const caps: string[] = [];
+      if (meta.hasResample) caps.push('resample');
+      if (meta.hasCut)      caps.push('cut');
+      if (meta.hasPrune)    caps.push('prune');
+      const capStr = caps.length ? ` [${caps.join(',')}]` : '';
+      versionLine.textContent =
+        `wgf-output: v${meta.version}` +
+        (meta.numIsoLevels > 0 ? ` · ${meta.numIsoLevels} iso-levels` : '') +
+        capStr;
+    }
+  }
+
+  const levelGroup = document.getElementById('iso-level-group') as HTMLElement | null;
+  const levelRow   = document.getElementById('iso-level-row');
+  const versionNote = document.getElementById('iso-level-version-note');
+  if (levelGroup && levelRow) {
+    if (meta.numIsoLevels > 0) {
+      levelGroup.style.display = '';
+      levelRow.innerHTML = renderIsoLevelToggles(view.isoLevelMask, meta.numIsoLevels);
+      if (versionNote) versionNote.textContent = ` (v${meta.version})`;
+    } else {
+      levelGroup.style.display = 'none';
+      levelRow.innerHTML = '';
+      if (versionNote) versionNote.textContent = '';
+    }
+  }
+
+  const flagGroup = document.getElementById('iso-flag-group') as HTMLElement | null;
+  if (flagGroup) {
+    flagGroup.style.display = (meta.version >= 4 || meta.hasCut) ? '' : 'none';
+  }
 }
 
 export function downloadFile(content: string, filename: string, mimeType: string): void {

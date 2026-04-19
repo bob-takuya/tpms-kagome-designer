@@ -21,17 +21,28 @@
  *
  * Output file (what the CLI writes, what the browser reads):
  *
- *   # wgf-output v2
+ *   # wgf-output vN          (N=2,3,4 — see version table below)
  *   META initialCurl=... finalCurl=... iterations=... numSingular=...
  *        segments=... components=... fam0=... fam1=... fam2=...
+ *        [numIsoLevels=8]                       (v3+, optional)
+ *        [resample=1] [cut=1] [prune=1]         (v3/v4 capability flags, optional)
  *   SEG <nSeg>
- *   ax ay az bx by bz family baseFaceIdx chainId
+ *   ax ay az bx by bz family baseFaceIdx [chainId] [isoLevel] [flag]
  *   ...
  *   END
  *
- * v1 compatibility: old 8-column rows (no chainId) still parse; the
- * missing chainId field is filled with -1 ("unknown"). Downstream
- * code falls back to the pre-chain behaviour in that case.
+ * Version table (header + per-segment columns):
+ *   v1   8 cols                                  legacy
+ *   v2   9 cols  (+chainId)                      one polyline per chain
+ *   v3  10 cols  (+isoLevel)                     resampled along chain
+ *   v4  11 cols  (+flag: 0=normal,1=cut,2=fast)  cut + prune applied
+ *
+ * The parser is permissive: missing trailing columns are filled with -1
+ * ("unknown") so a v3/v4 reader transparently consumes older files, and
+ * a v2-aware reader gracefully ignores the extra v3/v4 columns it does
+ * not understand. The detected version is reported back to the caller
+ * in `ParsedWgfResult.version` so the UI can light up the matching
+ * controls (iso-level filter, cut-chain colouring, …).
  */
 
 import type { HalfEdgeMesh } from './halfEdge';
@@ -87,9 +98,19 @@ export interface ParsedWgfSegment {
   // field was absent (v1 file) or unknown — readers should fall back
   // to the old per-family bucketing behaviour.
   chainId: number;
+  // Iso-level index within (family, baseComponent). -1 if absent (v1/v2).
+  // All segments of one chain share the same isoLevel.
+  isoLevel: number;
+  // Per-segment classification flag (v4+). -1 if absent.
+  //   0 = regular chain segment
+  //   1 = cut segment (split at sharp corner / singularity)
+  //   2 = fast-path segment (resampled / topologically straight chain)
+  flag: number;
 }
 
 export interface ParsedWgfResult {
+  /** Detected file version (1..4). 0 means no version header found. */
+  version: number;
   segments: ParsedWgfSegment[];
   initialCurl: number;
   finalCurl:   number;
@@ -97,11 +118,18 @@ export interface ParsedWgfResult {
   numSingular: number;
   numComponents: number;
   familyCounts: [number, number, number];
+  /** Number of iso-levels declared in META (v3+). 0 if absent. */
+  numIsoLevels: number;
+  /** Capability flags advertised by the producer in META. */
+  hasResample: boolean;
+  hasCut:      boolean;
+  hasPrune:    boolean;
 }
 
 export function parseResultText(text: string): ParsedWgfResult {
   const lines = text.split(/\r?\n/);
   const result: ParsedWgfResult = {
+    version: 0,
     segments: [],
     initialCurl: 0,
     finalCurl:   0,
@@ -109,6 +137,10 @@ export function parseResultText(text: string): ParsedWgfResult {
     numSingular: 0,
     numComponents: 0,
     familyCounts: [0, 0, 0],
+    numIsoLevels: 0,
+    hasResample: false,
+    hasCut:      false,
+    hasPrune:    false,
   };
 
   let i = 0;
@@ -116,7 +148,13 @@ export function parseResultText(text: string): ParsedWgfResult {
   while (i < n) {
     const raw = lines[i].trim();
     i++;
-    if (!raw || raw.startsWith('#')) continue;
+    if (!raw) continue;
+    if (raw.startsWith('#')) {
+      // "# wgf-output v3" — pull the integer that follows the trailing 'v'.
+      const m = raw.match(/wgf-output\s+v(\d+)/i);
+      if (m) result.version = parseInt(m[1], 10);
+      continue;
+    }
 
     const tokens = raw.split(/\s+/);
     const tag = tokens[0];
@@ -136,6 +174,10 @@ export function parseResultText(text: string): ParsedWgfResult {
           case 'fam0':          result.familyCounts[0] = parseInt(v, 10); break;
           case 'fam1':          result.familyCounts[1] = parseInt(v, 10); break;
           case 'fam2':          result.familyCounts[2] = parseInt(v, 10); break;
+          case 'numIsoLevels':  result.numIsoLevels  = parseInt(v, 10); break;
+          case 'resample':      result.hasResample   = v !== '0'; break;
+          case 'cut':           result.hasCut        = v !== '0'; break;
+          case 'prune':         result.hasPrune      = v !== '0'; break;
           default: /* ignore */ break;
         }
       }
@@ -161,14 +203,26 @@ export function parseResultText(text: string): ParsedWgfResult {
           bx: parseFloat(p[3]), by: parseFloat(p[4]), bz: parseFloat(p[5]),
           family:  parseInt(p[6], 10),
           faceIdx: parseInt(p[7], 10),
-          // v2: 9th column. Default to -1 for v1 (8-column) files.
-          chainId: p.length >= 9 ? parseInt(p[8], 10) : -1,
+          chainId:  p.length >=  9 ? parseInt(p[8],  10) : -1,
+          isoLevel: p.length >= 10 ? parseInt(p[9],  10) : -1,
+          flag:     p.length >= 11 ? parseInt(p[10], 10) : -1,
         });
       }
       continue;
     }
 
     if (tag === 'END') break;
+  }
+
+  // Fall back to inferring version from per-segment column count when the
+  // header was missing or unrecognised, so downstream UI still gets a
+  // sensible capability hint.
+  if (result.version === 0 && result.segments.length > 0) {
+    const s = result.segments[0];
+    if      (s.flag     >= 0) result.version = 4;
+    else if (s.isoLevel >= 0) result.version = 3;
+    else if (s.chainId  >= 0) result.version = 2;
+    else                      result.version = 1;
   }
 
   return result;
