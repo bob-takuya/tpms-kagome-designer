@@ -80,6 +80,31 @@ struct PipelineOptions {
     bool   resample           = true;
     double resampleLength     = 0.0;
     bool   resampleNoFastPath = false;
+
+    // Step 2 + 3: cut at high-curvature points, prune short segments.
+    //
+    // Both run after resample and use resampleLength as the scale for
+    // the adaptive threshold + absolute caps + prune length floor.
+    //
+    //   curvatureCut         : enable the cut pass (default on).
+    //   cutThresholdAbs      : absolute kappa threshold (1/length).
+    //                          > 0 overrides the per-chain adaptive rule.
+    //                          <= 0 means "adaptive" (per-chain p-th
+    //                          percentile clamped by absolute caps).
+    //   cutPercentile        : per-chain percentile used when the
+    //                          threshold is adaptive (default 0.95).
+    //   shortPrune           : enable the prune pass (default on).
+    //   minChainLengthAbs    : absolute minimum chain arclength.
+    //                          > 0 overrides the multiplier-based rule.
+    //                          <= 0 means L_target · minChainMult.
+    //   minChainMult         : multiplier on L_target for the minimum
+    //                          chain length (default 3.0).
+    bool   curvatureCut      = true;
+    double cutThresholdAbs   = 0.0;
+    double cutPercentile     = 0.95;
+    bool   shortPrune        = true;
+    double minChainLengthAbs = 0.0;
+    double minChainMult      = 3.0;
 };
 
 struct PipelineResult {
@@ -98,6 +123,13 @@ struct PipelineResult {
     // is true; left zero-initialised otherwise.
     bool          resampleApplied = false;
     ResampleStats resampleStats;
+
+    // Cut + prune pass (Vekhter §5.2 steps 2 & 3). Populated when
+    // opt.curvatureCut or opt.shortPrune is true; left zero-initialised
+    // otherwise. The two steps share a stats struct because their
+    // diagnostics are reported together.
+    bool           cutPruneApplied = false;
+    CutPruneStats  cutPruneStats;
 };
 
 inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt) {
@@ -480,9 +512,11 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         }
     }
 
-    // --- Post-processing: resample isolines to near-uniform length
-    //     (Vekhter §5.2, step 1). Cut / prune / extend come in later PRs.
-    if (opt.resample && !R.segments.empty()) {
+    // --- Post-processing: resample + cut + prune (Vekhter §5.2, steps 1-3).
+    //     Extend-to-crossings (step 4) will follow in a later PR.
+    const bool wantPostProc =
+        (opt.resample || opt.curvatureCut || opt.shortPrune) && !R.segments.empty();
+    if (wantPostProc) {
         double meshMean = meshMeanEdgeLength(base);
 
         // Auto-detect target length.
@@ -493,6 +527,10 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         // total arclength. Median of the *input* segment lengths tracks the
         // tracer's native sampling density, so the resample pass now only
         // uniformizes variance rather than downsampling.
+        //
+        // The same L_target is reused by the cut-threshold caps and the
+        // short-prune length floor, so we compute it once up front even when
+        // the resample pass itself is disabled.
         double L_target;
         const char* L_source;
         if (opt.resampleLength > 0.0) {
@@ -515,6 +553,7 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             }
         }
 
+    if (opt.resample) {
         ResampleStats rs;
         auto resampled = resampleProjectedSegments(
             R.segments, L_target, rs, opt.resampleNoFastPath);
@@ -660,7 +699,100 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         }
         R.resampleApplied = true;
         R.resampleStats   = rs;
-    }
+    } // end if (opt.resample)
+
+    // --- Cut + prune pass (Vekhter §5.2 steps 2 & 3) ---------------------
+    //
+    // Runs on whatever R.segments currently holds (resampled output if the
+    // previous step ran, raw tracer output otherwise). Uses the same
+    // L_target as the resample pass so that the adaptive threshold caps and
+    // the minimum chain length stay scale-aligned with the nominal segment
+    // size of the ribbon. When BOTH passes are disabled, R.segments is
+    // left untouched (regression-check path).
+    if (opt.curvatureCut || opt.shortPrune) {
+        CutPruneOptions cpOpt;
+        cpOpt.cutThresholdAbs   = opt.cutThresholdAbs;
+        cpOpt.cutPercentile     = opt.cutPercentile;
+        cpOpt.disableCut        = !opt.curvatureCut;
+        cpOpt.minChainLengthAbs = opt.minChainLengthAbs;
+        cpOpt.minChainMult      = opt.minChainMult;
+        cpOpt.disablePrune      = !opt.shortPrune;
+        cpOpt.L_target          = L_target;
+
+        CutPruneStats cps;
+        auto cpOut = cutAndPruneProjectedSegments(R.segments, cpOpt, cps);
+
+        std::fprintf(stderr,
+            "[postproc-cut] method=%s p=%.3f L_target=%.6f disableCut=%d disablePrune=%d\n",
+            cps.cutWasAdaptive ? "adaptive-percentile" : "absolute",
+            opt.cutPercentile, L_target,
+            cpOpt.disableCut ? 1 : 0, cpOpt.disablePrune ? 1 : 0);
+        if (cps.cutWasAdaptive && cps.thresholdSamples > 0) {
+            std::fprintf(stderr,
+                "[postproc-cut] threshold-stats: min=%.6f max=%.6f mean=%.6f "
+                "(over %d chains)\n",
+                cps.thrMin, cps.thrMax, cps.thrMean, cps.thresholdSamples);
+        } else if (!cps.cutWasAdaptive) {
+            std::fprintf(stderr,
+                "[postproc-cut] threshold=%.6f (absolute override)\n",
+                opt.cutThresholdAbs);
+        }
+        std::fprintf(stderr,
+            "[postproc-cut] kappa-dist-input: samples=%d p50=%.6f p75=%.6f "
+            "p90=%.6f p95=%.6f p99=%.6f max=%.6f\n",
+            cps.totalKappaSamples,
+            cps.kappaP50, cps.kappaP75, cps.kappaP90,
+            cps.kappaP95, cps.kappaP99, cps.kappaMax);
+        std::fprintf(stderr,
+            "[postproc-cut] input-polylines=%d cuts-applied=%d "
+            "output-polylines=%d\n",
+            cps.inputPolylines, cps.cutsApplied, cps.afterCutPolylines);
+        std::fprintf(stderr,
+            "[postproc-cut] kappa-dist-output: p95=%.6f p99=%.6f max=%.6f "
+            "(should sit below the input threshold band)\n",
+            cps.outKappaP95, cps.outKappaP99, cps.outKappaMax);
+
+        std::fprintf(stderr,
+            "[postproc-prune] min-length=%.6f method=%s\n",
+            cps.effectiveMinChainLength,
+            (opt.minChainLengthAbs > 0.0) ? "absolute" : "mult-of-L_target");
+        std::fprintf(stderr,
+            "[postproc-prune] length-hist before (<1L,<2L,<5L,<10L,>=10L): "
+            "[%d, %d, %d, %d, %d]\n",
+            cps.lenHistBefore[0], cps.lenHistBefore[1], cps.lenHistBefore[2],
+            cps.lenHistBefore[3], cps.lenHistBefore[4]);
+        std::fprintf(stderr,
+            "[postproc-prune] pruned=%d kept=%d\n",
+            cps.prunedPolylines, cps.afterPrunePolylines);
+        std::fprintf(stderr,
+            "[postproc-prune] length-hist after  (<1L,<2L,<5L,<10L,>=10L): "
+            "[%d, %d, %d, %d, %d]\n",
+            cps.lenHistAfter[0], cps.lenHistAfter[1], cps.lenHistAfter[2],
+            cps.lenHistAfter[3], cps.lenHistAfter[4]);
+
+        double inArc    = std::max(cps.inputArclen,  1e-30);
+        double arcDelta = 100.0 * std::fabs(cps.outputArclen - cps.inputArclen) / inArc;
+        std::fprintf(stderr,
+            "[postproc-summary] input=%d after-cut=%d after-prune=%d  "
+            "arclen input=%.6f cut=%.6f output=%.6f diff=%.3f%%\n",
+            cps.inputPolylines, cps.afterCutPolylines, cps.afterPrunePolylines,
+            cps.inputArclen, cps.cutArclen, cps.outputArclen, arcDelta);
+        std::fprintf(stderr,
+            "[postproc-summary] family counts after: fam0=%d fam1=%d fam2=%d\n",
+            cps.familyCountsAfter[0], cps.familyCountsAfter[1],
+            cps.familyCountsAfter[2]);
+
+        R.segments = std::move(cpOut);
+        R.numSegmentsFam[0] = R.numSegmentsFam[1] = R.numSegmentsFam[2] = 0;
+        for (const auto& s : R.segments) {
+            if (s.family >= 0 && s.family < 3) R.numSegmentsFam[s.family]++;
+        }
+        R.cutPruneApplied = true;
+        R.cutPruneStats   = cps;
+    } // end if (curvatureCut || shortPrune)
+
+    (void)L_source;  // only used by the resample pass' log line.
+    } // end if (wantPostProc)
 
     reportProgress(STAGE_DONE, 1, 1, "Done");
     return R;
