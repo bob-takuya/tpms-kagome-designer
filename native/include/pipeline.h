@@ -999,6 +999,16 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         int faceBuckets[5] = {0, 0, 0, 0, 0};
         // Per-family success counts (success == MAX_LENGTH outcome).
         int famSuccess[3] = {0, 0, 0};
+        // Rotation-angle histogram across all face transits (radians);
+        // buckets: <1°, <10°, <30°, ≥30°.
+        int rotBuckets[4] = {0, 0, 0, 0};
+        // Post-transport drift histogram (|t·n_to|) across all transits;
+        // buckets: <0.01, <0.1, <0.5, ≥0.5.
+        int driftBuckets[4] = {0, 0, 0, 0};
+        // First N DEGENERATE cases, dumped verbatim to stderr for root-cause
+        // analysis of the remaining collapses.
+        constexpr int kDegenSampleLimit = 20;
+        int degenSampleCount = 0;
 
         for (std::size_t i = 0; i < R.looseEnds.size(); ++i) {
             ExtensionPath p = extendLooseEnd(R.looseEnds[i], base, maxExt);
@@ -1034,6 +1044,59 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 if (fam >= 0 && fam < 3) ++famSuccess[fam];
             }
 
+            // Parallel-transport diagnostics.
+            for (double a : p.rotationAngles) {
+                const double deg = a * (180.0 / M_PI);
+                if      (deg < 1.0)  ++rotBuckets[0];
+                else if (deg < 10.0) ++rotBuckets[1];
+                else if (deg < 30.0) ++rotBuckets[2];
+                else                 ++rotBuckets[3];
+            }
+            for (double d : p.tangentDrifts) {
+                const double ad = std::abs(d);
+                if      (ad < 0.01) ++driftBuckets[0];
+                else if (ad < 0.1)  ++driftBuckets[1];
+                else if (ad < 0.5)  ++driftBuckets[2];
+                else                ++driftBuckets[3];
+            }
+
+            // First kDegenSampleLimit DEGENERATE cases: dump context so we
+            // can tell whether the collapse is happening on the first call
+            // (bad loose-end tangent) or after a transit (transport bug).
+            if (p.outcome == ExtensionPath::DEGENERATE &&
+                p.degenerateDiag.haveInfo &&
+                degenSampleCount < kDegenSampleLimit) {
+                const auto& d = p.degenerateDiag;
+                const char* phaseStr =
+                    (d.phase == ExtensionPath::DegenerateDiag::INITIAL)
+                        ? "initial" : "after-transit";
+                std::fprintf(stderr,
+                    "[postproc-extend-dry-degen-sample] #%d\n"
+                    "  looseEndIdx=%d chainId=%d family=%d phase=%s\n"
+                    "  current_face=%d num_faces_traversed=%d\n"
+                    "  current_pos=(%.9g, %.9g, %.9g)\n"
+                    "  current_tangent=(%.9g, %.9g, %.9g)\n"
+                    "  face_normal=(%.9g, %.9g, %.9g)\n"
+                    "  tangent_dot_normal=%.9g\n"
+                    "  projected_tangent=(%.9g, %.9g, %.9g) mag=%.9g\n"
+                    "  point_to_vertex_dists=(%.9g, %.9g, %.9g)\n"
+                    "  point_to_edge_dists=(%.9g, %.9g, %.9g)\n",
+                    degenSampleCount,
+                    (int)i,
+                    R.looseEnds[i].chainId, R.looseEnds[i].family,
+                    phaseStr,
+                    d.currentFace, d.numFacesTraversed,
+                    d.currentPos.x(), d.currentPos.y(), d.currentPos.z(),
+                    d.currentTangent.x(), d.currentTangent.y(), d.currentTangent.z(),
+                    d.faceNormal.x(), d.faceNormal.y(), d.faceNormal.z(),
+                    d.tangentDotNormal,
+                    d.projectedTangent.x(), d.projectedTangent.y(), d.projectedTangent.z(),
+                    d.projectedMag,
+                    d.pointToVertexDists[0], d.pointToVertexDists[1], d.pointToVertexDists[2],
+                    d.pointToEdgeDists[0],   d.pointToEdgeDists[1],   d.pointToEdgeDists[2]);
+                ++degenSampleCount;
+            }
+
             paths.push_back(std::move(p));
         }
 
@@ -1061,6 +1124,14 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             "[postproc-extend-dry] per-family: fam0-success=%d fam1-success=%d "
             "fam2-success=%d (success = max_length_reached)\n",
             famSuccess[0], famSuccess[1], famSuccess[2]);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] tangent-transport-hist (face-normal angle, "
+            "deg): <1=%d <10=%d <30=%d >=30=%d\n",
+            rotBuckets[0], rotBuckets[1], rotBuckets[2], rotBuckets[3]);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] tangent-drift-hist (|t . n_to| after "
+            "transport+nudge): <0.01=%d <0.1=%d <0.5=%d >=0.5=%d\n",
+            driftBuckets[0], driftBuckets[1], driftBuckets[2], driftBuckets[3]);
 
         R.extensionApplied   = true;
         R.extensionMaxLength = maxExt;
