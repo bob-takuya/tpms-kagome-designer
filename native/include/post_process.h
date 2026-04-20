@@ -1115,4 +1115,73 @@ inline std::vector<ProjectedSegment> cutAndPruneProjectedSegments(
     return polylinesToSegments(kept);
 }
 
+// ---------------------------------------------------------------------------
+// Step F: loose-end detection (Phase E-3, precursor to "extend to crossings").
+// ---------------------------------------------------------------------------
+//
+// A "loose end" is the start or end sample of an open polyline; closed
+// loops have none. These are the candidate attachment points for the
+// upcoming face-walking extension step (Vekhter §5.2 step 4). This stage
+// is observation-only: detectLooseEnds returns a flat list of endpoints
+// and never modifies the input polylines. Callers emit the resulting
+// diagnostics from the pipeline so the post-processed SEG output stays
+// bit-identical to a run with detection disabled.
+struct LooseEnd {
+    int  chainIdx;           // index into the polylines[] list passed in
+    int  chainId;            // v4 chainId echoed from the source polyline
+    bool isStart;            // true for the start endpoint, false for the end
+    Eigen::Vector3d pos;
+    Eigen::Vector3d tangent; // unit vector pointing OUT of the chain at pos
+    int  baseFaceIdx;        // base mesh face that pos lies on
+    int  family;
+};
+
+inline std::vector<LooseEnd> detectLooseEnds(
+    const std::vector<Polyline>& polylines)
+{
+    std::vector<LooseEnd> out;
+    out.reserve(polylines.size() * 2);
+    for (int ci = 0; ci < (int)polylines.size(); ++ci) {
+        const Polyline& pl = polylines[ci];
+        if (pl.isClosed) continue;
+        const int n = (int)pl.points.size();
+        if (n < 2) continue;
+        const auto& pts   = pl.points;
+        const auto& faces = pl.faceIds;
+
+        // Outward tangent at the start: from pts[1] toward pts[0].
+        Eigen::Vector3d ts = pts[0] - pts[1];
+        double ls = ts.norm();
+        if (ls > 1e-30) ts /= ls;
+        LooseEnd sEnd;
+        sEnd.chainIdx    = ci;
+        sEnd.chainId     = pl.chainId;
+        sEnd.isStart     = true;
+        sEnd.pos         = pts[0];
+        sEnd.tangent     = ts;
+        // faces[k] covers the segment (points[k] -> points[k+1]); the
+        // start endpoint lives on faces[0].
+        sEnd.baseFaceIdx = faces.empty() ? -1 : faces.front();
+        sEnd.family      = pl.family;
+        out.push_back(sEnd);
+
+        // Outward tangent at the end: from pts[n-2] toward pts[n-1].
+        Eigen::Vector3d te = pts[n-1] - pts[n-2];
+        double le = te.norm();
+        if (le > 1e-30) te /= le;
+        LooseEnd eEnd;
+        eEnd.chainIdx    = ci;
+        eEnd.chainId     = pl.chainId;
+        eEnd.isStart     = false;
+        eEnd.pos         = pts[n-1];
+        eEnd.tangent     = te;
+        // faces.size() == n - 1 for open chains, so faces.back() ==
+        // faces[n-2] covers the final segment.
+        eEnd.baseFaceIdx = faces.empty() ? -1 : faces.back();
+        eEnd.family      = pl.family;
+        out.push_back(eEnd);
+    }
+    return out;
+}
+
 } // namespace wgf

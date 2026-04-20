@@ -29,6 +29,7 @@
 #include "isolines.h"
 #include "paired_rounding.h"
 #include "post_process.h"
+#include "face_topology.h"
 #include "progress.h"
 
 #include <set>
@@ -105,6 +106,13 @@ struct PipelineOptions {
     bool   shortPrune        = true;
     double minChainLengthAbs = 0.0;
     double minChainMult      = 3.0;
+
+    // Phase E-3 step 4 preparation: detect open-polyline endpoints so that
+    // the distribution of candidate "extend to crossings" attachment points
+    // can be observed ahead of wiring up the extension pass. The detection
+    // stage never mutates R.segments; the SEG output stays bit-identical to
+    // a run with detectLooseEnds=false (regression check).
+    bool   detectLooseEnds   = true;
 };
 
 struct PipelineResult {
@@ -130,6 +138,14 @@ struct PipelineResult {
     // diagnostics are reported together.
     bool           cutPruneApplied = false;
     CutPruneStats  cutPruneStats;
+
+    // Loose-end detection (Phase E-3 observation-only). Populated when
+    // opt.detectLooseEnds is true; the list is just the start/end of every
+    // open polyline in the post-cut+prune output. SEG segments are not
+    // modified by this pass.
+    bool                  looseEndsDetected = false;
+    std::size_t           looseEndCount     = 0;
+    std::vector<LooseEnd> looseEnds;
 };
 
 inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt) {
@@ -513,9 +529,11 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
     }
 
     // --- Post-processing: resample + cut + prune (Vekhter §5.2, steps 1-3).
-    //     Extend-to-crossings (step 4) will follow in a later PR.
+    //     Loose-end detection runs alongside; the actual extend-to-crossings
+    //     pass (step 4) will follow in a later PR.
     const bool wantPostProc =
-        (opt.resample || opt.curvatureCut || opt.shortPrune) && !R.segments.empty();
+        (opt.resample || opt.curvatureCut || opt.shortPrune || opt.detectLooseEnds)
+        && !R.segments.empty();
     if (wantPostProc) {
         double meshMean = meshMeanEdgeLength(base);
 
@@ -790,6 +808,140 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         R.cutPruneApplied = true;
         R.cutPruneStats   = cps;
     } // end if (curvatureCut || shortPrune)
+
+    // --- Loose-end detection (Phase E-3, observation-only) -------------
+    //
+    // Rebuilds the post-cut+prune polyline list from R.segments and flags
+    // the start/end of every OPEN polyline. detectLooseEnds does not
+    // modify R.segments, so the SEG output on stdout stays bit-identical
+    // to a run with --no-detect-loose-ends. Diagnostics below characterise
+    // where loose ends concentrate so that the upcoming extend-to-crossings
+    // pass (§5.2 step 4) can be sized / validated against the observed
+    // distribution.
+    if (opt.detectLooseEnds && !R.segments.empty()) {
+        auto lePolys = buildOrderedPolylines(R.segments);
+        auto les     = detectLooseEnds(lePolys);
+
+        int nOpen = 0, nClosed = 0;
+        for (const auto& pl : lePolys) {
+            if (pl.isClosed) ++nClosed; else ++nOpen;
+        }
+
+        // Per-family and per-source (start vs end) counts.
+        int perFamily[3] = {0, 0, 0};
+        int fromStart = 0, fromEnd = 0;
+        for (const auto& e : les) {
+            if (e.family >= 0 && e.family < 3) ++perFamily[e.family];
+            if (e.isStart) ++fromStart; else ++fromEnd;
+        }
+
+        // Tangent-angle histogram. Take |tangent · n| so the sign of the
+        // face normal and the outward direction of the tangent drop out;
+        // the angle lands in [0°, 90°], where 90° means the tangent lies
+        // in the face plane (expected for on-surface loose ends).
+        int angBuckets[4] = {0, 0, 0, 0};  // [<10°, <30°, <60°, <90°]
+        for (const auto& e : les) {
+            if (e.baseFaceIdx < 0 || e.baseFaceIdx >= base.nF()) continue;
+            Eigen::Vector3d va = base.V.row(base.F(e.baseFaceIdx, 0));
+            Eigen::Vector3d vb = base.V.row(base.F(e.baseFaceIdx, 1));
+            Eigen::Vector3d vc = base.V.row(base.F(e.baseFaceIdx, 2));
+            Eigen::Vector3d nrm = (vb - va).cross(vc - va);
+            double nn = nrm.norm();
+            if (nn < 1e-30) continue;
+            nrm /= nn;
+            double tn = std::abs(e.tangent.dot(nrm));
+            if (tn > 1.0) tn = 1.0;
+            double angleDeg = std::acos(tn) * 180.0 / M_PI;
+            int idx = (angleDeg < 10.0) ? 0
+                    : (angleDeg < 30.0) ? 1
+                    : (angleDeg < 60.0) ? 2
+                    :                     3;
+            ++angBuckets[idx];
+        }
+
+        // Nearest different-family-segment distance. Bucket R.segments by
+        // baseFaceIdx, then probe the loose end's face plus its (up to
+        // three) 1-hop-adjacent faces. Limits the comparison to
+        // O(N_endpoints · k) where k is the local per-face segment
+        // density, vs a full O(N_endpoints · N_segments) sweep.
+        std::unordered_map<int, std::vector<int>> faceToSegs;
+        faceToSegs.reserve(R.segments.size() / 4 + 1);
+        for (int i = 0; i < (int)R.segments.size(); ++i) {
+            faceToSegs[R.segments[i].baseFaceIdx].push_back(i);
+        }
+        auto pointSegDist = [](const Eigen::Vector3d& p,
+                               const Eigen::Vector3d& a,
+                               const Eigen::Vector3d& b) {
+            Eigen::Vector3d ab = b - a;
+            double abab = ab.dot(ab);
+            if (abab < 1e-30) return (p - a).norm();
+            double t = (p - a).dot(ab) / abab;
+            if (t < 0.0) t = 0.0; else if (t > 1.0) t = 1.0;
+            return (a + t * ab - p).norm();
+        };
+        int distBuckets[5] = {0, 0, 0, 0, 0};
+        for (const auto& e : les) {
+            if (e.baseFaceIdx < 0) { ++distBuckets[4]; continue; }
+            double best = std::numeric_limits<double>::infinity();
+            auto probeFace = [&](int f) {
+                auto it = faceToSegs.find(f);
+                if (it == faceToSegs.end()) return;
+                for (int si : it->second) {
+                    const auto& s = R.segments[si];
+                    if (s.family == e.family) continue;
+                    double d = pointSegDist(e.pos, s.a, s.b);
+                    if (d < best) best = d;
+                }
+            };
+            probeFace(e.baseFaceIdx);
+            if (e.baseFaceIdx < base.nF()) {
+                int h0 = base.f2he[e.baseFaceIdx];
+                if (h0 >= 0) {
+                    int h1 = base.he[h0].next;
+                    int h2 = base.he[h1].next;
+                    int hs[3] = { h0, h1, h2 };
+                    for (int k = 0; k < 3; ++k) {
+                        int nf = oppositeFaceAcross(base, hs[k], e.baseFaceIdx);
+                        if (nf >= 0) probeFace(nf);
+                    }
+                }
+            }
+            if (!std::isfinite(best))                 ++distBuckets[4];
+            else if (best < 0.25 * L_target)          ++distBuckets[0];
+            else if (best < 0.5  * L_target)          ++distBuckets[1];
+            else if (best <        L_target)          ++distBuckets[2];
+            else if (best < 2.0  * L_target)          ++distBuckets[3];
+            else                                      ++distBuckets[4];
+        }
+
+        std::fprintf(stderr,
+            "[postproc-looseends] detected=%zu\n", les.size());
+        std::fprintf(stderr,
+            "[postproc-looseends] per-family: fam0=%d fam1=%d fam2=%d\n",
+            perFamily[0], perFamily[1], perFamily[2]);
+        std::fprintf(stderr,
+            "[postproc-looseends] per-chain-source: from-start=%d from-end=%d "
+            "(both should equal N_open=%d)\n",
+            fromStart, fromEnd, nOpen);
+        std::fprintf(stderr,
+            "[postproc-looseends] tangent-angle-hist (deg from face normal, "
+            "expect mass near 90deg): <10=%d <30=%d <60=%d <90=%d\n",
+            angBuckets[0], angBuckets[1], angBuckets[2], angBuckets[3]);
+        std::fprintf(stderr,
+            "[postproc-looseends] nearest-different-family-segment-dist "
+            "(L_target=%.6f): <0.25L=%d <0.5L=%d <1L=%d <2L=%d >=2L=%d\n",
+            L_target,
+            distBuckets[0], distBuckets[1], distBuckets[2],
+            distBuckets[3], distBuckets[4]);
+        std::fprintf(stderr,
+            "[postproc-looseends-summary] open-polylines=%d "
+            "closed-polylines=%d detected-loose-ends=%zu (expected 2*N_open=%d)\n",
+            nOpen, nClosed, les.size(), 2 * nOpen);
+
+        R.looseEndsDetected = true;
+        R.looseEndCount     = les.size();
+        R.looseEnds         = std::move(les);
+    } // end if (detectLooseEnds)
 
     (void)L_source;  // only used by the resample pass' log line.
     } // end if (wantPostProc)
