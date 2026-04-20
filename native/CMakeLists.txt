@@ -20,6 +20,11 @@ if(NOT EMSCRIPTEN)
     # Aggressive native optimization for the CLI — the WASM build uses
     # plain -O3 only because WASM SIMD is not enabled there.
     target_compile_options(wgf_cli PRIVATE -O3 -ffast-math)
+
+    # Unit tests for face-level geometry helpers (Phase E-3 groundwork).
+    # Does not link any solver code; exercises the header-only helpers
+    # against a tiny hand-built mesh.
+    add_executable(test_face_topology src/test_face_topology.cpp)
 endif()
 
 # Emscripten build — single-file ES module with the wasm base64-inlined.
