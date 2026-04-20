@@ -42,12 +42,14 @@
 
 #include "isolines.h"
 #include "mesh.h"
+#include "face_topology.h"
 
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wgf {
@@ -1182,6 +1184,111 @@ inline std::vector<LooseEnd> detectLooseEnds(
         out.push_back(eEnd);
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Step G: face-walking extension of loose ends (Phase E-3a-3, observation-only).
+// ---------------------------------------------------------------------------
+//
+// For each LooseEnd, ray-march across the base mesh face by face along the
+// chain's outward tangent, recording the 3D waypoints and visited faces.
+// Stops when either:
+//   - the cumulative extension distance reaches `maxExtension`
+//     (Outcome::MAX_LENGTH),
+//   - the ray walks off a mesh boundary edge (Outcome::BOUNDARY),
+//   - it would re-enter a face it already visited (Outcome::REVISITED_FACE),
+//   - computeExitPoint returns nullopt because the projected tangent is
+//     numerically zero (Outcome::DEGENERATE), or
+//   - the next face is missing (Outcome::FAILED — same nullopt path; kept as
+//     a separate enum value for future cases like missing twin metadata).
+//
+// This stage is observation-only: callers store the resulting ExtensionPaths
+// for diagnostics but never feed them back into R.segments. The crossing
+// detection / trim that turns these proxies into real polyline edits is the
+// job of PR E-3a-4.
+struct ExtensionPath {
+    int looseEndIdx = -1;                    // index into detectLooseEnds result
+    std::vector<Eigen::Vector3d> waypoints;  // 3D points reached during the walk
+    std::vector<int> facePath;               // faces traversed, parallel to waypoints
+    double totalDistance = 0.0;              // cumulative arclength of the walk
+    enum Outcome {
+        MAX_LENGTH,       // reached maxExtension before any other stop
+        BOUNDARY,         // walked off a mesh boundary edge
+        REVISITED_FACE,   // would re-enter a face already in the walk
+        FAILED,           // computeExitPoint returned nullopt (no forward hit)
+        DEGENERATE        // projected tangent collapsed to zero (∥ face normal)
+    };
+    Outcome outcome = MAX_LENGTH;
+};
+
+// Walk one loose end across faces under its outward tangent. Tangent is kept
+// in 3D and reprojected onto each face's plane by computeExitPoint, which
+// suffices on the smooth Gyroid surfaces this pipeline targets — true
+// parallel transport is left as future work.
+inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
+                                    const Mesh& mesh,
+                                    double maxExtension,
+                                    double /*step_eps*/ = 1e-9) {
+    ExtensionPath path;
+    path.looseEndIdx   = -1;  // caller assigns
+    path.totalDistance = 0.0;
+    path.outcome       = ExtensionPath::MAX_LENGTH;
+
+    int currentFace = looseEnd.baseFaceIdx;
+    Eigen::Vector3d currentPos     = looseEnd.pos;
+    Eigen::Vector3d currentTangent = looseEnd.tangent;
+
+    if (currentFace < 0 || currentFace >= mesh.nF()) {
+        path.outcome = ExtensionPath::FAILED;
+        return path;
+    }
+
+    std::unordered_set<int> visited;
+    visited.insert(currentFace);
+
+    while (path.totalDistance < maxExtension) {
+        auto exitInfo = computeExitPoint(mesh, currentFace,
+                                         currentPos, currentTangent);
+        if (!exitInfo.has_value()) {
+            path.outcome = ExtensionPath::DEGENERATE;
+            break;
+        }
+
+        const double remaining = maxExtension - path.totalDistance;
+        if (exitInfo->distance >= remaining) {
+            // Stop inside the current face once we've spent the budget.
+            // The unit-normalized tangent in LooseEnd makes this a clean
+            // "advance by `remaining`" without rescaling.
+            Eigen::Vector3d stop = currentPos + currentTangent * remaining;
+            path.waypoints.push_back(stop);
+            path.facePath.push_back(currentFace);
+            path.totalDistance = maxExtension;
+            path.outcome       = ExtensionPath::MAX_LENGTH;
+            break;
+        }
+
+        path.waypoints.push_back(exitInfo->point);
+        path.facePath.push_back(currentFace);
+        path.totalDistance += exitInfo->distance;
+
+        const int nextFace = oppositeFaceAcross(mesh, exitInfo->exitEdge,
+                                                currentFace);
+        if (nextFace < 0) {
+            path.outcome = ExtensionPath::BOUNDARY;
+            break;
+        }
+        if (visited.count(nextFace)) {
+            path.outcome = ExtensionPath::REVISITED_FACE;
+            break;
+        }
+        visited.insert(nextFace);
+
+        currentFace = nextFace;
+        currentPos  = exitInfo->point;
+        // Tangent kept in 3D; computeExitPoint reprojects per face.
+    }
+
+    return path;
 }
 
 } // namespace wgf
