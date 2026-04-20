@@ -128,6 +128,9 @@ bool parseInput(std::istream& in, CliInput& out) {
                     else if (key == "minChainLength")   out.opt.minChainLengthAbs = std::stod(val);
                     else if (key == "minChainMult")     out.opt.minChainMult      = std::stod(val);
                     else if (key == "detectLooseEnds")  out.opt.detectLooseEnds   = (std::stoi(val) != 0);
+                    else if (key == "extendLooseEnds")  out.opt.extendLooseEnds   = (std::stoi(val) != 0);
+                    else if (key == "extendMaxMult")    out.opt.extendMaxMult     = std::stod(val);
+                    else if (key == "extendMaxLength")  out.opt.extendMaxLength   = std::stod(val);
                 } catch (...) {
                     std::fprintf(stderr, "[wgf-cli] malformed option: %s\n", kv.c_str());
                 }
@@ -201,6 +204,21 @@ int main(int argc, char** argv) {
     if (const char* env = std::getenv("WGF_NO_DETECT_LOOSE_ENDS")) {
         if (std::atoi(env) != 0) cin_.opt.detectLooseEnds = false;
     }
+    if (const char* env = std::getenv("WGF_NO_EXTEND")) {
+        if (std::atoi(env) != 0) cin_.opt.noExtend = true;
+    }
+    if (const char* env = std::getenv("WGF_EXTEND_MAX_MULT")) {
+        try { cin_.opt.extendMaxMult = std::stod(env); }
+        catch (...) {
+            std::fprintf(stderr, "[wgf-cli] malformed WGF_EXTEND_MAX_MULT=%s\n", env);
+        }
+    }
+    if (const char* env = std::getenv("WGF_EXTEND_MAX_LENGTH")) {
+        try { cin_.opt.extendMaxLength = std::stod(env); }
+        catch (...) {
+            std::fprintf(stderr, "[wgf-cli] malformed WGF_EXTEND_MAX_LENGTH=%s\n", env);
+        }
+    }
 
     // Simple CLI flag parsing. Accepts `--flag value` and `--flag=value`.
     for (int i = 1; i < argc; ++i) {
@@ -221,6 +239,18 @@ int main(int argc, char** argv) {
             cin_.opt.shortPrune = false;
         } else if (a == "--no-detect-loose-ends") {
             cin_.opt.detectLooseEnds = false;
+        } else if (a == "--no-extend") {
+            cin_.opt.noExtend = true;
+        } else if (const char* v = takeVal("--extend-max-mult")) {
+            try { cin_.opt.extendMaxMult = std::stod(v); }
+            catch (...) {
+                std::fprintf(stderr, "[wgf-cli] malformed --extend-max-mult=%s\n", v);
+            }
+        } else if (const char* v = takeVal("--extend-max-length")) {
+            try { cin_.opt.extendMaxLength = std::stod(v); }
+            catch (...) {
+                std::fprintf(stderr, "[wgf-cli] malformed --extend-max-length=%s\n", v);
+            }
         } else if (const char* v = takeVal("--resample-length")) {
             try { cin_.opt.resampleLength = std::stod(v); }
             catch (...) {
@@ -279,12 +309,17 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "[wgf-cli] postproc: curvatureCut=%d cutThreshold=%.6g cutPercentile=%.3f "
                  "shortPrune=%d minChainLength=%.6g minChainMult=%.3f "
-                 "detectLooseEnds=%d\n",
+                 "detectLooseEnds=%d extendLooseEnds=%d noExtend=%d "
+                 "extendMaxMult=%.3f extendMaxLength=%.6g\n",
                  cin_.opt.curvatureCut ? 1 : 0, cin_.opt.cutThresholdAbs,
                  cin_.opt.cutPercentile,
                  cin_.opt.shortPrune ? 1 : 0, cin_.opt.minChainLengthAbs,
                  cin_.opt.minChainMult,
-                 cin_.opt.detectLooseEnds ? 1 : 0);
+                 cin_.opt.detectLooseEnds ? 1 : 0,
+                 cin_.opt.extendLooseEnds ? 1 : 0,
+                 cin_.opt.noExtend ? 1 : 0,
+                 cin_.opt.extendMaxMult,
+                 cin_.opt.extendMaxLength);
 
     PipelineResult R;
     try {
