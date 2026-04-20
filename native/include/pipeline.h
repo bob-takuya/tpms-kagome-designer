@@ -113,6 +113,29 @@ struct PipelineOptions {
     // stage never mutates R.segments; the SEG output stays bit-identical to
     // a run with detectLooseEnds=false (regression check).
     bool   detectLooseEnds   = true;
+
+    // Phase E-3a-3: face-walk each loose end as a geodesic proxy and record
+    // the extension path. Like detectLooseEnds, this stage is observation-
+    // only — extensionPaths feeds diagnostics, never R.segments. Crossing
+    // detection / trim is reserved for PR E-3a-4.
+    //
+    //   extendLooseEnds  : enable the extension pass (default on; gated by
+    //                      detectLooseEnds since it consumes the loose-end
+    //                      list).
+    //   noExtend         : hard skip; mirrors the --no-extend regression
+    //                      switch on the CLI.
+    //   extendMaxMult    : default extension budget = extendMaxMult * L_target.
+    //                      2.5 was picked from the PR #32 distance histogram:
+    //                      <2L covers 97.5% of loose-end → nearest-different-
+    //                      family-segment distances, plus a 25% safety margin
+    //                      to account for face-walk detours over a 3D direct
+    //                      line.
+    //   extendMaxLength  : explicit absolute extension budget (overrides
+    //                      extendMaxMult when > 0).
+    bool   extendLooseEnds = true;
+    bool   noExtend        = false;
+    double extendMaxMult   = 2.5;
+    double extendMaxLength = 0.0;
 };
 
 struct PipelineResult {
@@ -146,6 +169,14 @@ struct PipelineResult {
     bool                  looseEndsDetected = false;
     std::size_t           looseEndCount     = 0;
     std::vector<LooseEnd> looseEnds;
+
+    // Loose-end extension (Phase E-3a-3 observation-only). Populated when
+    // opt.extendLooseEnds is true and detectLooseEnds ran. Each entry is the
+    // face-walking proxy path for the corresponding LooseEnd (entries are
+    // parallel to looseEnds[]). R.segments is not modified.
+    bool                       extensionApplied = false;
+    double                     extensionMaxLength = 0.0;
+    std::vector<ExtensionPath> extensionPaths;
 };
 
 inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt) {
@@ -942,6 +973,99 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         R.looseEndCount     = les.size();
         R.looseEnds         = std::move(les);
     } // end if (detectLooseEnds)
+
+    // --- Loose-end extension (Phase E-3a-3, observation-only) ----------
+    //
+    // Face-walks each detected loose end as a geodesic proxy and records
+    // the extension path for diagnostics. R.segments is unchanged here:
+    // crossing detection / trim and the actual chain edits happen in
+    // PR E-3a-4. EXTEND_MAX_MULT defaults to 2.5 (PR #32 distance
+    // histogram: <2L covers 97.5% of loose-end → nearest-different-family
+    // distances; +25% margin for face-walk detours).
+    if (opt.extendLooseEnds && !opt.noExtend && R.looseEndsDetected) {
+        const double maxExt = (opt.extendMaxLength > 0.0)
+            ? opt.extendMaxLength
+            : opt.extendMaxMult * L_target;
+
+        std::vector<ExtensionPath> paths;
+        paths.reserve(R.looseEnds.size());
+
+        // Outcome counters.
+        int outMax = 0, outBoundary = 0, outRevisited = 0,
+            outFailed = 0, outDegenerate = 0;
+        // Distance histogram (relative to maxExt): <0.25, <0.5, <0.75, =max.
+        int distBuckets[4] = {0, 0, 0, 0};
+        // Faces-visited histogram: 1-face, 2, 3, 4, 5+.
+        int faceBuckets[5] = {0, 0, 0, 0, 0};
+        // Per-family success counts (success == MAX_LENGTH outcome).
+        int famSuccess[3] = {0, 0, 0};
+
+        for (std::size_t i = 0; i < R.looseEnds.size(); ++i) {
+            ExtensionPath p = extendLooseEnd(R.looseEnds[i], base, maxExt);
+            p.looseEndIdx = (int)i;
+
+            switch (p.outcome) {
+                case ExtensionPath::MAX_LENGTH:     ++outMax;        break;
+                case ExtensionPath::BOUNDARY:       ++outBoundary;   break;
+                case ExtensionPath::REVISITED_FACE: ++outRevisited;  break;
+                case ExtensionPath::FAILED:         ++outFailed;     break;
+                case ExtensionPath::DEGENERATE:     ++outDegenerate; break;
+            }
+
+            const double r = (maxExt > 0.0) ? (p.totalDistance / maxExt) : 0.0;
+            int db;
+            if      (r < 0.25)  db = 0;
+            else if (r < 0.5)   db = 1;
+            else if (r < 0.75)  db = 2;
+            else                db = 3;
+            ++distBuckets[db];
+
+            const int nFaces = (int)p.facePath.size();
+            int fb;
+            if      (nFaces <= 1) fb = 0;
+            else if (nFaces == 2) fb = 1;
+            else if (nFaces == 3) fb = 2;
+            else if (nFaces == 4) fb = 3;
+            else                  fb = 4;
+            ++faceBuckets[fb];
+
+            if (p.outcome == ExtensionPath::MAX_LENGTH) {
+                int fam = R.looseEnds[i].family;
+                if (fam >= 0 && fam < 3) ++famSuccess[fam];
+            }
+
+            paths.push_back(std::move(p));
+        }
+
+        std::fprintf(stderr,
+            "[postproc-extend-dry] max-mult=%.3f max-length=%.6f "
+            "(= %.3f x L_target)\n",
+            opt.extendMaxMult, maxExt,
+            (L_target > 0.0) ? (maxExt / L_target) : 0.0);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] attempts=%zu\n", paths.size());
+        std::fprintf(stderr,
+            "[postproc-extend-dry] outcomes: max-length=%d boundary=%d "
+            "revisited-face=%d failed=%d degenerate=%d\n",
+            outMax, outBoundary, outRevisited, outFailed, outDegenerate);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] distance-hist (relative to L_max): "
+            "<0.25=%d <0.5=%d <0.75=%d =L_max=%d\n",
+            distBuckets[0], distBuckets[1], distBuckets[2], distBuckets[3]);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] faces-visited-hist: 1-face=%d 2-face=%d "
+            "3-face=%d 4-face=%d 5+=%d\n",
+            faceBuckets[0], faceBuckets[1], faceBuckets[2],
+            faceBuckets[3], faceBuckets[4]);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] per-family: fam0-success=%d fam1-success=%d "
+            "fam2-success=%d (success = max_length_reached)\n",
+            famSuccess[0], famSuccess[1], famSuccess[2]);
+
+        R.extensionApplied   = true;
+        R.extensionMaxLength = maxExt;
+        R.extensionPaths     = std::move(paths);
+    } // end if (extendLooseEnds)
 
     (void)L_source;  // only used by the resample pass' log line.
     } // end if (wantPostProc)
