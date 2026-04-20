@@ -127,6 +127,7 @@ bool parseInput(std::istream& in, CliInput& out) {
                     else if (key == "shortPrune")       out.opt.shortPrune        = (std::stoi(val) != 0);
                     else if (key == "minChainLength")   out.opt.minChainLengthAbs = std::stod(val);
                     else if (key == "minChainMult")     out.opt.minChainMult      = std::stod(val);
+                    else if (key == "detectLooseEnds")  out.opt.detectLooseEnds   = (std::stoi(val) != 0);
                 } catch (...) {
                     std::fprintf(stderr, "[wgf-cli] malformed option: %s\n", kv.c_str());
                 }
@@ -197,6 +198,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[wgf-cli] malformed WGF_MIN_CHAIN_MULT=%s\n", env);
         }
     }
+    if (const char* env = std::getenv("WGF_NO_DETECT_LOOSE_ENDS")) {
+        if (std::atoi(env) != 0) cin_.opt.detectLooseEnds = false;
+    }
 
     // Simple CLI flag parsing. Accepts `--flag value` and `--flag=value`.
     for (int i = 1; i < argc; ++i) {
@@ -215,6 +219,8 @@ int main(int argc, char** argv) {
             cin_.opt.curvatureCut = false;
         } else if (a == "--no-short-prune") {
             cin_.opt.shortPrune = false;
+        } else if (a == "--no-detect-loose-ends") {
+            cin_.opt.detectLooseEnds = false;
         } else if (const char* v = takeVal("--resample-length")) {
             try { cin_.opt.resampleLength = std::stod(v); }
             catch (...) {
@@ -272,11 +278,13 @@ int main(int argc, char** argv) {
                  cin_.opt.resampleNoFastPath ? 1 : 0);
     std::fprintf(stderr,
                  "[wgf-cli] postproc: curvatureCut=%d cutThreshold=%.6g cutPercentile=%.3f "
-                 "shortPrune=%d minChainLength=%.6g minChainMult=%.3f\n",
+                 "shortPrune=%d minChainLength=%.6g minChainMult=%.3f "
+                 "detectLooseEnds=%d\n",
                  cin_.opt.curvatureCut ? 1 : 0, cin_.opt.cutThresholdAbs,
                  cin_.opt.cutPercentile,
                  cin_.opt.shortPrune ? 1 : 0, cin_.opt.minChainLengthAbs,
-                 cin_.opt.minChainMult);
+                 cin_.opt.minChainMult,
+                 cin_.opt.detectLooseEnds ? 1 : 0);
 
     PipelineResult R;
     try {
