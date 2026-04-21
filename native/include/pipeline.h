@@ -993,6 +993,18 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
         // Outcome counters.
         int outMax = 0, outBoundary = 0, outRevisited = 0,
             outFailed = 0, outDegenerate = 0;
+        // Per-phase DEGENERATE counters, parallel to the
+        // ExtensionPath::DegenerateDiag::Phase enum (5 entries):
+        //   [0] INITIAL_POS_ON_EDGE      — first computeExitPoint failed
+        //                                  even after the initial nudge.
+        //   [1] INITIAL_TANGENT_PARALLEL — initial tangent ∥ face normal.
+        //   [2] TRANSIT_POS_ON_EDGE      — computeExitPoint failed after a
+        //                                  successful face transit.
+        //   [3] TRANSIT_TANGENT_PARALLEL — transported tangent collapsed to
+        //                                  zero in the new face's plane.
+        //   [4] OTHER                    — degenerate without a diag
+        //                                  payload (e.g. invalid face id).
+        int degenPhaseCounts[5] = {0, 0, 0, 0, 0};
         // Distance histogram (relative to maxExt): <0.25, <0.5, <0.75, =max.
         int distBuckets[4] = {0, 0, 0, 0};
         // Faces-visited histogram: 1-face, 2, 3, 4, 5+.
@@ -1019,7 +1031,15 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 case ExtensionPath::BOUNDARY:       ++outBoundary;   break;
                 case ExtensionPath::REVISITED_FACE: ++outRevisited;  break;
                 case ExtensionPath::FAILED:         ++outFailed;     break;
-                case ExtensionPath::DEGENERATE:     ++outDegenerate; break;
+                case ExtensionPath::DEGENERATE: {
+                    ++outDegenerate;
+                    int phaseIdx = p.degenerateDiag.haveInfo
+                        ? (int)p.degenerateDiag.phase
+                        : (int)ExtensionPath::DegenerateDiag::OTHER;
+                    if (phaseIdx < 0 || phaseIdx > 4) phaseIdx = 4;
+                    ++degenPhaseCounts[phaseIdx];
+                    break;
+                }
             }
 
             const double r = (maxExt > 0.0) ? (p.totalDistance / maxExt) : 0.0;
@@ -1067,9 +1087,19 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
                 p.degenerateDiag.haveInfo &&
                 degenSampleCount < kDegenSampleLimit) {
                 const auto& d = p.degenerateDiag;
-                const char* phaseStr =
-                    (d.phase == ExtensionPath::DegenerateDiag::INITIAL)
-                        ? "initial" : "after-transit";
+                const char* phaseStr;
+                switch (d.phase) {
+                    case ExtensionPath::DegenerateDiag::INITIAL_POS_ON_EDGE:
+                        phaseStr = "initial-pos-on-edge"; break;
+                    case ExtensionPath::DegenerateDiag::INITIAL_TANGENT_PARALLEL:
+                        phaseStr = "initial-tangent-parallel"; break;
+                    case ExtensionPath::DegenerateDiag::TRANSIT_POS_ON_EDGE:
+                        phaseStr = "transit-pos-on-edge"; break;
+                    case ExtensionPath::DegenerateDiag::TRANSIT_TANGENT_PARALLEL:
+                        phaseStr = "transit-tangent-parallel"; break;
+                    default:
+                        phaseStr = "other"; break;
+                }
                 std::fprintf(stderr,
                     "[postproc-extend-dry-degen-sample] #%d\n"
                     "  looseEndIdx=%d chainId=%d family=%d phase=%s\n"
@@ -1111,6 +1141,12 @@ inline PipelineResult runPipeline(const Mesh& baseIn, const PipelineOptions& opt
             "[postproc-extend-dry] outcomes: max-length=%d boundary=%d "
             "revisited-face=%d failed=%d degenerate=%d\n",
             outMax, outBoundary, outRevisited, outFailed, outDegenerate);
+        std::fprintf(stderr,
+            "[postproc-extend-dry] degenerate-phase-breakdown: "
+            "initial-pos-on-edge=%d initial-tangent-parallel=%d "
+            "transit-pos-on-edge=%d transit-tangent-parallel=%d other=%d\n",
+            degenPhaseCounts[0], degenPhaseCounts[1],
+            degenPhaseCounts[2], degenPhaseCounts[3], degenPhaseCounts[4]);
         std::fprintf(stderr,
             "[postproc-extend-dry] distance-hist (relative to L_max): "
             "<0.25=%d <0.5=%d <0.75=%d =L_max=%d\n",

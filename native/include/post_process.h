@@ -1228,14 +1228,23 @@ struct ExtensionPath {
     std::vector<double> tangentDrifts;   // |t · n_to| after transport+nudge
 
     // DEGENERATE-only diagnostic payload. The pipeline dumps the first N of
-    // these to stderr so we can tell whether the collapse happened on the
-    // very first computeExitPoint call (phase=initial) or after a face
-    // transit (phase=after-transit), and whether the position was sitting
-    // on a vertex/edge when it happened.
+    // these to stderr and also aggregates phase counts so we can tell where
+    // each collapse came from. The phases split along two axes: initial vs.
+    // post-transit (i.e. before any face transit ran, or after one), and
+    // pos-on-edge (computeExitPoint returned nullopt because every edge
+    // intersection sat at t < kForwardEps) vs. tangent-parallel (the tangent
+    // projects to nearly zero in the current face's plane). OTHER catches
+    // anything else, e.g. an invalid base face id.
     struct DegenerateDiag {
         bool   haveInfo         = false;
-        enum Phase { INITIAL = 0, AFTER_TRANSIT = 1 };
-        Phase  phase            = INITIAL;
+        enum Phase {
+            INITIAL_POS_ON_EDGE      = 0,
+            INITIAL_TANGENT_PARALLEL = 1,
+            TRANSIT_POS_ON_EDGE      = 2,
+            TRANSIT_TANGENT_PARALLEL = 3,
+            OTHER                    = 4
+        };
+        Phase  phase            = INITIAL_POS_ON_EDGE;
         int    currentFace      = -1;
         Eigen::Vector3d currentPos     = Eigen::Vector3d::Zero();
         Eigen::Vector3d currentTangent = Eigen::Vector3d::Zero();
@@ -1277,6 +1286,11 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
     // computeExitPoint's "t < kForwardEps" test can't reject the first
     // intersection on the new face.
     constexpr double EDGE_NUDGE_EPS = 1e-9;
+    // Threshold for declaring the in-plane tangent magnitude "zero" after
+    // projecting away the face-normal component. Sits well above
+    // computeExitPoint's kParallelEps (1e-12) so we catch the collapse
+    // before it forces the ray-march to give up.
+    constexpr double TANGENT_PARALLEL_EPS = 1e-9;
 
     int currentFace = looseEnd.baseFaceIdx;
     Eigen::Vector3d currentPos     = looseEnd.pos;
@@ -1342,17 +1356,53 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
         d.pointToEdgeDists[2] = pointToSeg(v2, v0);
     };
 
+    // Initial nudge into the face interior. Loose-end positions produced
+    // by PR #30's cut-and-prune pass land EXACTLY on a face edge in 80%+
+    // of attempts (the dump from PR #34 measured point-to-edge distances
+    // of 1e-16 .. 1e-18). Without this nudge, the very first
+    // computeExitPoint call rejects every candidate edge because the
+    // chosen exit point sits at t < kForwardEps from the start. A nudge
+    // toward the face centroid is feature-scale-safe (EDGE_NUDGE_EPS is
+    // ~10^-7 of a typical mesh edge) and moves us cleanly off the edge.
+    {
+        const Eigen::Vector3d centroid = computeFaceCentroid(mesh, currentFace);
+        Eigen::Vector3d toward = centroid - currentPos;
+        const double tlen = toward.norm();
+        if (tlen > 1e-30) currentPos += (toward / tlen) * EDGE_NUDGE_EPS;
+    }
+
+    // Project the initial tangent into the face plane. detectLooseEnds
+    // builds the tangent from two consecutive 3D polyline samples, which
+    // are not guaranteed to lie exactly in the base face's plane after
+    // PR #30's resample/cut. computeExitPoint already does this projection
+    // internally, but doing it here lets us distinguish "tangent literally
+    // parallel to normal" from "computeExitPoint failed for some other
+    // reason" in the diagnostic breakdown.
+    {
+        const Eigen::Vector3d n = computeFaceNormal(mesh, currentFace);
+        Eigen::Vector3d t_plane = currentTangent - n * currentTangent.dot(n);
+        const double mag = t_plane.norm();
+        if (mag < TANGENT_PARALLEL_EPS) {
+            captureDegenerate(
+                ExtensionPath::DegenerateDiag::INITIAL_TANGENT_PARALLEL);
+            path.outcome = ExtensionPath::DEGENERATE;
+            return path;
+        }
+        currentTangent = t_plane / mag;
+    }
+
     // Track whether we've just crossed a face boundary, so the first
-    // computeExitPoint on a new face labels its failure as AFTER_TRANSIT.
+    // computeExitPoint on a new face labels its failure as TRANSIT_*.
     bool justTransited = false;
 
     while (path.totalDistance < maxExtension) {
         auto exitInfo = computeExitPoint(mesh, currentFace,
                                          currentPos, currentTangent);
         if (!exitInfo.has_value()) {
-            captureDegenerate(justTransited
-                                  ? ExtensionPath::DegenerateDiag::AFTER_TRANSIT
-                                  : ExtensionPath::DegenerateDiag::INITIAL);
+            captureDegenerate(
+                justTransited
+                    ? ExtensionPath::DegenerateDiag::TRANSIT_POS_ON_EDGE
+                    : ExtensionPath::DegenerateDiag::INITIAL_POS_ON_EDGE);
             path.outcome = ExtensionPath::DEGENERATE;
             break;
         }
@@ -1403,10 +1453,33 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
         const double tlen = toward.norm();
         if (tlen > 1e-30) currentPos += (toward / tlen) * EDGE_NUDGE_EPS;
 
-        // Record the post-transport drift: how much of the tangent still
-        // sticks out of the new face's plane. A good transport keeps this
-        // well below 1e-6; values near 1 signal the transport bailed out.
+        // Record the post-transport drift BEFORE the safety re-projection
+        // below, so the histogram still reflects raw transport quality.
+        // A good transport keeps this well below 1e-6; values near 1
+        // signal the transport bailed out.
         path.tangentDrifts.push_back(std::abs(currentTangent.dot(n_to)));
+
+        // Safety net: re-project the transported tangent into the new
+        // face's plane and re-normalize. parallelTransportTangent should
+        // already produce an in-plane unit vector, but on near-flat
+        // adjacencies the rotation can leave a residual normal component
+        // that, while small in absolute terms, lets the next
+        // computeExitPoint reject every candidate. If the in-plane
+        // component degenerates entirely, classify as
+        // TRANSIT_TANGENT_PARALLEL so the breakdown can flag a transport
+        // bug instead of blaming the position.
+        {
+            Eigen::Vector3d t_plane =
+                currentTangent - n_to * currentTangent.dot(n_to);
+            const double mag = t_plane.norm();
+            if (mag < TANGENT_PARALLEL_EPS) {
+                captureDegenerate(
+                    ExtensionPath::DegenerateDiag::TRANSIT_TANGENT_PARALLEL);
+                path.outcome = ExtensionPath::DEGENERATE;
+                break;
+            }
+            currentTangent = t_plane / mag;
+        }
 
         justTransited = true;
     }
