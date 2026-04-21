@@ -10,6 +10,10 @@
 //                           reporting which edge it exits through
 //   - segSegIntersectOnFace: 3D segment–segment intersection restricted to
 //                            a shared face plane
+//   - computeFaceNormal / computeFaceCentroid / getEdgeDirection:
+//                           trivial accessors used by the face-walk
+//   - parallelTransportTangent: rotate a 3D tangent from one face plane
+//                           to an adjacent one around their shared edge
 //
 // All functions operate on the half-edge `Mesh` from mesh.h and use Eigen.
 
@@ -158,6 +162,84 @@ inline std::optional<ExitInfo> computeExitPoint(const Mesh& mesh,
     info.exitEdge = bestH;
     info.distance = (hit3D - pos).norm();
     return info;
+}
+
+// ---------------------------------------------------------------------------
+// computeFaceNormal / computeFaceCentroid / getEdgeDirection
+// ---------------------------------------------------------------------------
+// Per-face helpers used by the loose-end face walk. Kept as free functions
+// so the walk doesn't have to cache a FaceFrame table just to look up a
+// normal.
+inline Eigen::Vector3d computeFaceNormal(const Mesh& mesh, int face) {
+    const Eigen::Vector3d v0 = mesh.V.row(mesh.F(face, 0));
+    const Eigen::Vector3d v1 = mesh.V.row(mesh.F(face, 1));
+    const Eigen::Vector3d v2 = mesh.V.row(mesh.F(face, 2));
+    Eigen::Vector3d n = (v1 - v0).cross(v2 - v0);
+    const double nlen = n.norm();
+    if (nlen > 1e-30) n /= nlen;
+    else              n.setZero();
+    return n;
+}
+
+inline Eigen::Vector3d computeFaceCentroid(const Mesh& mesh, int face) {
+    const Eigen::Vector3d v0 = mesh.V.row(mesh.F(face, 0));
+    const Eigen::Vector3d v1 = mesh.V.row(mesh.F(face, 1));
+    const Eigen::Vector3d v2 = mesh.V.row(mesh.F(face, 2));
+    return (v0 + v1 + v2) / 3.0;
+}
+
+// Unit vector from heStart(edgeIdx) to he[edgeIdx].vertex. The direction
+// picked here is used only as a rotation axis by parallelTransportTangent,
+// which determines the sign of the rotation itself — so either orientation
+// of the half-edge gives the same transported tangent.
+inline Eigen::Vector3d getEdgeDirection(const Mesh& mesh, int edgeIdx) {
+    const Eigen::Vector3d a = mesh.V.row(mesh.heStart(edgeIdx));
+    const Eigen::Vector3d b = mesh.V.row(mesh.he[edgeIdx].vertex);
+    Eigen::Vector3d d = b - a;
+    const double L = d.norm();
+    if (L > 1e-30) d /= L;
+    else           d.setZero();
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// parallelTransportTangent
+// ---------------------------------------------------------------------------
+// Rotate `tangent` from a face with normal `n_from` to a face with normal
+// `n_to`, around the shared edge `edge_dir`. This is the simple discrete
+// parallel transport used by the face-walk loose-end extension: folding
+// both faces flat along the shared edge sends `n_from` to `n_to`, and the
+// same rotation carries the 3D tangent into the new face's plane. On
+// smooth Gyroid-class meshes this is enough to keep computeExitPoint from
+// degenerating after a face transit — without it, the unchanged 3D tangent
+// can land nearly parallel to the next face's normal and the projected
+// magnitude collapses to zero.
+//
+// Returns the absolute rotation angle in radians (for histogramming).
+// Leaves `tangent` unchanged when the two face normals are already
+// (numerically) aligned.
+inline double parallelTransportTangent(Eigen::Vector3d& tangent,
+                                       const Eigen::Vector3d& n_from,
+                                       const Eigen::Vector3d& n_to,
+                                       const Eigen::Vector3d& edge_dir) {
+    const double cos_angle = n_from.dot(n_to);
+    if (cos_angle > 1.0 - 1e-12) return 0.0;
+    if (edge_dir.squaredNorm() < 1e-24) return 0.0;
+
+    double angle = std::acos(std::clamp(cos_angle, -1.0, 1.0));
+
+    // Right-hand rule disambiguation: n_from × n_to points along the
+    // rotation axis that takes n_from to n_to with a positive angle.
+    // If it opposes edge_dir, flip the sign so we rotate the correct way.
+    const Eigen::Vector3d cross_n = n_from.cross(n_to);
+    if (cross_n.dot(edge_dir) < 0.0) angle = -angle;
+
+    const Eigen::AngleAxisd rot(angle, edge_dir);
+    tangent = rot * tangent;
+    const double tlen = tangent.norm();
+    if (tlen > 1e-30) tangent /= tlen;
+
+    return std::abs(angle);
 }
 
 // ---------------------------------------------------------------------------

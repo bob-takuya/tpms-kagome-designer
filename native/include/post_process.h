@@ -1219,12 +1219,48 @@ struct ExtensionPath {
         DEGENERATE        // projected tangent collapsed to zero (∥ face normal)
     };
     Outcome outcome = MAX_LENGTH;
+
+    // Parallel-transport diagnostics (populated regardless of outcome, one
+    // entry per face transit that actually ran the transport). The pipeline
+    // aggregates these into rotation-angle and post-transport drift
+    // histograms to verify the transport is doing its job.
+    std::vector<double> rotationAngles;  // |angle(n_from, n_to)| in radians
+    std::vector<double> tangentDrifts;   // |t · n_to| after transport+nudge
+
+    // DEGENERATE-only diagnostic payload. The pipeline dumps the first N of
+    // these to stderr so we can tell whether the collapse happened on the
+    // very first computeExitPoint call (phase=initial) or after a face
+    // transit (phase=after-transit), and whether the position was sitting
+    // on a vertex/edge when it happened.
+    struct DegenerateDiag {
+        bool   haveInfo         = false;
+        enum Phase { INITIAL = 0, AFTER_TRANSIT = 1 };
+        Phase  phase            = INITIAL;
+        int    currentFace      = -1;
+        Eigen::Vector3d currentPos     = Eigen::Vector3d::Zero();
+        Eigen::Vector3d currentTangent = Eigen::Vector3d::Zero();
+        Eigen::Vector3d faceNormal     = Eigen::Vector3d::Zero();
+        double tangentDotNormal = 0.0;
+        Eigen::Vector3d projectedTangent = Eigen::Vector3d::Zero();
+        double projectedMag     = 0.0;
+        double pointToVertexDists[3] = {0.0, 0.0, 0.0};
+        double pointToEdgeDists[3]   = {0.0, 0.0, 0.0};
+        int    numFacesTraversed = 0;
+    };
+    DegenerateDiag degenerateDiag;
 };
 
-// Walk one loose end across faces under its outward tangent. Tangent is kept
-// in 3D and reprojected onto each face's plane by computeExitPoint, which
-// suffices on the smooth Gyroid surfaces this pipeline targets — true
-// parallel transport is left as future work.
+// Walk one loose end across faces under its outward tangent.
+//
+// Face transits apply a simple discrete parallel transport (rotate the
+// tangent around the shared edge so it tracks the new face's plane) plus
+// a tiny nudge toward the next face's centroid, so the exit point — which
+// sits exactly on the shared edge — starts the next ray from inside the
+// new face rather than on its boundary. Together these eliminate the
+// degenerate collapse (PR #33 dry run showed 80.9% DEGENERATE) that the
+// previous "keep tangent in 3D, rely on computeExitPoint to reproject"
+// version hit whenever an adjacent face's normal tilted enough that the
+// reprojected tangent magnitude fell below the kParallelEps cutoff.
 inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
                                     const Mesh& mesh,
                                     double maxExtension,
@@ -1233,6 +1269,14 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
     path.looseEndIdx   = -1;  // caller assigns
     path.totalDistance = 0.0;
     path.outcome       = ExtensionPath::MAX_LENGTH;
+
+    // Small offset from the exit edge toward the interior of the next
+    // face. Typical mesh coordinates are O(1e-2 .. 1); 1e-9 is orders of
+    // magnitude below any feature scale, so the nudge never perturbs the
+    // geometry perceptibly — it only moves the ray off the edge line so
+    // computeExitPoint's "t < kForwardEps" test can't reject the first
+    // intersection on the new face.
+    constexpr double EDGE_NUDGE_EPS = 1e-9;
 
     int currentFace = looseEnd.baseFaceIdx;
     Eigen::Vector3d currentPos     = looseEnd.pos;
@@ -1246,10 +1290,69 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
     std::unordered_set<int> visited;
     visited.insert(currentFace);
 
+    // Fill the DEGENERATE diagnostic payload at the current iteration, so
+    // the caller (pipeline.h) can dump a sample explaining why the walk
+    // stalled. `phase` distinguishes an initial collapse (first call,
+    // before any transit) from one that happened after a successful face
+    // transit — the latter indicates the transport+nudge logic itself
+    // failed to keep the tangent inside the new face's plane.
+    auto captureDegenerate = [&](ExtensionPath::DegenerateDiag::Phase phase) {
+        auto& d = path.degenerateDiag;
+        d.haveInfo          = true;
+        d.phase             = phase;
+        d.currentFace       = currentFace;
+        d.currentPos        = currentPos;
+        d.currentTangent    = currentTangent;
+        d.numFacesTraversed = (int)path.facePath.size();
+        d.faceNormal        = Eigen::Vector3d::Zero();
+        d.tangentDotNormal  = 0.0;
+        d.projectedMag      = 0.0;
+        d.projectedTangent  = Eigen::Vector3d::Zero();
+        for (int k = 0; k < 3; ++k) {
+            d.pointToVertexDists[k] = 0.0;
+            d.pointToEdgeDists[k]   = 0.0;
+        }
+        if (currentFace < 0 || currentFace >= mesh.nF()) return;
+
+        const Eigen::Vector3d v0 = mesh.V.row(mesh.F(currentFace, 0));
+        const Eigen::Vector3d v1 = mesh.V.row(mesh.F(currentFace, 1));
+        const Eigen::Vector3d v2 = mesh.V.row(mesh.F(currentFace, 2));
+        Eigen::Vector3d n = (v1 - v0).cross(v2 - v0);
+        const double nlen = n.norm();
+        if (nlen > 1e-30) n /= nlen;
+        d.faceNormal       = n;
+        d.tangentDotNormal = currentTangent.dot(n);
+        Eigen::Vector3d proj = currentTangent - d.tangentDotNormal * n;
+        d.projectedMag     = proj.norm();
+        d.projectedTangent = proj;
+        d.pointToVertexDists[0] = (currentPos - v0).norm();
+        d.pointToVertexDists[1] = (currentPos - v1).norm();
+        d.pointToVertexDists[2] = (currentPos - v2).norm();
+        auto pointToSeg = [&](const Eigen::Vector3d& a,
+                              const Eigen::Vector3d& b) {
+            const Eigen::Vector3d ab = b - a;
+            const double L2 = ab.squaredNorm();
+            if (L2 < 1e-30) return (currentPos - a).norm();
+            double t = (currentPos - a).dot(ab) / L2;
+            t = std::clamp(t, 0.0, 1.0);
+            return (currentPos - (a + t * ab)).norm();
+        };
+        d.pointToEdgeDists[0] = pointToSeg(v0, v1);
+        d.pointToEdgeDists[1] = pointToSeg(v1, v2);
+        d.pointToEdgeDists[2] = pointToSeg(v2, v0);
+    };
+
+    // Track whether we've just crossed a face boundary, so the first
+    // computeExitPoint on a new face labels its failure as AFTER_TRANSIT.
+    bool justTransited = false;
+
     while (path.totalDistance < maxExtension) {
         auto exitInfo = computeExitPoint(mesh, currentFace,
                                          currentPos, currentTangent);
         if (!exitInfo.has_value()) {
+            captureDegenerate(justTransited
+                                  ? ExtensionPath::DegenerateDiag::AFTER_TRANSIT
+                                  : ExtensionPath::DegenerateDiag::INITIAL);
             path.outcome = ExtensionPath::DEGENERATE;
             break;
         }
@@ -1283,9 +1386,29 @@ inline ExtensionPath extendLooseEnd(const LooseEnd& looseEnd,
         }
         visited.insert(nextFace);
 
+        // Parallel-transport the tangent into the new face's plane, then
+        // nudge the position a hair off the shared edge so computeExitPoint
+        // doesn't reject every candidate edge for being "not forward".
+        const Eigen::Vector3d n_from   = computeFaceNormal(mesh, currentFace);
+        const Eigen::Vector3d n_to     = computeFaceNormal(mesh, nextFace);
+        const Eigen::Vector3d edge_dir = getEdgeDirection(mesh, exitInfo->exitEdge);
+        const double rotAngle = parallelTransportTangent(
+            currentTangent, n_from, n_to, edge_dir);
+        path.rotationAngles.push_back(rotAngle);
+
         currentFace = nextFace;
         currentPos  = exitInfo->point;
-        // Tangent kept in 3D; computeExitPoint reprojects per face.
+        const Eigen::Vector3d centroid = computeFaceCentroid(mesh, currentFace);
+        Eigen::Vector3d toward = centroid - currentPos;
+        const double tlen = toward.norm();
+        if (tlen > 1e-30) currentPos += (toward / tlen) * EDGE_NUDGE_EPS;
+
+        // Record the post-transport drift: how much of the tangent still
+        // sticks out of the new face's plane. A good transport keeps this
+        // well below 1e-6; values near 1 signal the transport bailed out.
+        path.tangentDrifts.push_back(std::abs(currentTangent.dot(n_to)));
+
+        justTransited = true;
     }
 
     return path;
